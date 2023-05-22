@@ -367,7 +367,9 @@ while true; do
             continue
         fi
     fi
-    . /tmp/ppgw.ini
+    if [ -f /tmp/ppgw.ini ]; then
+        . /tmp/ppgw.ini
+    fi
     if [ "$mode" = "yaml" ]; then
         try_conf "$yamlfile" "yaml"
     fi
