@@ -17,7 +17,7 @@ jobs:
     - name: Gen sha.txt
       run: echo "${{ env.SHSHA }}" >sha.txt
     - name: Set TAG_NAME
-      run: echo "TAG_NAME=""${{ env.SHSHA }}""-""$(date +%Y%m%d)" >> $GITHUB_ENV
+      run: echo "TAG_NAME=""$(date +%Y%m%d)"""-"${{ env.SHSHA }}" >> $GITHUB_ENV
     - name: build iso
       run: sh makeiso.sh
     - name: Set variables
