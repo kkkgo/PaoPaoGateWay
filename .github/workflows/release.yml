@@ -22,6 +22,8 @@ jobs:
       run: sh makeiso.sh
     - name: Set variables
       run: ls -lah && echo "RE_NOTE=$(cat ./renote.txt | tr -d '[:space:]')" >> $GITHUB_ENV
+    - name: show iso sha256sum
+      run: cat ./renote.txt
     - name: Upload files to GitHub release
       uses: svenstaro/upload-release-action@v2
       with:
