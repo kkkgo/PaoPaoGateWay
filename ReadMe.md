@@ -102,7 +102,7 @@ ext_node="Traffic|Expire| GB|Days|Date"
 - 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。
 - 10 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并使用`sleeptime`的值循环刷新检测配置文件变化，值发生变化则重载网关。
 - 11 `suburl`和`subtime`: subrul运行模式的专用配置，`suburl`指定订阅的地址（记得加双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔而不是`sleeptime`，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔，检测配置变化仍然是由`sleeptime`进行。
-- 12 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能，适用于yaml和suburl运行模式。`fast_node`默认值为no，当`fast_node`设置为yes的时候有效。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://www.google.com`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。当开启`fast_node`功能后，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。
+- 12 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能，适用于yaml和suburl运行模式。`fast_node`默认值为no，当`fast_node`设置为yes的时候有效。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://www.google.com`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。当开启`fast_node`功能后，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。开启该功能会忽略`rules：`规则。   
 
 ## 构建说明
 `PaoPao GateWay`iso镜像由Github Actions自动构建仓库代码构建推送，你可以在[Actions](https://github.com/kkkgo/PaoPaoGateWay/actions)查看构建日志并对比下载的镜像sha256值。
