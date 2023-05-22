@@ -1,0 +1,11 @@
+config system
+	option hostname 'PaoPaoGW'
+	option ttylogin '0'
+        option log_size '64'
+        option urandom_seed '0'
+        option zonename 'Asia/Shanghai'
+        option timezone 'CST-8'
+config timeserver 'ntp'
+        option enabled '1'
+        option enable_server '0'
+        list server 'ntp.aliyun.com'

@@ -1,0 +1,8 @@
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+config interface 'eth0'
+	option device 'eth0'
+	option proto 'dhcp'

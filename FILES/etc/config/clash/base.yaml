@@ -1,0 +1,24 @@
+port: 0
+socks-port: 0
+redir-port: 0
+tproxy-port: 1082
+mixed-port: 1080
+allow-lan: {openport}
+bind-address: '127.0.0.1'
+mode: {clashmode}
+external-controller: 0.0.0.0:{clash_web_port}
+external-ui: /etc/config/clash/clash-dashboard
+secret: {clash_web_password}
+log-level: info
+ipv6: false
+profile:
+  store-fake-ip: true
+  store-selected: true
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: {fake_cidr}
+  nameserver:
+    - {dns_ip}:{dns_port}

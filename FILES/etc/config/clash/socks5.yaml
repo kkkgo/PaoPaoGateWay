@@ -1,0 +1,9 @@
+proxies:
+  - name: "socks"
+    type: socks5
+    server: "{socks5_ip}"
+    port: {socks5_port}
+    udp: true
+rules:
+  - MATCH,socks
+  - MATCH,DIRECT

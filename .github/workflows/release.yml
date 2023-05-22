@@ -1,0 +1,38 @@
+name: Build and Release ISO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build_release:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    - name: Set SHSHA
+      run: echo "SHSHA="$(echo "${{ github.sha }}"|grep -Eo "^[0-9a-z]{7}"|head -1) >> $GITHUB_ENV
+    - name: Gen sha.txt
+      run: echo "${{ env.SHSHA }}" >sha.txt
+    - name: Set TAG_NAME
+      run: echo "TAG_NAME=""${{ env.SHSHA }}""-""$(date +%Y%m%d)" >> $GITHUB_ENV
+    - name: build iso
+      run: sh makeiso.sh
+    - name: Set variables
+      run: ls -lah && echo "RE_NOTE=$(cat ./renote.txt | tr -d '[:space:]')" >> $GITHUB_ENV
+    - name: Upload files to GitHub release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file_glob: true
+        file: ./iso/*.7z
+        tag: ${{ env.TAG_NAME }}
+        body: ${{ env.RE_NOTE }}
+    - name: Remove old release
+      uses: dev-drprasad/delete-older-releases@v0.2.1
+      with:
+        keep_latest: 3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

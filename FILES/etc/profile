@@ -1,0 +1,14 @@
+[ -f /etc/banner ] && cat /etc/banner
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export HOME=$(grep -e "^${USER:-root}:" /etc/passwd | cut -d ":" -f 6)
+export HOME=${HOME:-/root}
+export PS1='\u@\h:\w\$ '
+export ENV=/etc/shinit
+
+case "$TERM" in
+        xterm*|rxvt*)
+                export PS1='\[\e]0;\u@\h: \w\a\]'$PS1
+                ;;
+esac
+

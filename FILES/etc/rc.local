@@ -1,0 +1,3 @@
+#!/bin/sh
+/usr/bin/ppg.sh &
+exit 0
