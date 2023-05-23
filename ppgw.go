@@ -260,26 +260,10 @@ func main() {
 			fmt.Printf("Failed to parse URL: %v\n", err)
 			os.Exit(0)
 		}
-
 		host := parsedURL.Hostname()
-		ip := net.ParseIP(host)
-		if ip != nil {
-			fmt.Println(rawURL)
-			os.Exit(0)
-		}
 		initDNS()
 		ipString := nslookup(host)
-		port := ""
-		if parsedURL.Port() != "" {
-			port = ":" + parsedURL.Port()
-		} else {
-			if parsedURL.Scheme == "http" {
-				port = ":80"
-			} else if parsedURL.Scheme == "https" {
-				port = ":443"
-			}
-		}
-		constructedURL := fmt.Sprintf("%s\n%s\n%s%s\n%s", host, parsedURL.Scheme, ipString, port, parsedURL.RequestURI())
+		constructedURL := fmt.Sprintf("%s  %s", ipString, host)
 		fmt.Println(constructedURL)
 		os.Exit(0)
 	}

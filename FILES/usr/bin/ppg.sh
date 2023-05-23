@@ -27,7 +27,7 @@ net_ready() {
 
 fast_node_sel() {
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini
+        . /tmp/ppgw.ini 2>/dev/tty0
     fi
     if [ -z "$clash_web_port" ]; then
         clash_web_port="80"
@@ -46,7 +46,7 @@ fast_node_sel() {
 start_clash() {
     if [ -f /tmp/clash.yaml ]; then
         if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini
+            . /tmp/ppgw.ini 2>/dev/tty0
         fi
         if [ -z "$test_node_url" ]; then
             test_node_url="http://www.google.com"
@@ -59,7 +59,7 @@ start_clash() {
 }
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini
+        . /tmp/ppgw.ini 2>/dev/tty0
         str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
@@ -93,24 +93,16 @@ get_conf() {
         rm "$file_down_tmp"
     fi
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini
+        . /tmp/ppgw.ini 2>/dev/tty0
     fi
+    echo "127.0.0.1 localhost" >/etc/hosts
     if [ "$down_sdns" = "yes" ]; then
-        rawURL=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
+        genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
     else
-        rawURL=$(ppgw -rawURL "$down_url")
+        genHost=$(ppgw -rawURL "$down_url")
     fi
-    line_count=$(echo "$rawURL" | wc -l)
-    if [ "$line_count" -eq 1 ]; then
-        wget --header="User-Agent: ClashforWindows/0.20.23" --timeout=10 --tries=1 --no-check-certificate "$down_url" -O "$file_down_tmp" >/dev/tty0 2>&1
-    else
-        rawDomain=$(echo "$rawURL" | head -1)
-        rawSch=$(echo "$rawURL" | sed -n "2p")
-        rawIP=$(echo "$rawURL" | sed -n "3p")
-        rawReq=$(echo "$rawURL" | tail -1)
-        down_url="$rawSch"":""//""$rawIP""$rawReq"
-        wget --header="Host: ""$rawDomain" --header="User-Agent: ClashforWindows/0.20.23" --timeout=10 --no-check-certificate "$down_url" -O "$file_down_tmp" >/dev/tty0 2>&1
-    fi
+    echo "$genHost" >>/etc/hosts
+    wget --header="User-Agent: ClashforWindows/0.20.23" --timeout=10 --tries=1 --no-check-certificate "$down_url" -O "$file_down_tmp" >/dev/tty0 2>&1
     if [ "$down_type" = "ini" ]; then
         if head -1 "$file_down_tmp" | grep -q "#paopao-gateway"; then
             cp "$file_down_tmp" "$file_down"
@@ -192,7 +184,7 @@ reload_gw() {
         log "[SYSCTL] Turn on net.ipv4.conf.all.route_localnet..." warn
         sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1
     fi
-    . /tmp/ppgw.ini
+    . /tmp/ppgw.ini 2>/dev/tty0
     if [ -z "$udp_enable" ]; then
         udp_enable="yes"
     fi
@@ -342,7 +334,7 @@ fi
 
 if [ "$1" = "cron" ]; then
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini
+        . /tmp/ppgw.ini 2>/dev/tty0
     fi
     get_conf "$suburl" "yaml" "yes"
     exit
@@ -368,7 +360,7 @@ while true; do
         fi
     fi
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini
+        . /tmp/ppgw.ini 2>/dev/tty0
     fi
     if [ "$mode" = "yaml" ]; then
         try_conf "$yamlfile" "yaml"
