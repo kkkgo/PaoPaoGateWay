@@ -81,23 +81,44 @@ func updateCrontab(interval string) error {
 }
 
 func convertToCronExpression(interval string) (string, error) {
-	duration, err := time.ParseDuration(interval)
-	if err != nil {
-		return "", err
-	}
-	minutes := int(duration.Minutes())
-	hours := minutes / 60
-	days := hours / 24
-	switch {
-	case days > 0:
-		return fmt.Sprintf("0 0 */%d * *", days), nil
-	case hours > 0:
-		return fmt.Sprintf("0 */%d * * *", hours), nil
-	case minutes > 0:
-		return fmt.Sprintf("*/%d * * * *", minutes), nil
+	lastChar := interval[len(interval)-1]
+	durationPart := interval[:len(interval)-1]
+	var totalMinutes int
+
+	switch lastChar {
+	case 'm':
+		duration, err := strconv.Atoi(durationPart)
+		if err != nil {
+			return "", err
+		}
+		totalMinutes = duration
+	case 'h':
+		duration, err := strconv.Atoi(durationPart)
+		if err != nil {
+			return "", err
+		}
+		totalMinutes = duration * 60
+	case 'd':
+		duration, err := strconv.Atoi(durationPart)
+		if err != nil {
+			return "", err
+		}
+		totalMinutes = duration * 24 * 60
 	default:
 		return "", fmt.Errorf("invalid time interval")
+	}
 
+	switch {
+	case totalMinutes >= 24*60:
+		days := totalMinutes / (24 * 60)
+		return fmt.Sprintf("0 0 */%d * *", days), nil
+	case totalMinutes > 60:
+		hours := totalMinutes / 60
+		return fmt.Sprintf("0 */%d * * *", hours), nil
+	case totalMinutes > 0:
+		return fmt.Sprintf("*/%d * * * *", totalMinutes), nil
+	default:
+		return "", fmt.Errorf("invalid time interval")
 	}
 }
 

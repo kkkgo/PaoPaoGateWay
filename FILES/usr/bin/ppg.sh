@@ -103,8 +103,20 @@ get_conf() {
     fi
     echo "$genHost" >>/etc/hosts
     wget --header="User-Agent: ClashforWindows/0.20.23" --timeout=10 --tries=1 --no-check-certificate "$down_url" -O "$file_down_tmp" >/dev/tty0 2>&1
+    echo "127.0.0.1 localhost" >/etc/hosts
     if [ "$down_type" = "ini" ]; then
         if head -1 "$file_down_tmp" | grep -q "#paopao-gateway"; then
+            checkflag=0
+            if sed 's/\r$//' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+="[^\"]+$' >/dev/tty0 2>&1; then
+                checkflag=1
+            fi
+            if sed 's/\r$//' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+=[^"]+"$' >/dev/tty0 2>&1; then
+                checkflag=1
+            fi
+            if [ "$checkflag" = "1" ]; then
+                log "[Fail] Unclosed double quotes found in ""$down_url" warn
+                return 1
+            fi
             cp "$file_down_tmp" "$file_down"
             sed 's/\r$//' "$file_down" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/ppgw.ini"
             log "[Succ] Get ""$down_url" succ
@@ -125,6 +137,7 @@ get_conf() {
 
 try_conf() {
     net_ready
+    ntpd -n -q -p ntp.aliyun.com >/dev/tty0
     export gw=$(ip route show | grep "default via" | head -1 | grep -Eo "$IPREX4" | head -1)
     dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
     dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
@@ -408,7 +421,6 @@ while true; do
     if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
         sleeptime=30
     fi
-
     log "Same hash. Sleep ""$sleeptime""s."
     sleep "$sleeptime"
 done

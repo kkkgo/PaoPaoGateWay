@@ -1,6 +1,8 @@
 #!/bin/sh
+ppgwver=$(date +%Y%m%d)
 if [ -f ./sha.txt ]; then
-    sha="-"$(cat ./sha.txt)
+    ppgwver="$ppgwver""-"$(cat ./sha.txt)
+    sed -i "s/PPGW_version/$ppgwver/g"custom.config.sh
 fi
 # build ppgw
 docker pull golang:alpine
@@ -16,6 +18,7 @@ mkdir -p ./FILES/
 rm -rf ./iso/*
 ls -lah ./iso/
 docker run --rm --name opbuilder \
+    -e ppgwver="$ppgwver" \
     -v $(pwd)/custom.config.sh:/src/custom.config.sh \
     -v $(pwd)/iso/:/src/iso/ \
     -v $(pwd)/FILES:/src/cpfiles/ \
@@ -41,10 +44,12 @@ for file in *.iso; do
     echo "$hash  $file" >>sha256hashsum.txt
 done
 
-tail -1 sha256hashsum.txt | cut -d" " -f1 >../renote.txt
 if [ -f ../sha.txt ]; then
+    tail -1 sha256hashsum.txt | cut -d" " -f1 >../renote.txt
     docker run --rm --name opbuilder \
         -v $(pwd):/src/iso/ \
         -e sha=$sha \
         sliamb/opbuilder bash 7z.sh
+else
+    ls -lah .
 fi
