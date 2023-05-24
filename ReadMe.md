@@ -107,7 +107,7 @@ ext_node="Traffic|Expire| GB|Days|Date"
 ## 与DNS服务器配合完成分流
 PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   
 配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流，以下是一个简单的非CN IP的域名转发到PaoPao GateWay的docker compose配置：  
-假设PaoPaoDNS容器运行在macvlan模式，IP是10.10.10.8。PaoPao GateWay的IP是10.10.10.3，还开启了`openport`功能：
+假设PaoPaoDNS容器IP是10.10.10.8。PaoPao GateWay的IP是10.10.10.3，还开启了`openport`功能：
 ```yaml
 version: "3"
 
