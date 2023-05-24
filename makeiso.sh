@@ -2,7 +2,7 @@
 ppgwver=$(date +%Y%m%d)
 if [ -f ./sha.txt ]; then
     sha="-"$(cat ./sha.txt)
-    ppgwver="$ppgwver""-""$sha"
+    ppgwver="$ppgwver""$sha"
     sed -i "s/PPGW_version/$ppgwver/g"custom.config.sh
 fi
 # build ppgw
