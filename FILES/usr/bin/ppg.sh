@@ -405,7 +405,7 @@ while true; do
         fi
     fi
 
-    if [ "$fast_node" = "yes" ]; then
+    if [ "$fast_node" = "yes" ] || [ "$fast_node" = "check" ]; then
         if [ -z "$test_node_url" ]; then
             test_node_url="http://www.google.com"
         fi
@@ -414,8 +414,13 @@ while true; do
             log "$proxytest" succ
         else
             log "Node Check Fail:""$proxytest" warn
-            log "Try to switch the fastest node..." warn
-            fast_node_sel
+            if [ "$fast_node" = "yes" ]; then
+                log "Try to switch the fastest node..." warn
+                fast_node_sel
+            else
+                log "Try to update and reload..." warn
+                /usr/bin/reload
+            fi
         fi
     fi
     if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
