@@ -104,6 +104,44 @@ ext_node="Traffic|Expire| GB|Days|Date"
 - 11 `suburl`和`subtime`: subrul运行模式的专用配置，`suburl`指定订阅的地址（记得加双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔而不是`sleeptime`，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔，检测配置变化仍然是由`sleeptime`进行。
 - 12 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能，适用于yaml和suburl运行模式。`fast_node`默认值为no，当`fast_node`设置为yes的时候有效。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://www.google.com`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。当开启`fast_node`功能后，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。开启该功能`yes`会忽略`rules：`规则。如果把`fast_node=check`，则当测试失败时仅更新配置或者订阅，并重载，不主动选择节点。     
 
+## 与DNS服务器配合完成分流
+PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   
+配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流，以下是一个简单的非CN IP的域名转发到PaoPao GateWay的docker compose配置：  
+假设PaoPaoDNS容器运行在macvlan模式，IP是10.10.10.8。PaoPao GateWay的IP是10.10.10.3，还开启了`openport`功能：
+```yaml
+version: "3"
+
+services:
+  paopaodns:
+    image: sliamb/paopaodns:latest
+    container_name: PaoPaoDNS
+    restart: always
+    volumes:
+      - /home/paopaodns:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - UPDATE=weekly
+      - DNS_SERVERNAME=PaoPaoDNS,blog.03k.org
+      - DNSPORT=53
+      - CNAUTO=yes
+      - CNFALL=yes
+      - CN_TRACKER=yes
+      - USE_HOSTS=no
+      - IPV6=no
+      - SOCKS5="10.10.10.3:1080"
+      - SERVER_IP=10.10.10.8
+      - CUSTOM_FORWARD="10.10.10.3:53"
+      - AUTO_FORWARD=yes
+      - AUTO_FORWARD_CHECK=yes
+      - HTTP_FILE=yes
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "5304:5304/ucp"
+      - "5304:5304/tcp"
+      - "7889:7889/tcp"
+```
+
 ## 构建说明
 `PaoPao GateWay`iso镜像由Github Actions自动构建仓库代码构建推送，你可以在[Actions](https://github.com/kkkgo/PaoPaoGateWay/actions)查看构建日志并对比下载的镜像sha256值。
 
