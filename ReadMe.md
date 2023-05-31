@@ -115,10 +115,6 @@ ext_node="Traffic|Expire| GB|Days|Date"
 
 默认的ISO是通过DHCP下发配置的，这个通常能满足大部分场景需求，然而一些企业内部的服务器网段也许只能设置静态IP，或者通过公开的http端口拉取配置觉得不够安全，或者自带的标准开源clash核心支持的功能和协议不够多等等，现在你可以通过docker镜像`sliamb/ppgwiso`，来定制你的专属ISO镜像。  
 ### 使用方法
-确保在每次进行操作之前，拉取最新的镜像，在Linux上或者Windows上操作均可：
-```shell
-docker pull sliamb/ppgwiso
-```
 现在，你可以准备一个文件夹，根据需求，选择性放入以下文件，或者不放：
 #### 配置网络：`network.ini`
 如果你要配置静态IP等信息，可以新建一个`network.ini`如下：
@@ -146,12 +142,16 @@ ppgwurl="http://...."
 你可以把你的amd64的clash二进制文件重命名为clash放到当前目录即可。通过替换clash核心，你可以支持更多的协议和规则功能，比如`Premium Core`支持Wireguard出站，Meta核心支持VLESS等等。   
 注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。
 #### 最后一步：一键生成ISO
-你只需要在放好文件的当前目录执行以下命令则可生成镜像：
+你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  
+确保在每次进行操作之前，使用`docker pull`拉取最新的镜像。  
+在Linux上或者Windows上操作均可：
 ```shell
+docker pull sliamb/ppgwiso
 docker run --rm -v .:/data sliamb/ppgwiso
 ```
 如果你想顺便集成最新的全量GEOIP数据，可以执行：
 ```shell
+docker pull sliamb/ppgwiso
 docker run --rm -e GEOIP=full -v .:/data sliamb/ppgwiso
 ```
 只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。
