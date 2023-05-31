@@ -5,7 +5,7 @@ on:
     - cron: '05 23 * * *'
   push:
     paths-ignore:
-      - 'README.md'
+      - '*.md'
       - '.github/**'
       - 'LICENSE'
   workflow_dispatch:

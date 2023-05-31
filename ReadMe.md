@@ -119,7 +119,7 @@ ext_node="Traffic|Expire| GB|Days|Date"
 ```shell
 docker pull sliamb/ppgwiso
 ```
-现在，你可以在你准备一个文件夹，根据需求，选择性放入以下文件，或者不放：
+现在，你可以准备一个文件夹，根据需求，选择性放入以下文件，或者不放：
 #### 配置网络：`network.ini`
 如果你要配置静态IP等信息，可以新建一个`network.ini`如下：
 ```ini
