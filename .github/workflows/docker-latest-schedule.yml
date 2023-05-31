@@ -1,4 +1,4 @@
-name: Build and Release ISO and docker
+name: Schedule Latest Build Docker
 
 on:
   schedule:
