@@ -1,6 +1,13 @@
 name: Build and Release ISO and docker
 
 on:
+  schedule:
+    - cron: '05 23 * * *'
+  push:
+    paths-ignore:
+      - 'README.md'
+      - '.github/**'
+      - 'LICENSE'
   workflow_dispatch:
 permissions:
   contents: write
@@ -39,17 +46,3 @@ jobs:
         push: true
         platforms: linux/amd64
         tags: sliamb/ppgwiso
-    - name: Upload files to GitHub release
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file_glob: true
-        file: ./iso/paopao-gateway*.7z
-        tag: ${{ env.TAG_NAME }}
-        body: ${{ env.RE_NOTE }}
-    - name: Remove old release
-      uses: dev-drprasad/delete-older-releases@v0.2.1
-      with:
-        keep_latest: 30
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

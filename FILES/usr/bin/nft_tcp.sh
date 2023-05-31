@@ -18,7 +18,7 @@ table ip ppgw {
                 }
         }
         
-        chain clash {
+        chain clashtcp {
                 type filter hook prerouting priority mangle; policy accept;
                 ip daddr @localnetwork return
                 ip protocol tcp tproxy to 127.0.0.1:1082 meta mark set 1

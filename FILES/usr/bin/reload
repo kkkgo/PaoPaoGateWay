@@ -3,5 +3,6 @@ if [ -f /tmp/ppgw.ini ]; then
 fi
 if [ "$mode" = "suburl" ]; then
     /usr/bin/cron.sh
+    else
+    /usr/bin/ppg.sh reload
 fi
-/usr/bin/ppg.sh reload
