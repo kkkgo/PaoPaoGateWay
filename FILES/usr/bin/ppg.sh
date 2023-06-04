@@ -296,7 +296,7 @@ reload_gw() {
     fi
     . /tmp/ppgw.ini 2>/dev/tty0
     if [ -z "$udp_enable" ]; then
-        udp_enable="yes"
+        udp_enable="no"
     fi
 
     # route table
