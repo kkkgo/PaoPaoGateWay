@@ -143,7 +143,7 @@ ppgwurl="http://...."
 注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。
 #### 最后一步：一键生成ISO
 你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  
-确保在每次进行操作之前，使用`docker pull`拉取最新的镜像。  
+确保在每次进行操作之前，使用`docker pull`拉取最新的镜像（docker版本会每天同步最新上游代码）。    
 在Linux上或者Windows上操作均可：
 ```shell
 docker pull sliamb/ppgwiso
