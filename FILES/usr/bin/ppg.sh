@@ -61,6 +61,14 @@ kill_clash() {
     fi
 }
 load_clash() {
+    # ulimit
+    if [ "$(ulimit -n)" -gt 999999 ]; then
+        log "ulimit adbove 1000000." succ
+    else
+        ulimit -SHn 1048576
+        log "ulimit:"$(ulimit -n)
+    fi
+
     if [ -f /tmp/clash.yaml ]; then
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
@@ -270,15 +278,6 @@ try_conf() {
 
 reload_gw() {
     . /etc/profile
-
-    # ulimit
-    if [ "$(ulimit -n)" -gt 999999 ]; then
-        log "ulimit adbove 1000000." succ
-    else
-        ulimit -SHn 1048576
-        log "ulimit:"$(ulimit -n)
-    fi
-
     # ip_forward
     if sysctl -a 2>&1 | grep -qE "net\.ipv4\.ip_forward[ =]+1"; then
         log "[SYSCTL] Turn off net.ipv4.ip_forward..." warn
