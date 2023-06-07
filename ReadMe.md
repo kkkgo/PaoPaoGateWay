@@ -140,7 +140,12 @@ ppgwurl="http://...."
 
 #### 替换clash核心
 你可以把你的amd64的clash二进制文件重命名为clash放到当前目录即可。通过替换clash核心，你可以支持更多的协议和规则功能，比如`Premium Core`支持Wireguard出站，Meta核心支持VLESS等等。   
-注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。
+注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。  
+
+#### 替换Country.mmdb
+默认的GEOIP数据`Country.mmdb`仅包含`CN`和`PRIVATE`地址，你可以在当前目录放入你自己的Country.mmdb。  
+默认的数据来源：https://github.com/kkkgo/Country-only-cn-private.mmdb  
+
 #### 最后一步：一键生成ISO
 你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  
 确保在每次进行操作之前，使用`docker pull`拉取最新的镜像（docker版本会每天同步最新上游代码）。    
@@ -149,12 +154,26 @@ ppgwurl="http://...."
 docker pull sliamb/ppgwiso
 docker run --rm -v .:/data sliamb/ppgwiso
 ```
-如果你想顺便集成最新的全量GEOIP数据，可以执行：
+只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。
+
+#### 可选：生成前置嗅探的ISO
+生成前置嗅探的ISO，流量到达网关后先尝试嗅探出域名再使用FAKEIP，更适合企业环境使用：  
+
+优点：
+- 即使FAKE DNS缓存出错也能正确连接常见协议（http/tls），可以避免因网站使用了QUIC不稳定导致网页断流；   
+- 重启虚拟机也不会因FAKE IP映射不正确而引起无法访问的短暂故障、对DNS TTL处理不正常的客户端兼容更好；   
+
+缺点： 
+- Web面板看不到请求的IP来源
+- UDP Type降级
+- 需要占用更多内存
+- 可能会略微增加延迟
+
+使用该功能，只需要在生成的时候加入环境变量参数`SNIFF=yes`即可：
 ```shell
 docker pull sliamb/ppgwiso
-docker run --rm -e GEOIP=full -v .:/data sliamb/ppgwiso
+docker run --rm -e SNIFF=yes -v .:/data sliamb/ppgwiso
 ```
-只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。
 ## 与DNS服务器配合完成分流
 PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   
 配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流，以下是一个简单的非CN IP的域名转发到PaoPao GateWay的docker compose配置：  
