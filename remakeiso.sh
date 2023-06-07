@@ -1,15 +1,71 @@
 #!/bin/sh
+
+json='{
+    "log": {
+        "loglevel": "error"
+    },
+    "inbounds": [
+        {
+            "port": 1081,
+            "protocol": "dokodemo-door",
+            "address": "127.0.0.1",
+            "settings": {
+                "network": "tcp,udp",
+                "followRedirect": true
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "tproxy": "tproxy"
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": [
+                    "http",
+                    "tls",
+                    "quic"
+                ],
+                "metadataOnly": false
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "socks",
+            "settings": {
+                "servers": [
+                    {
+                        "address": "127.0.0.1",
+                        "port": 1080
+                    }
+                ]
+            }
+        }
+    ]
+}'
+
 echo Patching new iso ...
 7z x -p"$sha" -o"/tmp/" /root.7z >/dev/null
 root=/tmp/remakeroot
 mkdir -p $root
 tar -xf /tmp/ppgwroot.tar -C $root >/dev/null
 rm /tmp/ppgwroot.tar /root.7z
+
 if [ -f /data/Country.mmdb ]; then
     ls -lah /data/Country.mmdb
     echo Patching Country.mmdb...
     cp /data/Country.mmdb $root"/etc/config/clash/Country.mmdb"
 fi
+
+if [ "$SNIFF" = "yes" ]; then
+    echo Patching sniff...
+    mkdir -p $root"/etc/config/v2ray"
+    echo "$json" >$root"/etc/config/v2ray/sniff.json"
+    sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
+    sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
+    cp /v2ray $root"/usr/bin/"
+fi
+
 if [ -f /data/clash ]; then
     ls -lah /data/clash
     echo Patching clash...
