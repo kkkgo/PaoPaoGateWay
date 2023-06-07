@@ -5,18 +5,10 @@ root=/tmp/remakeroot
 mkdir -p $root
 tar -xf /tmp/ppgwroot.tar -C $root >/dev/null
 rm /tmp/ppgwroot.tar /root.7z
-if [ "$GEOIP" = "full" ]; then
-    echo "Pacthing FULL GEOIP..."
-    echo "Downloading full Country.mmdb..."
-    wget https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/Country.mmdb -O /tmp/Country-full.mmdb
-    mmdbfull_hash=$(sha256sum /tmp/Country-full.mmdb | grep -Eo "[a-zA-Z0-9]{64}" | head -1)
-    mmdbfull_down_hash=$(wget -q https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/Country.mmdb.sha256sum -O- | grep -Eo "[a-zA-Z0-9]{64}" | head -1)
-    if [ "$mmdbfull_down_hash" = "$mmdbfull_hash" ]; then
-        echo "New full Country.mmdb OK."
-        mv /tmp/Country-full.mmdb $root"/etc/config/clash/Country.mmdb"
-    else
-        mv /Country-full.mmdb $root"/etc/config/clash/Country.mmdb"
-    fi
+if [ -f /data/Country.mmdb ]; then
+    ls -lah /data/Country.mmdb
+    echo Patching Country.mmdb...
+    cp /data/Country.mmdb $root"/etc/config/clash/Country.mmdb"
 fi
 if [ -f /data/clash ]; then
     ls -lah /data/clash
