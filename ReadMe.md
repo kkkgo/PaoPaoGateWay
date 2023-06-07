@@ -162,11 +162,12 @@ docker run --rm -v .:/data sliamb/ppgwiso
 优点：
 - 即使FAKE DNS缓存出错也能正确连接常见协议（http/tls），可以避免因网站使用了QUIC不稳定导致网页断流；   
 - 重启虚拟机也不会因FAKE IP映射不正确而引起无法访问的短暂故障、对DNS TTL处理不正常的客户端兼容更好；   
+- 嗅探禁止BT流量；   
 
 缺点： 
 - Web面板看不到请求的IP来源
-- UDP Type降级
 - 需要占用更多内存
+- 有可能导致UDP Type降级
 - 可能会略微增加延迟
 
 使用该功能，只需要在生成的时候加入环境变量参数`SNIFF=yes`即可：

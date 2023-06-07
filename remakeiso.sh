@@ -40,8 +40,29 @@ json='{
                     }
                 ]
             }
+        },
+        {
+            "protocol": "blackhole",
+            "tag": "blocked"
         }
-    ]
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "network": "udp",
+                "port": 443
+            },
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "protocol": [
+                    "bittorrent"
+                ]
+            }
+        ]
+    }
 }'
 
 echo Patching new iso ...
