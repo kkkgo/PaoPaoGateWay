@@ -538,31 +538,31 @@ while true; do
     fi
     if ps | grep -v "grep" | grep "/etc/config/clash"; then
         echo "Clash running OK."
+        if [ "$fast_node" = "yes" ] || [ "$fast_node" = "check" ]; then
+            if [ -z "$test_node_url" ]; then
+                test_node_url="https://www.youtube.com/generate_204"
+            fi
+            proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
+            if [ $? -eq 0 ]; then
+                log "$proxytest" succ
+            else
+                log "Node Check Fail:""$proxytest" warn
+                kill_clash
+                if [ "$fast_node" = "yes" ]; then
+                    log "Try to update and reload..." warn
+                    if [ "$mode" = "suburl" ]; then
+                        get_conf "$suburl" "yaml" "yes"
+                    fi
+                    reload_gw
+                fi
+            fi
+        fi
     else
         ps | grep clash >/dev/tty0 &
         log "Try to run Clash again..." warn
         load_clash $fast_node $udp_enable
     fi
 
-    if [ "$fast_node" = "yes" ] || [ "$fast_node" = "check" ]; then
-        if [ -z "$test_node_url" ]; then
-            test_node_url="https://www.youtube.com/generate_204"
-        fi
-        proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
-        if [ $? -eq 0 ]; then
-            log "$proxytest" succ
-        else
-            log "Node Check Fail:""$proxytest" warn
-            kill_clash
-            if [ "$fast_node" = "yes" ]; then
-                log "Try to update and reload..." warn
-                if [ "$mode" = "suburl" ]; then
-                    get_conf "$suburl" "yaml" "yes"
-                fi
-                reload_gw
-            fi
-        fi
-    fi
     if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
         sleeptime=30
     fi
