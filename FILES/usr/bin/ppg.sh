@@ -120,6 +120,7 @@ load_clash() {
                 /usr/bin/nft.sh
             fi
         fi
+        ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
     fi
 
 }
@@ -493,7 +494,6 @@ while true; do
                 kill_clash
             fi
             if [ "$old_fast_node" != "$fast_node" ]; then
-                kill_clash
                 if [ "$mode" = "suburl" ]; then
                     get_conf "$suburl" "yaml" "yes"
                 fi
@@ -547,7 +547,6 @@ while true; do
                 log "$proxytest" succ
             else
                 log "Node Check Fail:""$proxytest" warn
-                kill_clash
                 if [ "$fast_node" = "yes" ]; then
                     log "Try to update and reload..." warn
                     if [ "$mode" = "suburl" ]; then
@@ -558,7 +557,6 @@ while true; do
             fi
         fi
     else
-        ps | grep clash >/dev/tty0 &
         log "Try to run Clash again..." warn
         load_clash $fast_node $udp_enable
     fi

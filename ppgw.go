@@ -39,6 +39,7 @@ var (
 	extNodeStr   string
 	testProxy    string
 	reload       bool
+	closeall     bool
 )
 
 var orange = "\033[38;5;208m"
@@ -93,6 +94,7 @@ func main() {
 	flag.StringVar(&testNodeURL, "test_node_url", "", "test_node_url")
 	flag.StringVar(&extNodeStr, "ext_node", "", "ext_node")
 	flag.BoolVar(&reload, "reload", false, "reload yaml")
+	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
 
 	flag.Parse()
 	if reload {
@@ -151,6 +153,17 @@ func main() {
 	}
 
 	//clashapi ./ppgw -apiurl="http://10.10.10.3:9090" -secret="clashpass" -test_node_url="https://www.google.com" -ext_node="ong|Traffic|Expire| GB"
+	if closeall {
+		if secret == "" || apiURL == "" {
+			os.Exit(1)
+		}
+		err := deleteConnections(apiURL, secret)
+		if err != nil {
+			fmt.Printf(red+"[PaoPaoGW Close]"+reset+"Unable to close connections %s：%v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if apiURL != "" {
 		if secret == "" || testNodeURL == "" {
 			os.Exit(1)
@@ -204,6 +217,7 @@ func main() {
 				fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to select node %s：%v\n", fastestNode, err)
 			}
 			fmt.Printf("\n"+green+"[PaoPaoGW Fast]"+reset+"The fastest node selected:%s\n", fastestNode)
+			deleteConnections(apiURL, secret)
 			os.Exit(0)
 		} else {
 			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "There are no nodes available")
@@ -676,4 +690,28 @@ func setGlobalMode(apiURL, secret string) error {
 	}
 
 	return fmt.Errorf("Failed to set Global mode, response status code	：%d", resp.StatusCode)
+}
+
+func deleteConnections(apiURL, secret string) error {
+	url := fmt.Sprintf("%s/connections", apiURL)
+
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", secret))
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+
+	return fmt.Errorf("Failed to delete connections, response status code: %d", resp.StatusCode)
 }
