@@ -107,7 +107,7 @@ ext_node="Traffic|Expire| GB|Days|Date"
 - 12 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能。`fast_node`默认值为no。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://https://www.youtube.com/generate_204`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。`fast_node`的行为如下：
   - 当`fast_node=yes`或者`fast_node=check`，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则立即停止clash并秒重载网关配置，如果是suburl模式，还会在重载前拉新订阅配置。
   - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式。
-  - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=yes`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
+  - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
 
 
 ## 使用docker定制ISO镜像:ppwgiso
