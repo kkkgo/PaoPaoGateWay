@@ -1,7 +1,7 @@
 ## PaoPao GateWay
 ![PaoPaoDNS](https://th.bing.com/th/id/OIG.0FtL40H4krRLeooEGFpu?w=220&h=220&c=6&r=0&o=5&pid=ImgGn)    
 
-PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，系统由openwrt定制构建，核心由clash驱动，支持`Full Cone NAT` ，支持多种方式下发配置，支持多种出站方式，包括自定义socks5、自定义yaml节点、订阅模式和自由出站，支持节点测速自动选择、节点排除等功能，并附带web面板可供查看日志连接信息等。PaoPao GateWay可以和其他DNS服务器一起结合使用，比如配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流。   
+PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由clash驱动，支持`Full Cone NAT` ，支持多种方式下发配置，支持多种出站方式，包括自定义socks5、自定义yaml节点、订阅模式和自由出站，支持节点测速自动选择、节点排除等功能，并附带web面板可供查看日志连接信息等。PaoPao GateWay可以和其他DNS服务器一起结合使用，比如配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流。   
 
 你可以从Github Release下载到最新的镜像：[https://github.com/kkkgo/PaoPaoGateWay/releases](https://github.com/kkkgo/PaoPaoGateWay/releases)   
 ## [→详细说明《FakeIP网关的工作原理》](https://blog.03k.org/post/paopaogateway.html)
@@ -15,9 +15,10 @@ PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，系统由ope
 网卡|1
 光驱|1  
   
+#### 方式一：使用docker内嵌配置
+你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、集成全量GEOIP、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
 
-写在前面：从2023.05.31新版本开始，可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、集成全量GEOIP、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
-
+#### 方式二：使用DHCP下发配置
 PaoPao GateWay是一个iso镜像，为虚拟机运行优化设计，你只需要添加一个网络接口和一个虚拟光驱塞iso即可。虚拟机启动之后，会自动使用DHCP初始化eth0接口，因此你需要在路由器里为这个虚拟机**绑定静态的IP地址**，如果你在路由器里面找不到哪个是PaoPao GateWay的话，他的主机名是PaoPaoGW，虚拟机也会滚动显示获取到的eth0接口的IP地址和MAC信息。  
 为了实现配置和虚拟机分离，达到类似docker的效果，PaoPaoGateWay采用了配置下发的方式进行配置，你需要把配置文件放在对应位置，假设系统启动后通过DHCP获取到以下信息：  
 ```shell
@@ -148,7 +149,7 @@ ppgwurl="http://...."
 
 #### 最后一步：一键生成ISO
 你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  
-确保在每次进行操作之前，使用`docker pull`拉取最新的镜像（docker版本会每天同步最新上游代码）。    
+确保在每次进行操作之前，使用`docker pull`拉取最新的镜像（不同于release版本，docker版本会每天同步最新所有上游代码）。    
 在Linux上或者Windows上操作均可：
 ```shell
 docker pull sliamb/ppgwiso
