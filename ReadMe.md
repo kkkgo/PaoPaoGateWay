@@ -16,7 +16,7 @@ PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由cla
 光驱|1  
   
 #### 方式一：使用docker内嵌配置
-你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、集成全量GEOIP、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
+你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、替换Country.mmdb、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
 
 #### 方式二：使用DHCP下发配置
 PaoPao GateWay是一个iso镜像，为虚拟机运行优化设计，你只需要添加一个网络接口和一个虚拟光驱塞iso即可。虚拟机启动之后，会自动使用DHCP初始化eth0接口，因此你需要在路由器里为这个虚拟机**绑定静态的IP地址**，如果你在路由器里面找不到哪个是PaoPao GateWay的话，他的主机名是PaoPaoGW，虚拟机也会滚动显示获取到的eth0接口的IP地址和MAC信息。  
