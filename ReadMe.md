@@ -205,6 +205,7 @@ services:
       - CUSTOM_FORWARD=10.10.10.3:53
       - AUTO_FORWARD=yes
       - AUTO_FORWARD_CHECK=yes
+      - USE_MARK_DATA=yes
       - HTTP_FILE=yes
     ports:
       - "53:53/udp"
