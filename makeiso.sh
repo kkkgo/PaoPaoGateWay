@@ -9,7 +9,9 @@ if [ -f "$builddir""/sha.txt" ]; then
 fi
 
 # build ppgw
-rm "$builddir"/FILES/usr/bin/ppgw
+if [ -f "$builddir"/FILES/usr/bin/ppgw ]; then
+    rm "$builddir"/FILES/usr/bin/ppgw
+fi
 docker pull golang:alpine
 docker run --rm --name gobuilder \
     -v "$builddir"/ppgw.go:/go/build/main.go \
