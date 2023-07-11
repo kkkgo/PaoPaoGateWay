@@ -580,7 +580,7 @@ func containsExcludedKeyword(nodeName string, excludedNodes []string) bool {
 func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, error) {
 	client := &http.Client{}
 
-	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=3000&url=%s", apiURL, nodeName, testNodeURL)
+	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=5000&url=%s", apiURL, nodeName, testNodeURL)
 
 	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {

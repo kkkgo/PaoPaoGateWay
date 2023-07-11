@@ -7,6 +7,7 @@ allow-lan: {openport}
 bind-address: '127.0.0.1'
 mode: {clashmode}
 external-controller: 0.0.0.0:{clash_web_port}
+#interface-name: tun114
 external-ui: /etc/config/clash/clash-dashboard
 secret: {clash_web_password}
 log-level: info
@@ -21,4 +22,4 @@ dns:
   enhanced-mode: fake-ip
   fake-ip-range: {fake_cidr}
   nameserver:
-    - {dns_ip}:{dns_port}
+    - {dns_ip}:{dns_port}#eth0

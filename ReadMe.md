@@ -1,7 +1,7 @@
 ## PaoPao GateWay
 ![PaoPaoDNS](https://th.bing.com/th/id/OIG.0FtL40H4krRLeooEGFpu?w=220&h=220&c=6&r=0&o=5&pid=ImgGn)    
 
-PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由clash驱动，支持`Full Cone NAT` ，支持多种方式下发配置，支持多种出站方式，包括自定义socks5、自定义yaml节点、订阅模式和自由出站，支持节点测速自动选择、节点排除等功能，并附带web面板可供查看日志连接信息等。PaoPao GateWay可以和其他DNS服务器一起结合使用，比如配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流。   
+PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由clash驱动，支持`Full Cone NAT` ，支持多种方式下发配置，支持多种出站方式，包括自定义socks5、自定义openvpn、自定义yaml节点、订阅模式和自由出站，支持节点测速自动选择、节点排除等功能，并附带web面板可供查看日志连接信息等。PaoPao GateWay可以和其他DNS服务器一起结合使用，比如配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流。   
 
 你可以从Github Release下载到最新的镜像：[https://github.com/kkkgo/PaoPaoGateWay/releases](https://github.com/kkkgo/PaoPaoGateWay/releases)   
 ## [→详细说明《FakeIP网关的工作原理》](https://blog.03k.org/post/paopaogateway.html)
@@ -39,7 +39,7 @@ ppgw.ini的所有配置项如下：
 ```ini
 #paopao-gateway
 
-# mode=socks5|yaml|suburl|free
+# mode=socks5|ovpn|yaml|suburl|free
 # default: free
 mode=free
 
@@ -74,6 +74,13 @@ socks5_ip="10.10.10.5"
 # default: socks5_port="7890"
 socks5_port="7890"
 
+# ovpn mode settting
+# The ovpn file in the same directory as the ppgw.ini.
+# default: ovpnfile=custom.ovpn
+ovpnfile="custom.ovpn"
+ovpn_username=""
+ovpn_password=""
+
 # yaml mode settting
 # The yaml file in the same directory as the ppgw.ini.
 # default: yamlfile=custom.yaml
@@ -83,7 +90,7 @@ yamlfile="custom.yaml"
 suburl="https://..."
 subtime=1d
 
-# yaml and suburl mode setting
+# yaml|suburl|ovpn mode setting
 # fast_node=check/yes/no
 fast_node=yes
 test_node_url="https://www.youtube.com/generate_204"
@@ -91,8 +98,9 @@ ext_node="Traffic|Expire| GB|Days|Date"
 ```
 下面逐项来解释选项的用法：
 - 1 配置文件第一行必须以`#paopao-gateway`开头。配置格式为`选项="值"`。
-- 2 `mode`是网关的运行模式，也就是当静态路由的流量到达网关之后，怎么出去。一共有四种模式可以选择（`socks5`,`yaml`,`suburl`,`free`）:
+- 2 `mode`是网关的运行模式，也就是当静态路由的流量到达网关之后，怎么出去。一共有五种模式可以选择（`socks5`,`ovpn`,`yaml`,`suburl`,`free`）:
     - `socks5`:配置为socks5代理出站，这是最简单也是最通用的配置方式，如果其他模式不能满足你的需求，你可以把能满足你需求的服务程序开一个`socks5`代理给网关使用。
+    - `ovpn`:配置为openvpn出站，适用于一些专线场景。
     - `yaml`：自定义clash的yaml配置文件出站。你可以自己写一个clash格式的yaml配置文件，clash支持多种出站协议，具体写法请看官方wiki。只写`proxies:`字段即可，也可以包含`rules:`字段。如果只有`proxies:`字段，在网关启动后你可以在web端选择节点；如果有`rules:`字段，则会按照你写的规则来执行。注意，网关使用开源的官方clash核心，如果你的`rules:`包含闭源Premium core的规则，则无法加载并报错，导致clash无法启动。使用开源的Clash核心是因为功能已经可以满足需求，网关本身也不适合加载过于复杂的规则，Premium core的功能会降低稳定性、增加崩溃的几率，比如`RULE-SET`功能在启动的时候下载远程url文件失败的话可能会导致clash无法正常启动，而clash无法启动的时候文件可能不能被正常下载，进入了死循环。此外，由于网关也不适用GEOIP规则，请勿写入任何GEOIP规则，因为GEOIP规则依赖GEOIP库更新，而稳定的网关不适合依赖更新运行([参见](https://github.com/Dreamacro/clash/issues/2674#issuecomment-1507868338))，此外碰到GEOIP规则会触发DNS解析，降低了处理效率。如果有更复杂的规则需求，建议单独跑一个docker配置你所需的规则，开放socks5端口，让网关使用`socks5`模式，或者参考**使用docker定制ISO镜像**一节更换定制的clash核心。选择该模式，你需要把配置文件放在和`ppgw.ini`同一目录，系统将会在指定的`sleeptime`内循环检测配置值的变化并重载网关。
    - `suburl`：自定义远程订阅clash配置，不过是从给定的url下载配置。注意事项与`yaml`模式基本一样，不能使用包含开源clash功能之外的规则的订阅，或者参考**使用docker定制ISO镜像**一节更换定制的clash核心。推荐nodelist类型订阅，或者使用subconverter等程序转换订阅。
     - `free`: 自由出站模式，选择此模式的场景是，假定你在IP层面把虚拟机IP出口走了专线，流量直接出站处理。
@@ -103,13 +111,15 @@ ext_node="Traffic|Expire| GB|Days|Date"
 - 7 `udp_enable`: 是否允许UDP流量通过网关，默认值为no，设置为no则禁止UDP流量进入网关。（此选项只影响路由，不影响`openport`选项）注意：如果你的节点不支持UDP或者不稳定不建议开启，开启UDP将会导致QUIC失败导致网站有时候上不去的现象。   
 - 8 `sleeptime`是拉取配置检测更新的时间间隔，默认值是30，单位是秒。`sleeptime`在第一次成功获取到配置后生效，如果配置的值发生变化，将会重载网关配置。
 - 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。
-- 10 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并使用`sleeptime`的值循环刷新检测配置文件变化，值发生变化则重载网关。
-- 11 `suburl`和`subtime`: suburl运行模式的专用配置，`suburl`指定订阅的地址（记得加英文半角双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔而不是`sleeptime`，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔，检测配置变化仍然是由`sleeptime`进行。注意如果开了`fast_node`功能，检测不通的时候会主动拉新订阅。  
-- 12 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能。`fast_node`默认值为no。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://https://www.youtube.com/generate_204`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。`fast_node`的行为如下：
+- 10 `ovpnfile`，`ovpn_username`和`ovpn_password`: ovpn运行模式的专用设置，`ovpnfile`指定ovpn的文件名，系统将会从`ppgw.ini`的同一目录下载该文件。如果你的ovpn需要用户名和密码认证，可以指定`ovpn_username`和`ovpn_password`。
+- 11 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并使用`sleeptime`的值循环刷新检测配置文件变化，值发生变化则重载网关。
+- 12 `suburl`和`subtime`: suburl运行模式的专用配置，`suburl`指定订阅的地址（记得加英文半角双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔而不是`sleeptime`，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔，检测配置变化仍然是由`sleeptime`进行。注意如果开了`fast_node`功能，检测不通的时候会主动拉新订阅。  
+- 13 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能。`fast_node`默认值为no。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://https://www.youtube.com/generate_204`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。`fast_node`的行为如下：
   - 当`fast_node=yes`或者`fast_node=check`，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则立即停止clash并秒重载网关配置，如果是suburl模式，还会在重载前拉新订阅配置。
   - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式。
   - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
-
+  - 注意，当`mode=ovpn`，因为对clash来说只有一个节点，所以`yes`和`check`效果一样。
+  - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。
 
 ## 使用docker定制ISO镜像:ppwgiso
 ![pull](https://img.shields.io/docker/pulls/sliamb/ppgwiso.svg) ![size](https://img.shields.io/docker/image-size/sliamb/ppgwiso)   
@@ -134,6 +144,10 @@ ppgwurl="http://...."
 #### 内嵌`ppgw.ini`
 如果你想固定`ppgw.ini`的配置而不是通过http远程拉取，你可以直接在当前目录放入`ppgw.ini`。   
 注意：内嵌`ppgw.ini`优先级比`ppgwurl.ini`高，同时内嵌`ppgwurl.ini`不生效。
+
+#### 内嵌`custom.ovpn`
+你可以把节点信息`custom.ovpn`放入当前目录，当`mode=ovpn`的时候将会强制使用该文件。    
+注意：你仍然需要在`ppgw.ini`中指定`mode=ovpn`才会使用到该文件。
 
 #### 内嵌`custom.yaml`
 你可以把节点信息`custom.yaml`放入当前目录，当`mode=yaml`的时候将会强制使用该文件。    

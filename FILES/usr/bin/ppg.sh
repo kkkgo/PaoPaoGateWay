@@ -29,6 +29,9 @@ fast_node_sel() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
     fi
+    if [ "$mode" = "ovpn" ]; then
+        return 0
+    fi
     if [ -z "$clash_web_port" ]; then
         clash_web_port="80"
     fi
@@ -122,12 +125,71 @@ load_clash() {
         fi
         ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
     fi
+}
+
+kill_ovpn() {
+    if ps | grep -v "grep" | grep "/etc/config/clash"; then
+        kill $(pgrep -x "openvpn")
+    fi
+    ovpn_tun="tun114"
+    if ip a | grep -q $ovpn_tun; then
+        ip link set $ovpn_tun down >/dev/tty0
+        ip link delete $ovpn_tun >/dev/tty0
+    fi
 
 }
+
+load_ovpn() {
+    # ulimit
+    if [ "$(ulimit -n)" -gt 999999 ]; then
+        log "ulimit adbove 1000000." succ
+    else
+        ulimit -SHn 1048576
+        log "ulimit:"$(ulimit -n)
+    fi
+    if [ -f /tmp/ppgw.ovpn.down ]; then
+        grep -E "^remote " | cut -d" " -f2 | grep -Eo "[-._0-9a-zA-Z]+" >/tmp/ovpn_remote.list
+        echo "127.0.0.1 localhost" >/etc/hosts
+        echo "" >>/tmp/ovpn_remote.list
+        while read ovpn_remote; do
+            echo "Test "$dnsserver
+            genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "ovpn://""$ovpn_remote")
+            echo "$genHost" >>/etc/hosts
+        done </tmp/ovpn_remote.list
+
+        sed -r "/^dev /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
+        if [ -f /tmp/ppgw.ini ]; then
+            . /tmp/ppgw.ini 2>/dev/tty0
+        fi
+        if [ -n "$ovpn_username" ]; then
+            sed -r "/^auth-user-pass /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
+            echo "auth-user-pass /tmp/ovpn_pass.txt" >>/tmp/paopao.ovpn
+            echo "$ovpn_username" >/tmp/ovpn_pass.txt
+            echo "$ovpn_password" >>/tmp/ovpn_pass.txt
+        fi
+        echo "dev tun114" >>/tmp/paopao.ovpn
+        if ! grep -q route-nopull /tmp/paopao.ovpn; then
+            echo "route-nopull" >>/tmp/paopao.ovpn
+        fi
+        openvpn --config /tmp/paopao.ovpn >/dev/tty0 2>&1 &
+        while ! ip a | grep -q 'tun114 '; do
+            touch /tmp/ovpn_wait.txt
+            log "Waiting for openvpn tun to be ready." warn
+            sleep 1
+            echo "1" >>/tmp/ovpn_wait.txt
+            if [ "$(cat /tmp/ovpn_wait.txt | wc -l)" -gt 10 ]; then
+                break
+            fi
+        done
+    else
+        log "The paopao.ovpn generation failed." warn
+    fi
+}
+
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -138,6 +200,15 @@ gen_yaml_hash() {
     calcfile=$1
     if [ -f "$calcfile" ]; then
         ppgw -yamlhashFile "$calcfile"
+    else
+        echo "$calcfile"" does not exist"
+    fi
+}
+
+gen_ovpn_hash() {
+    calcfile=$1
+    if [ -f "$calcfile" ]; then
+        md5sum "$calcfile" | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "$calcfile"" does not exist"
     fi
@@ -162,6 +233,9 @@ get_conf() {
     fi
     if [ "$down_type" = "yaml" ]; then
         file_down="/tmp/ppgw.yaml.down"
+    fi
+    if [ "$down_type" = "ovpn" ]; then
+        file_down="/tmp/ppgw.ovpn.down"
     fi
     file_down_tmp="$file_down"".tmp"
     if [ -f "$file_down_tmp" ]; then
@@ -227,6 +301,13 @@ get_conf() {
             return 0
         fi
     fi
+    if [ "$down_type" = "ovpn" ]; then
+        if grep -q "remote" "$file_down_tmp"; then
+            cp "$file_down_tmp" "$file_down"
+            log "[Succ] Get ""$down_url" succ
+            return 0
+        fi
+    fi
     log "[Fail] Get ""$down_url" warn
     return 1
 }
@@ -256,6 +337,15 @@ try_conf() {
         else
             cp /www/custom.yaml /tmp/ppgw.yaml.down
             cp /www/custom.yaml /tmp/paopao_custom.yaml
+        fi
+        return 0
+    fi
+
+    if [ -f /www/custom.ovpn ] && [ "$down_type" = "ovpn" ]; then
+        if [ -f "/tmp/ppgw.ovpn.down" ] && [ -f "/tmp/paopao.ovpn" ]; then
+            log "Load local ovpn" succ
+        else
+            cp /www/custom.ovpn /tmp/ppgw.ovpn.down
         fi
         return 0
     fi
@@ -366,6 +456,11 @@ reload_gw() {
     if [ -z "$yamlfile" ]; then
         yamlfile="custom.yaml"
     fi
+
+    if [ -z "$ovpnfile" ]; then
+        ovpnfile="custom.ovpn"
+    fi
+
     fake_cidr_escaped=$(echo "$fake_cidr" | sed 's/\//\\\//g')
     sed 's/\r$//' /etc/config/clash/base.yaml >/tmp/clash_base.yaml
     sed -i "s/{fake_cidr}/$fake_cidr_escaped/g" /tmp/clash_base.yaml
@@ -389,6 +484,15 @@ reload_gw() {
     if [ "$mode" = "yaml" ]; then
         kill_cron
         try_conf "$yamlfile" "yaml"
+    fi
+    if [ "$mode" = "ovpn" ]; then
+        kill_cron
+        try_conf "$ovpnfile" "ovpn"
+        sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
+        sed -i "s/#interface-name/interface-name/g" /tmp/clash_base.yaml
+        cat /tmp/clash_base.yaml >/tmp/clash.yaml
+        kill_ovpn
+        load_ovpn
     fi
     if [ "$mode" = "suburl" ]; then
         if echo "$suburl" | grep -q "//"; then
@@ -460,6 +564,7 @@ echo " " >/dev/tty0
 
 last_hash="empty"
 last_yaml_hash="empty"
+last_ovpn_hash="empty"
 while true; do
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
@@ -529,6 +634,19 @@ while true; do
             continue
         fi
     fi
+    if [ "$mode" = "ovpn" ]; then
+        ovpn_hash=$(gen_ovpn_hash "/tmp/ppgw.ovpn.down")
+        log "[OLD OVPN HASH]: ""$last_ovpn_hash"
+        log "[NEW OVPN HASH]: ""$ovpn_hash"
+        if [ "$last_ovpn_hash" != "$ovpn_hash" ]; then
+            log "The ovpn hash has changed, reload gateway." warn
+            reload_gw
+            if [ -f /tmp/ppgw.ovpn.down ]; then
+                last_ovpn_hash=$(gen_ovpn_hash "/tmp/ppgw.ovpn.down")
+            fi
+            continue
+        fi
+    fi
     if [ -z "$fast_node" ]; then
         if [ "$clashmode" = "global" ]; then
             fast_node=yes
@@ -552,7 +670,12 @@ while true; do
                     if [ "$mode" = "suburl" ]; then
                         get_conf "$suburl" "yaml" "yes"
                     fi
-                    reload_gw
+                    if [ "$mode" = "ovpn" ]; then
+                        try_conf "$ovpnfile" "ovpn"
+                    fi
+                    if ip a | grep -q tun114; then
+                        reload_gw
+                    fi
                 fi
             fi
         fi

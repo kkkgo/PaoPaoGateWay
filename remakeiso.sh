@@ -138,6 +138,12 @@ if [ -f /data/custom.yaml ]; then
     sed 's/\r$//' /data/custom.yaml >$root"/www/custom.yaml"
 fi
 
+if [ -f /data/custom.ovpn ]; then
+    ls -lah /data/custom.ovpn
+    echo Patching custom.ovpn...
+    cp /data/custom.ovpn $root"/www/custom.ovpn"
+fi
+
 echo "Making iso..."
 xorriso -as mkisofs -R -b boot/grub/eltorito.img \
     -no-emul-boot -boot-info-table \
