@@ -102,29 +102,26 @@ load_clash() {
     else
         log "The clash.yaml generation failed." warn
     fi
-
-    if ps | grep -v "grep" | grep "/etc/config/clash"; then
-        if [ "$1" = "yes" ]; then
-            fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel
-        fi
-        if [ "$2" = "no" ]; then
-            if nft list ruleset | grep "clashtcp"; then
-                log "[OK] nft rule TCP OK." succ
-
-            else
-                log "[ADD] Add nft rule TCP..." warn
-                /usr/bin/nft_tcp.sh
-            fi
-        else
-            if nft list ruleset | grep "clashboth"; then
-                log "[OK] nft rule TCP/UDP OK." succ
-            else
-                log "[ADD] Add nft rule TCP/UDP..." warn
-                /usr/bin/nft.sh
-            fi
-        fi
-        ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
+    if [ "$1" = "yes" ]; then
+        fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel
     fi
+    if [ "$2" = "no" ]; then
+        if nft list ruleset | grep "clashtcp"; then
+            log "[OK] nft rule TCP OK." succ
+
+        else
+            log "[ADD] Add nft rule TCP..." warn
+            /usr/bin/nft_tcp.sh
+        fi
+    else
+        if nft list ruleset | grep "clashboth"; then
+            log "[OK] nft rule TCP/UDP OK." succ
+        else
+            log "[ADD] Add nft rule TCP/UDP..." warn
+            /usr/bin/nft.sh
+        fi
+    fi
+    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
 }
 
 kill_ovpn() {
