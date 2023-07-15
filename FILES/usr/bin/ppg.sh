@@ -69,6 +69,7 @@ kill_clash() {
     nft flush ruleset
 }
 load_clash() {
+    log "Loading clash..." warn
     # ulimit
     if [ "$(ulimit -n)" -gt 999999 ]; then
         log "ulimit adbove 1000000." succ
@@ -125,7 +126,7 @@ load_clash() {
 }
 
 kill_ovpn() {
-    if ps | grep -v "grep" | grep "/etc/config/clash"; then
+    if ps | grep -v "grep" | grep "/tmp/paopao.ovpn"; then
         kill $(pgrep -x "openvpn")
     fi
     ovpn_tun="tun114"
@@ -137,6 +138,7 @@ kill_ovpn() {
 }
 
 load_ovpn() {
+    log "Loading openvpn..." warn
     # ulimit
     if [ "$(ulimit -n)" -gt 999999 ]; then
         log "ulimit adbove 1000000." succ
@@ -145,13 +147,14 @@ load_ovpn() {
         log "ulimit:"$(ulimit -n)
     fi
     if [ -f /tmp/ppgw.ovpn.down ]; then
-        grep -E "^remote " | cut -d" " -f2 | grep -Eo "[-._0-9a-zA-Z]+" >/tmp/ovpn_remote.list
+        grep -E "^remote " /tmp/ppgw.ovpn.down | cut -d" " -f2 | grep -Eo "[-._0-9a-zA-Z]+" >/tmp/ovpn_remote.list
         echo "127.0.0.1 localhost" >/etc/hosts
         echo "" >>/tmp/ovpn_remote.list
         while read ovpn_remote; do
             echo "Test "$dnsserver
             genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "ovpn://""$ovpn_remote")
             echo "$genHost" >>/etc/hosts
+            log "ovpn remote: ""$genHost"
         done </tmp/ovpn_remote.list
 
         sed -r "/^dev /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
