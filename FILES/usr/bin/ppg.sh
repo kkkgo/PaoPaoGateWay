@@ -665,17 +665,17 @@ while true; do
                 log "$proxytest" succ
             else
                 log "Node Check Fail:""$proxytest" warn
-                if [ "$fast_node" = "yes" ]; then
-                    log "Try to update and reload..." warn
-                    if [ "$mode" = "suburl" ]; then
-                        get_conf "$suburl" "yaml" "yes"
-                    fi
-                    if [ "$mode" = "ovpn" ]; then
-                        try_conf "$ovpnfile" "ovpn"
-                    fi
+                log "Try to update and reload..." warn
+                if [ "$mode" = "ovpn" ]; then
+                    try_conf "$ovpnfile" "ovpn"
                     if ip a | grep -q tun114; then
                         reload_gw
                     fi
+                else
+                    if [ "$mode" = "suburl" ]; then
+                        get_conf "$suburl" "yaml" "yes"
+                    fi
+                    reload_gw
                 fi
             fi
         fi
