@@ -219,7 +219,6 @@ get_conf() {
     sleep 1
     down_url=$1
     down_type=$2
-    down_sdns=$3
     if [ "$down_type" = "ini" ]; then
         if [ -f /www/ppgw.ini ]; then
             if [ -f /tmp/ppgw.ini ]; then
@@ -251,11 +250,7 @@ get_conf() {
         dns_port="53"
     fi
     echo "127.0.0.1 localhost" >/etc/hosts
-    if [ "$down_sdns" = "yes" ]; then
-        genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
-    else
-        genHost=$(ppgw -rawURL "$down_url")
-    fi
+    genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
     if [ "$?" = "1" ]; then
         log "Nslookup failed." warn
         return 1
@@ -318,10 +313,9 @@ try_conf() {
     export gw=$(ip route show | grep "default via" | head -1 | grep -Eo "$IPREX4" | head -1)
     dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
     dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
-    confport=7889
-    conf=$1
+    conf_port=7889
+    conf_name=$1
     down_type=$2
-    paopao="paopao.dns"
     log "Try to get new ""$conf"
     if [ -f /www/ppgwurl.ini ] && [ "$down_type" = "ini" ]; then
         . /www/ppgwurl.ini
@@ -351,27 +345,27 @@ try_conf() {
     fi
 
     if [ -n "$try_succ_host" ]; then
-        get_conf "http://""$try_succ_host":"$try_succ_confport""/""$conf" "$down_type"
-    else
+        get_conf "http://""$try_succ_host":"$conf_port""/""$conf_name" "$down_type"
+    fi
+    if [ "$?" = "1" ]; then
+        paopao=$(ppgw -rawURL "http://paopao.dns" | cut -d" " -f1)
         try_host=$paopao
-        try_confport=$confport
-        get_conf "http://""$try_host":"$try_confport""/""$conf" "$down_type"
+        get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ]; then
         try_host=$gw
-        get_conf "http://""$try_host":"$try_confport""/""$conf" "$down_type"
+        get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ]; then
         try_host=$dns1
-        get_conf "http://""$try_host":"$try_confport""/""$conf" "$down_type"
+        get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ]; then
         try_host=$dns2
-        get_conf "http://""$try_host":"$try_confport""/""$conf" "$down_type"
+        get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "0" ]; then
         export try_succ_host="$try_host"
-        export try_succ_confport="$try_confport"
     fi
 }
 
@@ -502,7 +496,7 @@ reload_gw() {
             if grep -q "proxies:" "/tmp/ppgw.yaml.down"; then
                 log "Sub yaml OK, skip get."
             else
-                get_conf "$suburl" "yaml" "yes"
+                get_conf "$suburl" "yaml"
             fi
             ppgw -interval "$subtime"
             /etc/init.d/cron reload
@@ -553,7 +547,7 @@ if [ "$1" = "cron" ]; then
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
     fi
-    get_conf "$suburl" "yaml" "yes"
+    get_conf "$suburl" "yaml"
     reload_gw
     exit
 fi
@@ -600,12 +594,12 @@ while true; do
             fi
             if [ "$old_fast_node" != "$fast_node" ]; then
                 if [ "$mode" = "suburl" ]; then
-                    get_conf "$suburl" "yaml" "yes"
+                    get_conf "$suburl" "yaml"
                 fi
             fi
             if [ "$mode" = "suburl" ]; then
                 if [ "$old_suburl" != "$suburl" ]; then
-                    get_conf "$suburl" "yaml" "yes"
+                    get_conf "$suburl" "yaml"
                 fi
             fi
             reload_gw
@@ -673,7 +667,7 @@ while true; do
                     fi
                 else
                     if [ "$mode" = "suburl" ]; then
-                        get_conf "$suburl" "yaml" "yes"
+                        get_conf "$suburl" "yaml"
                     fi
                     reload_gw
                 fi
