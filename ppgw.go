@@ -335,7 +335,7 @@ func NewDownloader(url, outputFile string) *Downloader {
 	return &Downloader{
 		URL:        url,
 		OutputFile: outputFile,
-		UserAgent:  "ClashforWindows/0.20.23",
+		UserAgent:  "ClashforWindows/clash-verge/Clash/clash",
 		Timeout:    10 * time.Second,
 	}
 }
