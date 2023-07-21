@@ -102,6 +102,7 @@ load_clash() {
         fi
     else
         log "The clash.yaml generation failed." warn
+        return 1
     fi
     if [ "$1" = "yes" ]; then
         fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel
