@@ -316,7 +316,7 @@ try_conf() {
     conf_port=7889
     conf_name=$1
     down_type=$2
-    log "Try to get new ""$conf"
+    log "Try to get new ""$conf_name"
     if [ -f /www/ppgwurl.ini ] && [ "$down_type" = "ini" ]; then
         . /www/ppgwurl.ini
         if [ -n "$ppgwurl" ]; then
@@ -347,7 +347,7 @@ try_conf() {
     if [ -n "$try_succ_host" ]; then
         get_conf "http://""$try_succ_host":"$conf_port""/""$conf_name" "$down_type"
     fi
-    if [ "$?" = "1" ]; then
+    if [ "$?" = "1" ] || [ -z "$try_succ_host" ]; then
         paopao=$(ppgw -rawURL "http://paopao.dns" | cut -d" " -f1)
         try_host=$paopao
         get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
