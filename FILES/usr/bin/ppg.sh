@@ -164,6 +164,9 @@ load_ovpn() {
         fi
         if [ -n "$ovpn_username" ]; then
             sed -r "/^auth-user-pass /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
+            sed -i "/^service /d" /tmp/paopao.ovpn
+            sed -i "/^block-outside-dns /d" /tmp/paopao.ovpn
+            echo " " >>/tmp/paopao.ovpn
             echo "auth-user-pass /tmp/ovpn_pass.txt" >>/tmp/paopao.ovpn
             echo "$ovpn_username" >/tmp/ovpn_pass.txt
             echo "$ovpn_password" >>/tmp/ovpn_pass.txt
