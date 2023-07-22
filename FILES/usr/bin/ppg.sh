@@ -663,15 +663,11 @@ while true; do
                 log "Try to update and reload..." warn
                 if [ "$mode" = "ovpn" ]; then
                     try_conf "$ovpnfile" "ovpn"
-                    if ip a | grep -q tun114; then
-                        reload_gw
-                    fi
-                else
-                    if [ "$mode" = "suburl" ]; then
-                        get_conf "$suburl" "yaml"
-                    fi
-                    reload_gw
                 fi
+                if [ "$mode" = "suburl" ]; then
+                    get_conf "$suburl" "yaml"
+                fi
+                reload_gw
             fi
         fi
     else
