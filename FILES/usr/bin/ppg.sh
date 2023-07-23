@@ -106,7 +106,7 @@ load_clash() {
         return 1
     fi
     if [ "$1" = "yes" ]; then
-        fast_node_sel 1000 || fast_node_sel 2000 || fast_node_sel 3000 || fast_node_sel 4000 || fast_node_sel 5000
+        fast_node_sel 1500 || fast_node_sel 2000 || fast_node_sel 3000 || fast_node_sel 4000 || fast_node_sel 5000
     fi
     if [ "$2" = "no" ]; then
         if nft list ruleset | grep "clashtcp"; then

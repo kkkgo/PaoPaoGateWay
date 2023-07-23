@@ -195,9 +195,7 @@ func main() {
 						pingResults = append(pingResults, PingResult{Node: node1.Node, Duration: duration1})
 					} else {
 						fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to test connection speed for node %s:%v\n", node1.Node, err1)
-					}
-					if waitdelaynum > 1000 {
-						time.Sleep(time.Duration(waitdelaynum * int(time.Millisecond)))
+						time.Sleep(time.Duration(1+waitdelaynum/1000) * time.Second)
 					}
 					if index+1 < len(nodes) {
 						node2 := nodes[index+1]
@@ -206,15 +204,14 @@ func main() {
 							pingResults = append(pingResults, PingResult{Node: node2.Node, Duration: duration2})
 						} else {
 							fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to test the connection speed of node %s：%v\n", node2.Node, err2)
+							time.Sleep(time.Duration(1+waitdelaynum/1000) * time.Second)
 						}
 					}
 				}
 
 			}(i)
 		}
-
-		time.Sleep(time.Duration(waitdelaynum * int(time.Millisecond)))
-
+		time.Sleep(time.Duration(waitdelaynum/1000+3) * time.Second)
 		sort.Slice(pingResults, func(i, j int) bool {
 			return pingResults[i].Duration < pingResults[j].Duration
 		})
@@ -232,6 +229,8 @@ func main() {
 			os.Exit(0)
 		} else {
 			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "There are no nodes available")
+			fmt.Println("\n"+red+"[PaoPaoGW Fast]"+reset+"Force sleep ", waitdelaynum/1000*3+3)
+			time.Sleep(time.Duration(waitdelaynum/1000*3+3) * time.Second)
 		}
 		os.Exit(1)
 	}
@@ -592,7 +591,7 @@ func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, erro
 	client := &http.Client{}
 
 	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=%s&url=%s", apiURL, nodeName, waitdelay, testNodeURL)
-
+	// fmt.Println(requestURL)
 	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
 		return 0, err
