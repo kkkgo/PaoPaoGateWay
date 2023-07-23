@@ -229,8 +229,9 @@ func main() {
 			os.Exit(0)
 		} else {
 			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "There are no nodes available")
-			fmt.Println("\n"+red+"[PaoPaoGW Fast]"+reset+"Force sleep ", waitdelaynum/1000*3+3)
-			time.Sleep(time.Duration(waitdelaynum/1000*3+3) * time.Second)
+			force_sleep := time.Duration(waitdelaynum/1000+1) * time.Second * 3
+			fmt.Println("\n"+red+"[PaoPaoGW Fast]"+reset+"Force sleep ", force_sleep)
+			time.Sleep(force_sleep)
 		}
 		os.Exit(1)
 	}
