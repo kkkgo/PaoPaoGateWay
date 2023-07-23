@@ -28,6 +28,7 @@ var (
 	rawURL       string
 	downURL      string
 	port         int
+	waitdelay    int
 	resolver     *net.Resolver
 	inputFiles   inputFlags
 	outputFile   string
@@ -87,6 +88,7 @@ func main() {
 	flag.StringVar(&interval, "interval", "", "sub interval")
 	flag.StringVar(&testProxy, "testProxy", "", "http testProxy")
 	flag.IntVar(&port, "port", 53, "DNS port")
+	flag.IntVar(&waitdelay, "waitdelay", 1000, "node delay")
 
 	//clashapi
 	flag.StringVar(&apiURL, "apiurl", "", "Clash API")
@@ -189,6 +191,9 @@ func main() {
 					} else {
 						fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to test connection speed for node %s:%v\n", node1.Node, err1)
 					}
+					if waitdelay > 1000 {
+						time.Sleep(time.Duration(waitdelay * int(time.Second)))
+					}
 					if index+1 < len(nodes) {
 						node2 := nodes[index+1]
 						duration2, err2 := pingNode(apiURL, secret, node2.Node, testNodeURL)
@@ -199,10 +204,11 @@ func main() {
 						}
 					}
 				}
+
 			}(i)
 		}
 
-		time.Sleep(3 * time.Second)
+		time.Sleep(time.Duration(waitdelay * int(time.Second)))
 
 		sort.Slice(pingResults, func(i, j int) bool {
 			return pingResults[i].Duration < pingResults[j].Duration
@@ -580,7 +586,7 @@ func containsExcludedKeyword(nodeName string, excludedNodes []string) bool {
 func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, error) {
 	client := &http.Client{}
 
-	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=5000&url=%s", apiURL, nodeName, testNodeURL)
+	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=%s&url=%s", apiURL, nodeName, waitdelay, testNodeURL)
 
 	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {

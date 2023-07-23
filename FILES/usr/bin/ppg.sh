@@ -26,6 +26,7 @@ net_ready() {
 }
 
 fast_node_sel() {
+    wait_delay=$1
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
     fi
@@ -45,7 +46,7 @@ fast_node_sel() {
         ext_node="Traffic|Expire| GB|Days|Date"
     fi
     log "Try to switch the fastest node..." warn
-    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" >/dev/tty0
+    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" >/dev/tty0
 }
 kill_cron() {
     if ps | grep -v "grep" | grep "/etc/cron"; then
@@ -105,7 +106,7 @@ load_clash() {
         return 1
     fi
     if [ "$1" = "yes" ]; then
-        fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel || fast_node_sel
+        fast_node_sel 1000 || fast_node_sel 2000 || fast_node_sel 3000 || fast_node_sel 4000 || fast_node_sel 5000
     fi
     if [ "$2" = "no" ]; then
         if nft list ruleset | grep "clashtcp"; then
