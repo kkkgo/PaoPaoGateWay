@@ -228,7 +228,7 @@ func main() {
 			deleteConnections(apiURL, secret)
 			os.Exit(0)
 		} else {
-			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "All nodes failed")
+			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "All nodes failed !")
 		}
 		os.Exit(1)
 	}
