@@ -194,7 +194,7 @@ func main() {
 					if err1 == nil {
 						pingResults = append(pingResults, PingResult{Node: node1.Node, Duration: duration1})
 					} else {
-						fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to test connection speed for node %s:%v\n", node1.Node, err1)
+						fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Node %s:%v\n", node1.Node, err1)
 						time.Sleep(time.Duration(1+waitdelaynum/1000) * time.Second)
 					}
 					if index+1 < len(nodes) {
@@ -203,7 +203,7 @@ func main() {
 						if err2 == nil {
 							pingResults = append(pingResults, PingResult{Node: node2.Node, Duration: duration2})
 						} else {
-							fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to test the connection speed of node %s：%v\n", node2.Node, err2)
+							fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Node %s：%v\n", node2.Node, err2)
 							time.Sleep(time.Duration(1+waitdelaynum/1000) * time.Second)
 						}
 					}
@@ -228,7 +228,7 @@ func main() {
 			deleteConnections(apiURL, secret)
 			os.Exit(0)
 		} else {
-			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "There are no nodes available")
+			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "All nodes failed")
 		}
 		os.Exit(1)
 	}
@@ -617,7 +617,7 @@ func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, erro
 		return 0, fmt.Errorf("The delay value does not exist")
 	}
 
-	return 0, fmt.Errorf("The node latency request failed：%s", resp.Status)
+	return 0, fmt.Errorf("%s", resp.Status)
 }
 
 func selectNode(apiURL, secret, nodeName string) error {
