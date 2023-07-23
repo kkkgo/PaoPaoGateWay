@@ -208,7 +208,7 @@ func main() {
 			}(i)
 		}
 
-		time.Sleep(time.Duration(waitdelay * int(time.Second)))
+		time.Sleep(time.Duration(waitdelay * int(time.Millisecond)))
 
 		sort.Slice(pingResults, func(i, j int) bool {
 			return pingResults[i].Duration < pingResults[j].Duration
