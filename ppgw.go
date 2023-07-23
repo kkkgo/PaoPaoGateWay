@@ -28,7 +28,7 @@ var (
 	rawURL       string
 	downURL      string
 	port         int
-	waitdelay    int
+	waitdelay    string
 	resolver     *net.Resolver
 	inputFiles   inputFlags
 	outputFile   string
@@ -88,13 +88,13 @@ func main() {
 	flag.StringVar(&interval, "interval", "", "sub interval")
 	flag.StringVar(&testProxy, "testProxy", "", "http testProxy")
 	flag.IntVar(&port, "port", 53, "DNS port")
-	flag.IntVar(&waitdelay, "waitdelay", 1000, "node delay")
 
 	//clashapi
 	flag.StringVar(&apiURL, "apiurl", "", "Clash API")
 	flag.StringVar(&secret, "secret", "", "Clash secret")
 	flag.StringVar(&testNodeURL, "test_node_url", "", "test_node_url")
 	flag.StringVar(&extNodeStr, "ext_node", "", "ext_node")
+	flag.StringVar(&waitdelay, "waitdelay", "1000", "node delay")
 	flag.BoolVar(&reload, "reload", false, "reload yaml")
 	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
 
@@ -181,6 +181,11 @@ func main() {
 		nodes = filterNodes(nodes, excludedNodes)
 
 		pingResults := make([]PingResult, 0)
+		waitdelaynum, err := strconv.Atoi(waitdelay)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 		for i := 0; i < len(nodes); i += 2 {
 			go func(index int) {
 				if index < len(nodes) {
@@ -191,8 +196,8 @@ func main() {
 					} else {
 						fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to test connection speed for node %s:%v\n", node1.Node, err1)
 					}
-					if waitdelay > 1000 {
-						time.Sleep(time.Duration(waitdelay * int(time.Second)))
+					if waitdelaynum > 1000 {
+						time.Sleep(time.Duration(waitdelaynum * int(time.Millisecond)))
 					}
 					if index+1 < len(nodes) {
 						node2 := nodes[index+1]
@@ -208,7 +213,7 @@ func main() {
 			}(i)
 		}
 
-		time.Sleep(time.Duration(waitdelay * int(time.Millisecond)))
+		time.Sleep(time.Duration(waitdelaynum * int(time.Millisecond)))
 
 		sort.Slice(pingResults, func(i, j int) bool {
 			return pingResults[i].Duration < pingResults[j].Duration
