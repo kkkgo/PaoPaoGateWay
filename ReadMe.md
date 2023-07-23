@@ -14,6 +14,8 @@ PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由cla
 硬盘|不需要
 网卡|1
 光驱|1  
+
+*注意：如果节点数量很多（比如200+）的话，建议适当增加内存，否则可能在并发测速的时候内存紧缺导致CPU负载过高卡死*
   
 #### 方式一：使用docker内嵌配置
 你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、替换Country.mmdb、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
