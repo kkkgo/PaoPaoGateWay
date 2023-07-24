@@ -24,24 +24,25 @@ import (
 )
 
 var (
-	server       string
-	domain       string
-	rawURL       string
-	downURL      string
-	port         int
-	waitdelay    string
-	resolver     *net.Resolver
-	inputFiles   inputFlags
-	outputFile   string
-	yamlhashFile string
-	interval     string
-	apiURL       string
-	secret       string
-	testNodeURL  string
-	extNodeStr   string
-	testProxy    string
-	reload       bool
-	closeall     bool
+	server                string
+	domain                string
+	rawURL                string
+	downURL               string
+	port                  int
+	maxSystemCommandDelay int
+	waitdelay             string
+	resolver              *net.Resolver
+	inputFiles            inputFlags
+	outputFile            string
+	yamlhashFile          string
+	interval              string
+	apiURL                string
+	secret                string
+	testNodeURL           string
+	extNodeStr            string
+	testProxy             string
+	reload                bool
+	closeall              bool
 )
 
 var orange = "\033[38;5;208m"
@@ -96,6 +97,7 @@ func main() {
 	flag.StringVar(&testNodeURL, "test_node_url", "", "test_node_url")
 	flag.StringVar(&extNodeStr, "ext_node", "", "ext_node")
 	flag.StringVar(&waitdelay, "waitdelay", "1000", "node delay")
+	flag.IntVar(&maxSystemCommandDelay, "cpudelay", 300, "CPU dely")
 	flag.BoolVar(&reload, "reload", false, "reload yaml")
 	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
 
@@ -585,8 +587,6 @@ func containsExcludedKeyword(nodeName string, excludedNodes []string) bool {
 	}
 	return false
 }
-
-const maxSystemCommandDelay = 200
 
 func isSystemLoadAcceptable() bool {
 	startTime := time.Now()
