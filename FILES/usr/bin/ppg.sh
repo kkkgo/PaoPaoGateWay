@@ -47,7 +47,7 @@ fast_node_sel() {
         ext_node="Traffic|Expire| GB|Days|Date"
     fi
     if [ -z "$cpudelay" ]; then
-        cpudelay="500"
+        cpudelay="3000"
     fi
     log "Try to test node...[""$try_count""]" warn
     ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
@@ -153,7 +153,6 @@ load_clash() {
         if [ "$?" = "1" ]; then
             sleep 15
         fi
-
     fi
     if [ "$2" = "no" ]; then
         if nft list ruleset | grep "clashtcp"; then
