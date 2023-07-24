@@ -602,7 +602,8 @@ func systemLoadDealy() int64 {
 func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, error) {
 	delay := systemLoadDealy()
 	if delay > int64(maxSystemCommandDelay) {
-		return 0, fmt.Errorf("High CPU load:", delay)
+		fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Node %s：%v\n", nodeName, "High CPU load:", delay)
+		os.Exit(2)
 	}
 
 	client := &http.Client{}

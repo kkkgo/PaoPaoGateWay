@@ -26,15 +26,6 @@ net_ready() {
 }
 
 fast_node_sel() {
-    start_time=$(date +%s)
-    ps
-    end_time=$(date +%s)
-    elapsed_time=$((end_time - start_time))
-    log "CPU LOAD: ""$elapsed_time" warn
-    if [ $elapsed_time -gt 1 ]; then
-        kill_clash
-        return 1
-    fi
     wait_delay=$1
     try_count=$2
     if [ -f /tmp/ppgw.ini ]; then
@@ -123,21 +114,41 @@ load_clash() {
     if [ "$1" = "yes" ]; then
         sleep 3
         fast_node_sel 1500 1
+        if [ "$?" = "2" ]; then
+            kill_clash
+            return 1
+        fi
         if [ "$?" = "1" ]; then
             sleep 3
             fast_node_sel 2000 2
+        fi
+        if [ "$?" = "2" ]; then
+            kill_clash
+            return 1
         fi
         if [ "$?" = "1" ]; then
             sleep 6
             fast_node_sel 2000 3
         fi
+        if [ "$?" = "2" ]; then
+            kill_clash
+            return 1
+        fi
         if [ "$?" = "1" ]; then
             sleep 9
             fast_node_sel 2000 4
         fi
+        if [ "$?" = "2" ]; then
+            kill_clash
+            return 1
+        fi
         if [ "$?" = "1" ]; then
             sleep 12
             fast_node_sel 2000 5
+        fi
+        if [ "$?" = "2" ]; then
+            kill_clash
+            return 1
         fi
         if [ "$?" = "1" ]; then
             sleep 15
