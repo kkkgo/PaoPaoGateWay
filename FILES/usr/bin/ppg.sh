@@ -55,8 +55,11 @@ fast_node_sel() {
     if [ -z "$ext_node" ]; then
         ext_node="Traffic|Expire| GB|Days|Date"
     fi
+    if [ -z "$cpudelay" ]; then
+        cpudelay="500"
+    fi
     log "Try to test node...[""$try_count""]" warn
-    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" >/dev/tty0
+    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
 }
 kill_cron() {
     if ps | grep -v "grep" | grep "/etc/cron"; then
@@ -227,7 +230,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"

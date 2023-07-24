@@ -97,7 +97,7 @@ func main() {
 	flag.StringVar(&testNodeURL, "test_node_url", "", "test_node_url")
 	flag.StringVar(&extNodeStr, "ext_node", "", "ext_node")
 	flag.StringVar(&waitdelay, "waitdelay", "1000", "node delay")
-	flag.IntVar(&maxSystemCommandDelay, "cpudelay", 300, "CPU dely")
+	flag.IntVar(&maxSystemCommandDelay, "cpudelay", 300, "CPU delay")
 	flag.BoolVar(&reload, "reload", false, "reload yaml")
 	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
 
@@ -596,7 +596,7 @@ func isSystemLoadAcceptable() bool {
 		return false
 	}
 	executionTime := time.Since(startTime).Milliseconds()
-	if executionTime > maxSystemCommandDelay {
+	if executionTime > int64(maxSystemCommandDelay) {
 		return false
 	}
 	return true
