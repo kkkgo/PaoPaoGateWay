@@ -98,7 +98,9 @@ load_clash() {
         else
             /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
             if [ -f /usr/bin/v2ray ]; then
-                /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
+                if ps | grep -v "grep" | grep -v "/etc/config/v2ray"; then
+                    /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
+                fi
             fi
         fi
     else
