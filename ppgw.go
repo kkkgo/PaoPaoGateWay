@@ -588,24 +588,21 @@ func containsExcludedKeyword(nodeName string, excludedNodes []string) bool {
 	return false
 }
 
-func isSystemLoadAcceptable() bool {
+func systemLoadDealy() int64 {
 	startTime := time.Now()
 	cmd := exec.Command("ps")
 	err := cmd.Run()
 	if err != nil {
-		return false
+		return 10000
 	}
 	executionTime := time.Since(startTime).Milliseconds()
-	if executionTime > int64(maxSystemCommandDelay) {
-		return false
-	}
-	return true
+	return executionTime
 }
 
 func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, error) {
-
-	if !isSystemLoadAcceptable() {
-		return 0, fmt.Errorf("High CPU load, exit...")
+	delay := systemLoadDealy()
+	if delay > int64(maxSystemCommandDelay) {
+		return 0, fmt.Errorf("High CPU load:", delay)
 	}
 
 	client := &http.Client{}
