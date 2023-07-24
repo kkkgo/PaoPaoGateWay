@@ -26,7 +26,17 @@ net_ready() {
 }
 
 fast_node_sel() {
+    start_time=$(date +%s)
+    ps
+    end_time=$(date +%s)
+    elapsed_time=$((end_time - start_time))
+    if [ $elapsed_time -gt 1 ]; then
+        kill_clash
+        log "CPU LOAD: ""$elapsed_time" warn
+        return 1
+    fi
     wait_delay=$1
+    try_count=$2
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
     fi
@@ -45,7 +55,7 @@ fast_node_sel() {
     if [ -z "$ext_node" ]; then
         ext_node="Traffic|Expire| GB|Days|Date"
     fi
-    log "Try to test node..." warn
+    log "Try to test node...[""$try_count""]" warn
     ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" >/dev/tty0
 }
 kill_cron() {
@@ -109,34 +119,25 @@ load_clash() {
     fi
     if [ "$1" = "yes" ]; then
         sleep 3
-        fast_node_sel 1500
+        fast_node_sel 1500 1
         if [ "$?" = "1" ]; then
             sleep 3
-            fast_node_sel 2000
+            fast_node_sel 2000 2
         fi
         if [ "$?" = "1" ]; then
             sleep 6
-            fast_node_sel 2000
+            fast_node_sel 2000 3
         fi
         if [ "$?" = "1" ]; then
             sleep 9
-            fast_node_sel 2000
+            fast_node_sel 2000 4
         fi
         if [ "$?" = "1" ]; then
             sleep 12
-            fast_node_sel 2000
+            fast_node_sel 2000 5
         fi
         if [ "$?" = "1" ]; then
             sleep 15
-            start_time=$(date +%s)
-            ps
-            end_time=$(date +%s)
-            elapsed_time=$((end_time - start_time))
-            if [ $elapsed_time -gt 1 ]; then
-                kill_clash
-                log "CPU LOAD: ""$elapsed_time" warn
-                return 1
-            fi
         fi
 
     fi
