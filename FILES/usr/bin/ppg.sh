@@ -128,7 +128,13 @@ load_clash() {
         fi
         if [ "$?" = "1" ]; then
             sleep 15
+            start_time=$(date +%s)
+            ps
+            end_time=$(date +%s)
+            elapsed_time=$((end_time - start_time))
+            log "CPU LOAD: ""$elapsed_time" warn
         fi
+
     fi
     if [ "$2" = "no" ]; then
         if nft list ruleset | grep "clashtcp"; then
