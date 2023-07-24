@@ -132,7 +132,11 @@ load_clash() {
             ps
             end_time=$(date +%s)
             elapsed_time=$((end_time - start_time))
-            log "CPU LOAD: ""$elapsed_time" warn
+            if [ $elapsed_time -gt 1 ]; then
+                kill_clash
+                log "CPU LOAD: ""$elapsed_time" warn
+                return 1
+            fi
         fi
 
     fi
