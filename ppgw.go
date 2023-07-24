@@ -586,7 +586,7 @@ func containsExcludedKeyword(nodeName string, excludedNodes []string) bool {
 	return false
 }
 
-const maxSystemCommandDelay = 100
+const maxSystemCommandDelay = 200
 
 func isSystemLoadAcceptable() bool {
 	startTime := time.Now()
