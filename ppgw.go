@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -585,7 +586,28 @@ func containsExcludedKeyword(nodeName string, excludedNodes []string) bool {
 	return false
 }
 
+const maxSystemCommandDelay = 100
+
+func isSystemLoadAcceptable() bool {
+	startTime := time.Now()
+	cmd := exec.Command("ps")
+	err := cmd.Run()
+	if err != nil {
+		return false
+	}
+	executionTime := time.Since(startTime).Milliseconds()
+	if executionTime > maxSystemCommandDelay {
+		return false
+	}
+	return true
+}
+
 func pingNode(apiURL, secret, nodeName, testNodeURL string) (time.Duration, error) {
+
+	if !isSystemLoadAcceptable() {
+		return 0, fmt.Errorf("High CPU load, exit...")
+	}
+
 	client := &http.Client{}
 
 	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=%s&url=%s", apiURL, nodeName, waitdelay, testNodeURL)
