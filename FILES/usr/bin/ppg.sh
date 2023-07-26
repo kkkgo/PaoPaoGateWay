@@ -51,6 +51,9 @@ fast_node_sel() {
     fi
     log "Try to test node...[""$try_count""]" warn
     ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
+    if [ "$?" = "1" ]; then
+        touch /tmp/allnode.failed
+    fi
 }
 kill_cron() {
     if ps | grep -v "grep" | grep "/etc/cron"; then
@@ -109,44 +112,29 @@ load_clash() {
     if [ "$1" = "yes" ]; then
         sleep 3
         fast_node_sel 1500 1
-        if [ "$?" = "2" ]; then
-            kill_clash
-            return 1
-        fi
-        if [ "$?" = "1" ]; then
+        if [ -f /tmp/allnode.failed ]; then
             sleep 3
+            rm /tmp/allnode.failed
             fast_node_sel 2000 2
         fi
-        if [ "$?" = "2" ]; then
-            kill_clash
-            return 1
-        fi
-        if [ "$?" = "1" ]; then
+        if [ -f /tmp/allnode.failed ]; then
             sleep 6
+            rm /tmp/allnode.failed
             fast_node_sel 2000 3
         fi
-        if [ "$?" = "2" ]; then
-            kill_clash
-            return 1
-        fi
-        if [ "$?" = "1" ]; then
+        if [ -f /tmp/allnode.failed ]; then
             sleep 9
+            rm /tmp/allnode.failed
             fast_node_sel 2000 4
         fi
-        if [ "$?" = "2" ]; then
-            kill_clash
-            return 1
-        fi
-        if [ "$?" = "1" ]; then
+        if [ -f /tmp/allnode.failed ]; then
             sleep 12
+            rm /tmp/allnode.failed
             fast_node_sel 2000 5
         fi
-        if [ "$?" = "2" ]; then
+        if [ -f /tmp/allnode.failed ]; then
             kill_clash
-            return 1
-        fi
-        if [ "$?" = "1" ]; then
-            sleep 15
+            return 3
         fi
     fi
     if [ "$2" = "no" ]; then
@@ -166,7 +154,9 @@ load_clash() {
         fi
     fi
     if [ -f /usr/bin/v2ray ]; then
-        if ps | grep -v "grep" | grep -v "/etc/config/v2ray"; then
+        if ps | grep -v "grep" | grep "/etc/config/v2ray"; then
+            log "[OK] SNIFF OK." succ
+        else
             /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
         fi
     fi
@@ -728,6 +718,11 @@ while true; do
     if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
         sleeptime=30
     fi
-    log "Same hash. Sleep ""$sleeptime""s."
-    sleep "$sleeptime"
+    if [ -f /tmp/allnode.failed ] && [ "$fast_node" = "yes" ]; then
+        rm /tmp/allnode.failed
+        reload_gw
+    else
+        log "Same hash. Sleep ""$sleeptime""s."
+        sleep "$sleeptime"
+    fi
 done
