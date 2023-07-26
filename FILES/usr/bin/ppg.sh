@@ -720,7 +720,6 @@ while true; do
     fi
     if [ -f /tmp/allnode.failed ] && [ "$fast_node" = "yes" ]; then
         rm /tmp/allnode.failed
-        reload_gw
     else
         log "Same hash. Sleep ""$sleeptime""s."
         sleep "$sleeptime"
