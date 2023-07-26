@@ -64,11 +64,11 @@ kill_clash_cache() {
 }
 kill_clash() {
     if ps | grep -v "grep" | grep "/etc/config/clash"; then
-        kill $(pgrep -x "/usr/bin/clash")
+        kill -9 $(pgrep -x "/usr/bin/clash")
     fi
     if [ -f /usr/bin/v2ray ]; then
         if ps | grep -v "grep" | grep "/etc/config/v2ray"; then
-            kill $(pgrep -x "/usr/bin/v2ray")
+            kill -9 $(pgrep -x "/usr/bin/v2ray")
         fi
     fi
     nft flush ruleset
@@ -101,11 +101,6 @@ load_clash() {
             ppgw -reload -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" >/dev/tty0 2>&1
         else
             /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
-            if [ -f /usr/bin/v2ray ]; then
-                if ps | grep -v "grep" | grep -v "/etc/config/v2ray"; then
-                    /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
-                fi
-            fi
         fi
     else
         log "The clash.yaml generation failed." warn
@@ -168,6 +163,11 @@ load_clash() {
         else
             log "[ADD] Add nft rule TCP/UDP..." warn
             /usr/bin/nft.sh
+        fi
+    fi
+    if [ -f /usr/bin/v2ray ]; then
+        if ps | grep -v "grep" | grep -v "/etc/config/v2ray"; then
+            /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
         fi
     fi
     ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
