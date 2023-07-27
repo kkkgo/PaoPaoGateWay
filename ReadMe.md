@@ -15,7 +15,7 @@ PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由cla
 网卡|1
 光驱|1  
 
-*注意：如果节点数量很多（比如200+）的话，建议适当增加内存，否则可能在并发测速的时候，如果全部节点都失效，会循环尝试，在内存紧缺的情况下导致CPU负载过高卡死*
+*注意：如果节点数量很多（比如200+）的话，建议适当增加内存和CPU核心数*
   
 #### 方式一：使用docker内嵌配置
 你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、替换Country.mmdb、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
@@ -97,6 +97,7 @@ subtime=1d
 fast_node=yes
 test_node_url="https://www.youtube.com/generate_204"
 ext_node="Traffic|Expire| GB|Days|Date"
+cpudelay="3000"
 ```
 下面逐项来解释选项的用法：
 - 1 配置文件第一行必须以`#paopao-gateway`开头。配置格式为`选项="值"`。
@@ -122,6 +123,7 @@ ext_node="Traffic|Expire| GB|Days|Date"
   - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
   - 注意，当`mode=ovpn`，因为对clash来说只有一个节点，所以`yes`和`check`效果一样。
   - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。
+  - `cpudelay`选项是设定如果CPU处理延迟大于指定值则放弃本次测速。该选项是防止低性能设备负载过高导致死机，默认值为3000。设置更小的值可能会放弃更多测速，设置更高的值可能会让低性能设备负载过高。  
 
 ## 使用docker定制ISO镜像:ppwgiso
 ![pull](https://img.shields.io/docker/pulls/sliamb/ppgwiso.svg) ![size](https://img.shields.io/docker/image-size/sliamb/ppgwiso)   
