@@ -4,6 +4,7 @@
 PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由clash驱动，支持`Full Cone NAT` ，支持多种方式下发配置，支持多种出站方式，包括自定义socks5、自定义openvpn、自定义yaml节点、订阅模式和自由出站，支持节点测速自动选择、节点排除等功能，并附带web面板可供查看日志连接信息等。PaoPao GateWay可以和其他DNS服务器一起结合使用，比如配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流。   
 
 你可以从Github Release下载到最新的镜像：[https://github.com/kkkgo/PaoPaoGateWay/releases](https://github.com/kkkgo/PaoPaoGateWay/releases)   
+##### 如果对你有帮助，欢迎点`Star`，如果需要关注更新，可以点`Watch`。
 ## [→详细说明《FakeIP网关的工作原理》](https://blog.03k.org/post/paopaogateway.html)
 
 ### 运行要求和配置下发
