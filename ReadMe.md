@@ -92,7 +92,6 @@ yamlfile="custom.yaml"
 suburl="https://..."
 subtime=1d
 
-# yaml|suburl|ovpn mode setting
 # fast_node=check/yes/no
 fast_node=yes
 test_node_url="https://www.youtube.com/generate_204"
@@ -121,7 +120,7 @@ cpudelay="3000"
   - 当`fast_node=yes`或者`fast_node=check`，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则立即停止clash并秒重载网关配置，如果是suburl模式，还会在重载前拉新订阅配置。
   - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式。
   - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
-  - 注意，当`mode=ovpn`，因为对clash来说只有一个节点，所以`yes`和`check`效果一样。
+  - 注意，设置为`check`不会测速，设置为`yes`测速失败到阈值会杀死进程并终止应用网关并重载，而`check`不会杀死进程，仅重载所有配置并关闭所有现有的旧连接。  
   - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。
   - `cpudelay`选项是设定如果CPU处理延迟大于指定值则放弃本次测速。该选项是防止低性能设备负载过高导致死机，默认值为3000。设置更小的值可能会放弃更多测速，设置更高的值可能会让低性能设备负载过高。  
 
