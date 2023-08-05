@@ -104,18 +104,13 @@ dnsjson='{
     ],
     "outbounds": [
         {
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4"
-            },
-            "proxySettings": {
-                "tag": "proxy"
-            },
-            "tag": "free"
-        },
-        {
             "protocol": "socks",
             "tag": "proxy",
+              "streamSettings": {
+                "sockopt": {
+                  "domainStrategy": "UseIPv4"
+                            }
+                        }
             "settings": {
                 "servers": [
                     {
