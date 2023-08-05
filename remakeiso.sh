@@ -178,6 +178,7 @@ if [ "$SNIFF" = "dns" ]; then
     sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
     cp /v2ray $root"/usr/bin/"
+    touch $root"/www/sniffdns"
 fi
 
 if [ -f /data/clash ]; then

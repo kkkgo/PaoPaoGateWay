@@ -157,15 +157,19 @@ load_clash() {
         if ps | grep -v "grep" | grep "/etc/config/v2ray"; then
             log "[OK] SNIFF OK." succ
         else
-            if [ -z "$dns_ip" ]; then
-                dns_ip="1.0.0.1"
+            if [ -f /www/sniffdns ]; then
+                if [ -z "$dns_ip" ]; then
+                    dns_ip="1.0.0.1"
+                fi
+                if [ -z "$dns_port" ]; then
+                    dns_port="53"
+                fi
+                sed "s/{dns_ip}/$dns_ip/g" /etc/config/v2ray/sniff.json >/tmp/sniff.json
+                sed -i "s/{dns_port}/$dns_port/g" /tmp/sniff.json
+                /usr/bin/v2ray run -c /tmp/sniff.json >/dev/tty0 2>&1 &
+            else
+                /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
             fi
-            if [ -z "$dns_port" ]; then
-                dns_port="53"
-            fi
-            sed "s/{dns_ip}/$dns_ip" /etc/config/v2ray/sniff.json >/tmp/sniff.json
-            sed -i "s/{dns_port}/$dns_port" /tmp/sniff.json
-            /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
         fi
     fi
     ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
