@@ -65,6 +65,90 @@ json='{
     }
 }'
 
+dnsjson='{
+    "log": {
+        "loglevel": "error"
+    },
+    "dns": {
+        "servers": [
+            {
+                "address": "{dns_ip}",
+                "port": {dns_port}
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "port": 1081,
+            "protocol": "dokodemo-door",
+            "address": "127.0.0.1",
+            "settings": {
+                "network": "tcp,udp",
+                "followRedirect": true
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "tproxy": "tproxy"
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": [
+                    "http",
+                    "tls",
+                    "quic"
+                ],
+                "metadataOnly": false
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIPv4"
+            },
+            "proxySettings": {
+                "tag": "proxy"
+            },
+            "tag": "free"
+        },
+        {
+            "protocol": "socks",
+            "tag": "proxy",
+            "settings": {
+                "servers": [
+                    {
+                        "address": "127.0.0.1",
+                        "port": 1080
+                    }
+                ]
+            }
+        },
+        {
+            "protocol": "blackhole",
+            "tag": "blocked"
+        }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "network": "udp",
+                "port": 443
+            },
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "protocol": [
+                    "bittorrent"
+                ]
+            }
+        ]
+    }
+}'
+
 echo Patching new iso ...
 7z x -p"$sha" -o"/tmp/" /root.7z >/dev/null
 root=/tmp/remakeroot
@@ -82,6 +166,15 @@ if [ "$SNIFF" = "yes" ]; then
     echo Patching sniff...
     mkdir -p $root"/etc/config/v2ray"
     echo "$json" >$root"/etc/config/v2ray/sniff.json"
+    sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
+    sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
+    cp /v2ray $root"/usr/bin/"
+fi
+
+if [ "$SNIFF" = "dns" ]; then
+    echo Patching sniff with dns...
+    mkdir -p $root"/etc/config/v2ray"
+    echo "$dnsjson" >$root"/etc/config/v2ray/sniff.json"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
     cp /v2ray $root"/usr/bin/"

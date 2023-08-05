@@ -16,7 +16,7 @@ PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由cla
 网卡|1
 光驱|1  
 
-*注意：如果节点数量很多（比如200+）或者你的配置文件比较复杂的话，建议适当增加内存和CPU核心数*
+*注意：如果节点数量很多或者连接数很多或者你的配置文件比较复杂的话，建议适当增加内存和CPU核心数*
   
 #### 方式一：使用docker内嵌配置
 你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash核心、替换Country.mmdb、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
@@ -196,6 +196,11 @@ docker run --rm -v .:/data sliamb/ppgwiso
 docker pull sliamb/ppgwiso
 docker run --rm -e SNIFF=yes -v .:/data sliamb/ppgwiso
 ```
+此外，有时候节点远程解析的DNS存在问题或者存在审计，而又没有节点服务器的控制权，出于避免DNS请求泄漏到节点或者节点服务器DNS不正常等场景，如果你想在嗅探的基础上，使用本地可信任DNS（ppgw.ini中所配置的）来解析所有请求来代替远程解析，可以使用`SNIFF=dns`：
+```shell
+docker pull sliamb/ppgwiso
+docker run --rm -e SNIFF=dns -v .:/data sliamb/ppgwiso
+```
 ## 与DNS服务器配合完成分流
 PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   
 配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流，以下是一个简单的非CN IP的域名转发到PaoPao GateWay的docker compose配置：  
@@ -235,6 +240,7 @@ services:
       - "7889:7889/tcp"
 ```
 需要注意的是，一小部分应用不走域名而是IP直连，比如某些聊天软件应用（比如[tg](https://core.telegram.org/resources/cidr.txt)），你只需要网上搜索一下对应的IP段，添加少量对应的的静态路由即可。  
+***如果配合`PaoPaoDNS`使用，强烈建议开启`PaoPaoDNS`的`USE_MARK_DATA`功能，提升分流精准度。***     
 
 ## 构建说明
 `PaoPao GateWay`iso镜像由Github Actions自动构建仓库代码构建推送，你可以在[Actions](https://github.com/kkkgo/PaoPaoGateWay/actions)查看构建日志并对比下载的镜像sha256值。
