@@ -2,146 +2,71 @@
 
 json='{
     "log": {
-        "loglevel": "error"
+        "level": "info"
     },
     "inbounds": [
         {
-            "port": 1081,
-            "protocol": "dokodemo-door",
-            "address": "127.0.0.1",
-            "settings": {
-                "network": "tcp,udp",
-                "followRedirect": true
-            },
-            "streamSettings": {
-                "sockopt": {
-                    "tproxy": "tproxy"
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls",
-                    "quic"
-                ],
-                "metadataOnly": false
-            }
+            "type": "tproxy",
+            "tag": "tproxy-in",
+            "listen": "127.0.0.1",
+            "sniff": true,
+            "sniff_override_destination": true,
+            "sniff_timeout": "300ms",
+            "listen_port": 1081
         }
     ],
     "outbounds": [
         {
-            "protocol": "socks",
-            "settings": {
-                "servers": [
-                    {
-                        "address": "127.0.0.1",
-                        "port": 1080
-                    }
-                ]
-            }
+            "type": "socks",
+            "tag": "socks-clash",
+            "server": "127.0.0.1",
+            "server_port": 1080
         },
         {
-            "protocol": "blackhole",
-            "tag": "blocked"
+            "type": "direct",
+            "tag": "free"
         }
-    ],
-    "routing": {
-        "rules": [
-            {
-                "type": "field",
-                "outboundTag": "blocked",
-                "network": "udp",
-                "port": 443
-            },
-            {
-                "type": "field",
-                "outboundTag": "blocked",
-                "protocol": [
-                    "bittorrent"
-                ]
-            }
-        ]
-    }
+    ]
 }'
 
 dnsjson='{
     "log": {
-        "loglevel": "error"
+        "level": "info"
     },
     "dns": {
         "servers": [
             {
-                "address": "{dns_ip}",
-                "port": {dns_port}
+                "tag": "trustdns",
+                "address": "udp://dns_ip:dns_port",
+                "strategy": "prefer_ipv4",
+                "detour": "free"
             }
         ]
     },
     "inbounds": [
         {
-            "port": 1081,
-            "protocol": "dokodemo-door",
-            "address": "127.0.0.1",
-            "settings": {
-                "network": "tcp,udp",
-                "followRedirect": true
-            },
-            "streamSettings": {
-                "sockopt": {
-                    "tproxy": "tproxy"
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls",
-                    "quic"
-                ],
-                "metadataOnly": false
-            }
+            "type": "tproxy",
+            "tag": "tproxy-in",
+            "listen": "127.0.0.1",
+            "sniff": true,
+            "sniff_override_destination": true,
+            "sniff_timeout": "300ms",
+            "domain_strategy": "prefer_ipv4",
+            "listen_port": 1081
         }
     ],
     "outbounds": [
         {
-            "protocol": "socks",
-            "tag": "proxy",
-              "streamSettings": {
-                "sockopt": {
-                  "domainStrategy": "UseIPv4"
-                            }
-                        }
-            "settings": {
-                "servers": [
-                    {
-                        "address": "127.0.0.1",
-                        "port": 1080
-                    }
-                ]
-            }
+            "type": "socks",
+            "tag": "socks-clash",
+            "server": "127.0.0.1",
+            "server_port": 1080
         },
         {
-            "protocol": "blackhole",
-            "tag": "blocked"
+            "type": "direct",
+            "tag": "free"
         }
-    ],
-    "routing": {
-        "rules": [
-            {
-                "type": "field",
-                "outboundTag": "blocked",
-                "network": "udp",
-                "port": 443
-            },
-            {
-                "type": "field",
-                "outboundTag": "blocked",
-                "protocol": [
-                    "bittorrent"
-                ]
-            }
-        ]
-    }
+    ]
 }'
 
 echo Patching new iso ...
@@ -159,20 +84,20 @@ fi
 
 if [ "$SNIFF" = "yes" ]; then
     echo Patching sniff...
-    mkdir -p $root"/etc/config/v2ray"
-    echo "$json" >$root"/etc/config/v2ray/sniff.json"
+    mkdir -p $root"/etc/config/sing-box"
+    echo "$json" >$root"/etc/config/sing-box/sniff.json"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
-    cp /v2ray $root"/usr/bin/"
+    cp /sing-box $root"/usr/bin/"
 fi
 
 if [ "$SNIFF" = "dns" ]; then
     echo Patching sniff with dns...
-    mkdir -p $root"/etc/config/v2ray"
-    echo "$dnsjson" >$root"/etc/config/v2ray/sniff.json"
+    mkdir -p $root"/etc/config/sing-box"
+    echo "$dnsjson" >$root"/etc/config/sing-box/sniff.json"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
     sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
-    cp /v2ray $root"/usr/bin/"
+    cp /sing-box $root"/usr/bin/"
     touch $root"/www/sniffdns"
 fi
 

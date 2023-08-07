@@ -69,9 +69,9 @@ kill_clash() {
     if ps | grep -v "grep" | grep "/etc/config/clash"; then
         kill -9 $(pgrep -x "/usr/bin/clash")
     fi
-    if [ -f /usr/bin/v2ray ]; then
-        if ps | grep -v "grep" | grep "/etc/config/v2ray"; then
-            kill -9 $(pgrep -x "/usr/bin/v2ray")
+    if [ -f /usr/bin/sing-box ]; then
+        if ps | grep -v "grep" | grep "/etc/config/sing-box"; then
+            kill -9 $(pgrep -x "/usr/bin/sing-box")
         fi
     fi
     nft flush ruleset
@@ -153,8 +153,8 @@ load_clash() {
             /usr/bin/nft.sh
         fi
     fi
-    if [ -f /usr/bin/v2ray ]; then
-        if ps | grep -v "grep" | grep "/etc/config/v2ray"; then
+    if [ -f /usr/bin/sing-box ]; then
+        if ps | grep -v "grep" | grep "/etc/config/sing-box"; then
             log "[OK] SNIFF OK." succ
         else
             if [ -f /www/sniffdns ]; then
@@ -164,11 +164,11 @@ load_clash() {
                 if [ -z "$dns_port" ]; then
                     dns_port="53"
                 fi
-                sed "s/{dns_ip}/$dns_ip/g" /etc/config/v2ray/sniff.json >/tmp/sniff.json
-                sed -i "s/{dns_port}/$dns_port/g" /tmp/sniff.json
-                /usr/bin/v2ray run -c /tmp/sniff.json >/dev/tty0 2>&1 &
+                sed "s/dns_ip/$dns_ip/g" /etc/config/sing-box/sniff.json >/tmp/sniff.json
+                sed -i "s/dns_port/$dns_port/g" /tmp/sniff.json
+                /usr/bin/sing-box run -c /tmp/sniff.json >/dev/tty0 2>&1 &
             else
-                /usr/bin/v2ray run -c /etc/config/v2ray/sniff.json >/dev/tty0 2>&1 &
+                /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
             fi
         fi
     fi
