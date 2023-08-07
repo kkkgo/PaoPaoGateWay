@@ -25,8 +25,26 @@ json='{
         {
             "type": "direct",
             "tag": "free"
+        },
+        {
+            "type": "block",
+            "tag": "block-quic"
         }
-    ]
+    ],
+    "route": {
+        "final": "socks-clash",
+        "rules": [
+            {
+                "port": [
+                    443
+                ],
+                "protocol": [
+                    "udp"
+                ],
+                "outbound": "block-quic"
+            }
+        ]
+    }
 }'
 
 dnsjson='{
@@ -65,8 +83,26 @@ dnsjson='{
         {
             "type": "direct",
             "tag": "free"
+        },
+        {
+            "type": "block",
+            "tag": "block-quic"
         }
-    ]
+    ],
+    "route": {
+        "final": "socks-clash",
+        "rules": [
+            {
+                "port": [
+                    443
+                ],
+                "protocol": [
+                    "udp"
+                ],
+                "outbound": "block-quic"
+            }
+        ]
+    }
 }'
 
 echo Patching new iso ...
