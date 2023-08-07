@@ -35,11 +35,8 @@ json='{
         "final": "socks-clash",
         "rules": [
             {
-                "port": [
-                    443
-                ],
                 "protocol": [
-                    "udp"
+                    "quic"
                 ],
                 "outbound": "block-quic"
             }
@@ -93,11 +90,8 @@ dnsjson='{
         "final": "socks-clash",
         "rules": [
             {
-                "port": [
-                    443
-                ],
                 "protocol": [
-                    "udp"
+                    "quic"
                 ],
                 "outbound": "block-quic"
             }
