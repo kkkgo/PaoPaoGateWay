@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -33,6 +33,7 @@ var (
 	waitdelay             string
 	resolver              *net.Resolver
 	inputFiles            inputFlags
+	inputFile             string
 	outputFile            string
 	yamlhashFile          string
 	interval              string
@@ -41,6 +42,7 @@ var (
 	testNodeURL           string
 	extNodeStr            string
 	testProxy             string
+	dnslist               string
 	reload                bool
 	closeall              bool
 )
@@ -82,6 +84,7 @@ func main() {
 
 	flag.Var(&inputFiles, "input", "Input YAML files")
 	flag.StringVar(&outputFile, "output", "output.yaml", "Output YAML file")
+	flag.StringVar(&inputFile, "dnsinput", "", "dns input YAML file")
 	flag.StringVar(&yamlhashFile, "yamlhashFile", "", "Hash YAML file")
 	flag.StringVar(&domain, "domain", "", "domain")
 	flag.StringVar(&rawURL, "rawURL", "", "rawURL")
@@ -89,6 +92,7 @@ func main() {
 	flag.StringVar(&server, "server", "", "DNS server to use")
 	flag.StringVar(&interval, "interval", "", "sub interval")
 	flag.StringVar(&testProxy, "testProxy", "", "http testProxy")
+	flag.StringVar(&dnslist, "dnslist", "", "dnslist")
 	flag.IntVar(&port, "port", 53, "DNS port")
 
 	//clashapi
@@ -271,7 +275,7 @@ func main() {
 	}
 
 	if yamlhashFile != "" {
-		content, err := ioutil.ReadFile(yamlhashFile)
+		content, err := os.ReadFile(yamlhashFile)
 		if err != nil {
 			fmt.Println("Cannot read", err)
 			os.Exit(1)
@@ -302,11 +306,88 @@ func main() {
 		fmt.Printf("%x", hash.Sum32())
 		os.Exit(0)
 	}
+	if dnslist != "" {
+		if inputFile == "" {
+			fmt.Println("Please provide an input YAML file using the -input flag")
+		}
+
+		data, err := os.ReadFile(inputFile)
+		if err != nil {
+			fmt.Println("Error reading input file:", err)
+		}
+
+		var config map[string]interface{}
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			fmt.Println("Error unmarshalling YAML: ", err)
+		}
+
+		proxies, ok := config["proxies"].([]interface{})
+		if !ok {
+			fmt.Println("No 'proxies' found in the YAML file")
+		}
+		dnsServers := strings.Split(dnslist, ",")
+
+		var newProxies []interface{}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
+		for _, proxy := range proxies {
+			p, ok := proxy.(map[interface{}]interface{})
+			if !ok {
+				fmt.Printf("Skipping invalid proxy: %+v\n", proxy)
+				continue
+			}
+
+			server, ok := p["server"].(string)
+			if !ok {
+				fmt.Printf("Skipping proxy without a 'server' field: %+v\n", p)
+				continue
+			}
+
+			wg.Add(1)
+			go func(name, server string) {
+				defer wg.Done()
+
+				serverList := dnsRes(server, dnsServers)
+
+				mu.Lock()
+				defer mu.Unlock()
+
+				for _, serverAddr := range serverList {
+					newProxy := make(map[interface{}]interface{})
+					for key, value := range p {
+						newProxy[key] = value
+					}
+					newProxy["name"] = fmt.Sprintf("%s-%s", name, serverAddr)
+					newProxy["server"] = serverAddr
+					newProxies = append(newProxies, newProxy)
+				}
+			}(p["name"].(string), server)
+		}
+
+		wg.Wait()
+
+		config["proxies"] = append(proxies, newProxies...)
+
+		newData, err := yaml.Marshal(&config)
+		if err != nil {
+			fmt.Println("Error marshalling new YAML:", err)
+		}
+
+		if err := os.WriteFile(outputFile, newData, 0644); err != nil {
+			fmt.Println("Error writing output file: ", err)
+		}
+
+		fmt.Printf("New configuration written to %s\n", outputFile)
+
+		os.Exit(0)
+	}
+
 	if inputFiles != nil {
 		result := make(map[interface{}]interface{})
 
 		for _, inputFile := range inputFiles {
-			data, err := ioutil.ReadFile(inputFile)
+			data, err := os.ReadFile(inputFile)
 			if err != nil {
 				fmt.Println("Failed to read file : ", inputFile, err)
 				os.Exit(1)
@@ -330,7 +411,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		err = ioutil.WriteFile(outputFile, data, 0644)
+		err = os.WriteFile(outputFile, data, 0644)
 		if err != nil {
 			fmt.Println("Failed to write result to file : ", outputFile, err)
 			os.Exit(1)
@@ -340,6 +421,56 @@ func main() {
 		os.Exit(0)
 	}
 	flag.CommandLine.Usage()
+}
+
+func dnsRes(domain string, dnsServers []string) []string {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ipSet := make(map[string]struct{})
+	for _, dnsServer := range dnsServers {
+		wg.Add(1)
+		go func(server string) {
+			defer wg.Done()
+			ipAddrs, err := QueryARecords(context.Background(), &domain, server)
+			if err == nil {
+				mu.Lock()
+				for _, ipAddr := range ipAddrs {
+					ipSet[ipAddr.String()] = struct{}{}
+				}
+				mu.Unlock()
+			}
+		}(dnsServer)
+	}
+
+	wg.Wait()
+
+	uniqueIPs := make([]string, 0, len(ipSet))
+	for ip := range ipSet {
+		uniqueIPs = append(uniqueIPs, ip)
+	}
+
+	return uniqueIPs
+}
+
+func QueryARecords(ctx context.Context, domain *string, dnsServer string) ([]net.IP, error) {
+	dnsResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialer := net.Dialer{}
+			return dialer.DialContext(ctx, "udp", dnsServer)
+		},
+	}
+
+	ips, err := dnsResolver.LookupIP(ctx, "ip4", *domain)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no A records found for domain: %s", *domain)
+	}
+
+	return ips, nil
 }
 
 func NewDownloader(url, outputFile string) *Downloader {
@@ -469,11 +600,11 @@ func convertToCronExpression(interval string) (string, error) {
 
 func writeCrontab(cronExpression string) error {
 	filePath := "/etc/crontabs/root"
-	err := ioutil.WriteFile(filePath, []byte(""), 0644)
+	err := os.WriteFile(filePath, []byte(""), 0644)
 	if err != nil {
 		return err
 	}
-	err = ioutil.WriteFile(filePath, []byte(cronExpression+" /usr/bin/cron.sh\n"), 0644)
+	err = os.WriteFile(filePath, []byte(cronExpression+" /usr/bin/cron.sh\n"), 0644)
 	if err != nil {
 		return err
 	}
@@ -525,7 +656,7 @@ func getNodes(apiURL, secret string) ([]ClashNode, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -684,7 +815,7 @@ func reloadYaml(apiURL, secret string) error {
 		return nil
 	}
 
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("Failed to reload configuration: %s, unable to read response body", resp.Status)
 	}

@@ -98,6 +98,12 @@ fast_node=yes
 test_node_url="https://www.youtube.com/generate_204"
 ext_node="Traffic|Expire| GB|Days|Date"
 cpudelay="3000"
+
+# dns burn setting
+# depand on fast_node=yes & mode=suburl/yaml
+dns_burn=no
+# If used with PaoPaoDNS, you can set the PaoPaoDNS:53
+ex_dns="223.5.5.5:53"
 ```
 下面逐项来解释选项的用法：
 - 1 配置文件第一行必须以`#paopao-gateway`开头。配置格式为`选项="值"`。
@@ -124,6 +130,10 @@ cpudelay="3000"
   - 注意，设置为`check`不会测速，设置为`yes`测速失败到阈值会杀死进程并终止应用网关并重载，而`check`不会杀死进程，仅重载所有配置并关闭所有现有的旧连接。  
   - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。
   - `cpudelay`选项是设定如果CPU处理延迟大于指定值则放弃本次测速。该选项是防止低性能设备负载过高导致死机，默认值为3000。设置更小的值可能会放弃更多测速，设置更高的值可能会让低性能设备负载过高。  
+  - `dns_burn`选项和`ex_dns`选项：`dns_burn`功能可以把所有节点的域名解析成所有可能的IP结果，把server字段替换为解析的IP结果，以`节点名-IP`的名称作为新节点加入，临时硬编码到配置文件中。上面设置的`dns_ip`和`dns_port`，和`ex_dns`选项会被用于`dns_burn`功能，`ex_dns`选项用于指定额外的DNS用于解析节点，建议设置为境内DNS以获得不同的结果，如果为空默认值为`223.5.5.5:53`，如果配合PaoPaoDNS使用，则可以设置为PaoPaoDNSIP:53。你也可以设置多个`ex_dns`，格式为逗号分隔，比如`ex_dns=223.5.5.5:53,119.29.29.29:53`。`dns_burn`功能默认为no，适用于`suburl`模式和`yaml`模式，依赖于`fast_node=yes`。该功能的优点和应用场景如下：
+    - 1、节点使用了分区域解析，只有使用了境内DNS才能连接，参见[issue](https://github.com/kkkgo/PaoPaoGateWay/issues/20)，`dns_burn`功能可以额外对节点进行解析。
+    - 2、节点DNS解析存在多个解析入口，`dns_burn`功能会把所有可能的入口都作为新节点加入到配置文件中，在测速的时候就可以选择到速度最好的入口，而不是随机选择。
+    - 3、节点的所有可能的解析结果都会被临时硬编码到配置文件中，除非所有节点都测速失败或者订阅更新，该配置文件不会变化，可以减少节点的DNS查询，使用IP直连，并有效避免节点临时出现可能的DNS污染或者DNS故障的情况，比如节点域名忘记续费导致解析失败。
 
 ## 使用docker定制ISO镜像:ppwgiso
 ![pull](https://img.shields.io/docker/pulls/sliamb/ppgwiso.svg) ![size](https://img.shields.io/docker/image-size/sliamb/ppgwiso)   

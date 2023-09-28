@@ -242,7 +242,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -508,6 +508,14 @@ reload_gw() {
         ovpnfile="custom.ovpn"
     fi
 
+    if [ -z "$dns_burn" ]; then
+        dns_burn="no"
+    fi
+
+    if [ -z "$ex_dns" ]; then
+        ex_dns="223.5.5.5:53"
+    fi
+
     fake_cidr_escaped=$(echo "$fake_cidr" | sed 's/\//\\\//g')
     sed 's/\r$//' /etc/config/clash/base.yaml >/tmp/clash_base.yaml
     sed -i "s/{fake_cidr}/$fake_cidr_escaped/g" /tmp/clash_base.yaml
@@ -585,6 +593,17 @@ reload_gw() {
             fast_node=yes
         else
             fast_node=no
+        fi
+    fi
+    # burn dns
+    if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
+        if [ "$fast_node" = "yes" ]; then
+            if [ "$dns_burn" = "yes" ]; then
+                ppgw -dnslist "$dns_ip"":""$dns_port"",""$ex_dns" -dnsinput /tmp/clash.yaml -output /tmp/clash_dnsburn.yaml
+                if grep -q tproxy-port /tmp/clash_dnsburn.yaml; then
+                    cat /tmp/clash_dnsburn.yaml >/tmp/clash.yaml
+                fi
+            fi
         fi
     fi
     load_clash $fast_node $udp_enable
