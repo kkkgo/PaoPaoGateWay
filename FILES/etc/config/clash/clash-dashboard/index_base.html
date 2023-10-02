@@ -14,6 +14,8 @@
   <title>PaoPaoGateWay - PPGW_version</title>
   <script>
     document.addEventListener("DOMContentLoaded", function () {
+      var currentHostPort = window.location.origin;
+      document.getElementById("app").setAttribute("data-base-url", currentHostPort);
       var storageKey = "PaoPaoGateWay";
       var storedData = localStorage.getItem(storageKey);
       var isPrompted = false;
@@ -138,13 +140,12 @@
       }
     });
   </script>
-  <script type="module" crossorigin src="./assets/index-17fa2fa5.js"></script>
-  <link rel="stylesheet" href="./assets/index-b6d3babf.css">
+  <script type="module" crossorigin src="./assets/index-60ac2a92.js"></script>
+  <link rel="stylesheet" href="./assets/index-e8e92b14.css">
 <link rel="manifest" href="./manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="./registerSW.js"></script></head>
 
 <body>
   <div id="app" data-base-url=""></div>
   
 </body>
-
 </html>
