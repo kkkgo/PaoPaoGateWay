@@ -664,15 +664,8 @@ while true; do
             if [ "$old_clash_web_password" != "$clash_web_password" ]; then
                 kill_clash
             fi
-            if [ "$old_fast_node" != "$fast_node" ]; then
-                if [ "$mode" = "suburl" ]; then
-                    get_conf "$suburl" "yaml"
-                fi
-            fi
             if [ "$mode" = "suburl" ]; then
-                if [ "$old_suburl" != "$suburl" ]; then
                     get_conf "$suburl" "yaml"
-                fi
             fi
             reload_gw
             if [ -f /tmp/ppgw.ini ]; then

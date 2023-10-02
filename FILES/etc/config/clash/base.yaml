@@ -15,6 +15,8 @@ ipv6: false
 profile:
   store-fake-ip: true
   store-selected: true
+hosts:
+    paopaogateway.dns: 127.0.0.1
 dns:
   enable: true
   listen: 0.0.0.0:53
