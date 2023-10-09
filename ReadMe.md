@@ -251,7 +251,7 @@ services:
 ```
 需要注意的是，一小部分应用不走域名而是IP直连，比如某些聊天软件应用（比如[tg](https://core.telegram.org/resources/cidr.txt)），你只需要网上搜索一下对应的IP段，添加少量对应的的静态路由即可。  
 ***如果配合`PaoPaoDNS`使用，强烈建议开启`PaoPaoDNS`的`USE_MARK_DATA`功能，提升分流精准度。***     
-
+注：[抓取跳过域名参考](https://github.com/kkkgo/PaoPaoDNS/discussions/47#discussioncomment-7217219)
 ## 构建说明
 `PaoPao GateWay`iso镜像由Github Actions自动构建仓库代码构建推送，你可以在[Actions](https://github.com/kkkgo/PaoPaoGateWay/actions)查看构建日志并对比下载的镜像sha256值。
 
