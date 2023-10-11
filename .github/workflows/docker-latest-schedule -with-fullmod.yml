@@ -1,6 +1,13 @@
-name: Build and Release ISO and docker
+name: Schedule Latest Build Docker -with-full-mod
 
 on:
+  schedule:
+    - cron: '25 23 * * *'
+  push:
+    paths-ignore:
+      - '*.md'
+      - '.github/**'
+      - 'LICENSE'
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,6 +18,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
+    - name: set full mod flag
+      run: sed -i "s/#usefullmod//g" makeiso.sh
     - name: Set SHSHA
       run: echo "SHSHA="$(echo "${{ github.sha }}"|grep -Eo "^[0-9a-z]{7}"|head -1) >> $GITHUB_ENV
     - name: Gen sha.txt
@@ -32,24 +41,10 @@ jobs:
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
-    - name: Build and push
+    - name: Build and push -with-full-mod
       uses: docker/build-push-action@v4
       with:
         context: "./iso"
         push: true
         platforms: linux/amd64
-        tags: sliamb/ppgwiso
-    - name: Upload files to GitHub release
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file_glob: true
-        file: ./iso/paopao-gateway*.7z
-        tag: ${{ env.TAG_NAME }}
-        body: ${{ env.RE_NOTE }}
-    - name: Remove old release
-      uses: dev-drprasad/delete-older-releases@v0.2.1
-      with:
-        keep_latest: 30
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        tags: sliamb/ppgwiso:fullmod
