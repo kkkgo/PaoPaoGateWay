@@ -46,3 +46,12 @@ jobs:
         push: true
         platforms: linux/amd64
         tags: sliamb/ppgwiso
+    - name: set full mod flag
+      run: sed -i "s/#usefullmod//g" makeiso.sh
+    - name: Build and push -with-fullmod
+      uses: docker/build-push-action@v4
+      with:
+        context: "./iso"
+        push: true
+        platforms: linux/amd64
+        tags: sliamb/ppgwiso:fullmod

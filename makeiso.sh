@@ -34,6 +34,7 @@ rm -rf "$builddir"/iso/*
 ls -lah "$builddir"/iso/
 docker run --rm --name opbuilder \
     -e ppgwver="$ppgwver" \
+#usefullmod    -e FULLMOD="yes" \
     -v "$builddir"/custom.config.sh:/src/custom.config.sh \
     -v "$builddir"/iso/:/src/iso/ \
     -v "$builddir"/FILES:/src/cpfiles/ \
