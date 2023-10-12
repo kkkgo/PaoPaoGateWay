@@ -185,7 +185,15 @@ docker run --rm -v .:/data sliamb/ppgwiso
 ```
 *如果你的网络环境访问Dokcer镜像有困难，可以尝试使用[上海交大](https://mirror.sjtu.edu.cn/docs/docker-registry)的镜像。*   
 
-只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。
+只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。  
+
+#### 可选：物理网卡直通
+镜像因为是虚拟机专用默认仅包含虚拟网卡驱动，如果有物理网卡直通需求，你可以把定制的docker镜像切换成`fullmod`版本，增加驱动：  
+```shell
+docker pull sliamb/ppgwiso:fullmod
+docker run --rm -v .:/data sliamb/ppgwiso:fullmod
+```
+*注：`fullmod`附带了所有可能支持的网卡驱动和相关模块，生成的镜像会大20M左右，可适当增加运行内存。*
 
 #### 可选：生成前置嗅探的ISO
 生成前置嗅探的ISO，流量到达网关后先尝试嗅探出域名再使用FAKEIP，更适合企业环境使用：  
