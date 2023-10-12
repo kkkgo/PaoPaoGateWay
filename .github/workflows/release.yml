@@ -11,6 +11,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
+    - name: remove full mod flag
+      run: sed -i '/usefullmod/d' makeiso.sh
     - name: Set SHSHA
       run: echo "SHSHA="$(echo "${{ github.sha }}"|grep -Eo "^[0-9a-z]{7}"|head -1) >> $GITHUB_ENV
     - name: Gen sha.txt
