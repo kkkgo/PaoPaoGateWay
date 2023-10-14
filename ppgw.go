@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,6 +22,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v2"
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 )
 
 var (
@@ -45,6 +48,7 @@ var (
 	dnslist               string
 	reload                bool
 	closeall              bool
+	wsPort                string
 )
 
 var orange = "\033[38;5;208m"
@@ -80,6 +84,47 @@ type Downloader struct {
 	Timeout    time.Duration
 }
 
+// ws catch
+type ConnectionInfo struct {
+	DownloadTotal int64        `json:"downloadTotal"`
+	UploadTotal   int64        `json:"uploadTotal"`
+	Connections   []Connection `json:"connections"`
+}
+
+type Connection struct {
+	ID       string   `json:"id"`
+	Metadata Metadata `json:"metadata"`
+	Upload   int      `json:"upload"`
+	Download int      `json:"download"`
+}
+
+type Metadata struct {
+	Network         string `json:"network"`
+	Type            string `json:"type"`
+	SourceIP        string `json:"sourceIP"`
+	DestinationIP   string `json:"destinationIP"`
+	SourcePort      string `json:"sourcePort"`
+	DestinationPort string `json:"destinationPort"`
+	Host            string `json:"host"`
+	DNSMode         string `json:"dnsMode"`
+	ProcessPath     string `json:"processPath"`
+	SpecialProxy    string `json:"specialProxy"`
+}
+
+type DomainInfo struct {
+	Domain   string
+	Download int64
+	Upload   int64
+	ClientIP string
+}
+
+type DomainInfoList []DomainInfo
+
+type LastConnectionInfo struct {
+	LastDownloadTotal int64
+	LastUploadTotal   int64
+}
+
 func main() {
 
 	flag.Var(&inputFiles, "input", "Input YAML files")
@@ -104,8 +149,118 @@ func main() {
 	flag.IntVar(&maxSystemCommandDelay, "cpudelay", 300, "CPU delay")
 	flag.BoolVar(&reload, "reload", false, "reload yaml")
 	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
+	//ws catch
+	flag.StringVar(&wsPort, "wsPort", "", "wsPort")
 
 	flag.Parse()
+	//net_rec
+	if wsPort != "" && secret != "" {
+		wsURL := "ws://127.0.0.1:" + wsPort + "/connections?token=" + secret
+		fmt.Printf("\n" + green + "[PaoPaoGW REC]" + reset + "Start NET REC :" + wsPort + " \n")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		domainInfoMap := make(map[string]*DomainInfo)
+		lastConnectionInfoMap := make(map[string]LastConnectionInfo)
+		var domainInfoList DomainInfoList
+		var mutex sync.Mutex
+
+		go func() {
+			for {
+				conn, _, err := websocket.Dial(ctx, wsURL, nil)
+				if err != nil {
+					fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Failed to dial WebSocket.\n")
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				defer conn.Close(websocket.StatusInternalError, "PPGW NET_REC ERR")
+
+				// Increase the read limit
+				conn.SetReadLimit(10 * 1024 * 1024)
+
+				for {
+					var connectionInfo ConnectionInfo
+					err := wsjson.Read(ctx, conn, &connectionInfo)
+					if err != nil {
+						fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Failed to read WebSocket message.\n")
+						break
+					}
+
+					mutex.Lock()
+					for _, connection := range connectionInfo.Connections {
+						destination := connection.Metadata.Host
+						if destination == "" {
+							destination = connection.Metadata.DestinationIP
+						}
+
+						lastInfo, exists := lastConnectionInfoMap[connection.ID]
+						if !exists {
+							lastConnectionInfoMap[connection.ID] = LastConnectionInfo{
+								LastDownloadTotal: int64(connection.Download),
+								LastUploadTotal:   int64(connection.Upload),
+							}
+						} else {
+							download := int64(connection.Download) - lastInfo.LastDownloadTotal
+							upload := int64(connection.Upload) - lastInfo.LastUploadTotal
+
+							if domainInfo, ok := domainInfoMap[destination]; ok {
+								domainInfo.Download += download
+								domainInfo.Upload += upload
+							} else {
+								domainInfoMap[destination] = &DomainInfo{
+									Domain:   destination,
+									Download: download,
+									Upload:   upload,
+									ClientIP: connection.Metadata.SourceIP,
+								}
+							}
+
+							lastConnectionInfoMap[connection.ID] = LastConnectionInfo{
+								LastDownloadTotal: int64(connection.Download),
+								LastUploadTotal:   int64(connection.Upload),
+							}
+						}
+					}
+					mutex.Unlock()
+				}
+			}
+		}()
+
+		for range time.Tick(1 * time.Second) {
+			mutex.Lock()
+			domainInfoList = nil
+			for _, info := range domainInfoMap {
+				domainInfoList = append(domainInfoList, *info)
+			}
+			sort.Sort(domainInfoList)
+			mutex.Unlock()
+			file, err := os.Create("/etc/config/clash/clash-dashboard/data.csv")
+			if err != nil {
+				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Failed to create CSV file.\n")
+				continue
+			}
+			defer file.Close()
+			writer := csv.NewWriter(file)
+			if err := writer.Write([]string{"Domain", "Download", "Upload", "ClientIP"}); err != nil {
+				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Error writing CSV header.\n")
+				continue
+			}
+			for _, info := range domainInfoList {
+				row := []string{info.Domain, formatBytes(info.Download), formatBytes(info.Upload), info.ClientIP}
+				if err := writer.Write(row); err != nil {
+					fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Error writing CSV data.\n")
+					continue
+				}
+			}
+			writer.Flush()
+			if err := writer.Error(); err != nil {
+				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Error flushing CSV data.\n")
+			}
+		}
+		os.Exit(0)
+	}
+	//clash_yaml reload
 	if reload {
 		err := reloadYaml(apiURL, secret)
 		if err != nil {
@@ -115,6 +270,7 @@ func main() {
 		fmt.Printf("\n" + green + "[PaoPaoGW Reload]" + reset + "Yaml reload OK. \n")
 		os.Exit(0)
 	}
+	//test_http_code
 	if testProxy != "" {
 		if testNodeURL == "" || testProxy == "" {
 			fmt.Println("Please provide URL and HTTP proxy parameters")
@@ -162,6 +318,7 @@ func main() {
 	}
 
 	//clashapi ./ppgw -apiurl="http://10.10.10.3:9090" -secret="clashpass" -test_node_url="https://www.google.com" -ext_node="ong|Traffic|Expire| GB"
+	//closeall conn
 	if closeall {
 		if secret == "" || apiURL == "" {
 			os.Exit(1)
@@ -173,6 +330,7 @@ func main() {
 		}
 		os.Exit(0)
 	}
+	//fast_node
 	if apiURL != "" {
 		if secret == "" || testNodeURL == "" {
 			os.Exit(1)
@@ -239,7 +397,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-
+	//gen_host
 	if rawURL != "" {
 		parsedURL, err := url.Parse(rawURL)
 		if err != nil {
@@ -253,6 +411,7 @@ func main() {
 		fmt.Println(constructedURL)
 		os.Exit(0)
 	}
+	//wget
 	if downURL != "" {
 		downloader := NewDownloader(downURL, outputFile)
 		err := downloader.Download()
@@ -264,6 +423,7 @@ func main() {
 			os.Exit(0)
 		}
 	}
+	//gen_cron
 	if interval != "" {
 		err := updateCrontab(interval)
 		if err != nil {
@@ -273,7 +433,7 @@ func main() {
 		fmt.Println("Crontab updated successfully.")
 		os.Exit(0)
 	}
-
+	//gen yaml hash
 	if yamlhashFile != "" {
 		content, err := os.ReadFile(yamlhashFile)
 		if err != nil {
@@ -306,6 +466,7 @@ func main() {
 		fmt.Printf("%x", hash.Sum32())
 		os.Exit(0)
 	}
+	//dns_burn
 	if dnslist != "" {
 		if inputFile == "" {
 			fmt.Println("Please provide an input YAML file using the -input flag")
@@ -382,7 +543,7 @@ func main() {
 
 		os.Exit(0)
 	}
-
+	//combine yaml
 	if inputFiles != nil {
 		result := make(map[interface{}]interface{})
 
@@ -423,6 +584,37 @@ func main() {
 	flag.CommandLine.Usage()
 }
 
+// net rec func
+func (d DomainInfoList) Len() int {
+	return len(d)
+}
+
+func (d DomainInfoList) Less(i, j int) bool {
+	return d[i].Download+d[i].Upload > d[j].Download+d[j].Upload
+}
+
+func (d DomainInfoList) Swap(i, j int) {
+	d[i], d[j] = d[j], d[i]
+}
+
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.3fGB", float64(bytes)/GB)
+	case bytes >= MB:
+		return fmt.Sprintf("%.3fMB", float64(bytes)/MB)
+	case bytes >= KB:
+		return fmt.Sprintf("%.3fKB", float64(bytes)/KB)
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
+}
 func dnsRes(domain string, dnsServers []string) []string {
 	var wg sync.WaitGroup
 	var mu sync.Mutex

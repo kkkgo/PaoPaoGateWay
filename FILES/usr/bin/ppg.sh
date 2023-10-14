@@ -76,6 +76,21 @@ kill_clash() {
     fi
     nft flush ruleset
 }
+kill_netrec() {
+    if ps | grep -v "grep" | grep "wsPort"; then
+        kill -9 $(pgrep -x "/usr/bin/ppgw")
+        log "NET REC SHUTDOWN." warn
+    fi
+}
+load_netrec() {
+    if ps | grep -v "grep" | grep "/etc/config/clash"; then
+        if ps | grep -v "grep" | grep "wsPort"; then
+            echo "PPGW REC RUNNING."
+        else
+            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$clash_web_password" >/dev/tty0 2>&1 &
+        fi
+    fi
+}
 load_clash() {
     log "Loading clash..." warn
     # ulimit
@@ -242,7 +257,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns""$net_rec"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -638,8 +653,7 @@ while true; do
         old_openport=$openport
         old_clash_web_port=$clash_web_port
         old_clash_web_password=$clash_web_password
-        old_suburl=$suburl
-        old_fast_node=$fast_node
+        old_net_rec=$net_rec
     fi
     try_conf "ppgw.ini" "ini"
     hash=$(gen_hash)
@@ -660,12 +674,17 @@ while true; do
             fi
             if [ "$old_clash_web_port" != "$clash_web_port" ]; then
                 kill_clash
+                kill_netrec
             fi
             if [ "$old_clash_web_password" != "$clash_web_password" ]; then
                 kill_clash
+                kill_netrec
+            fi
+            if [ "$old_net_rec" != "$net_rec" ]; then
+                kill_netrec
             fi
             if [ "$mode" = "suburl" ]; then
-                    get_conf "$suburl" "yaml"
+                get_conf "$suburl" "yaml"
             fi
             reload_gw
             if [ -f /tmp/ppgw.ini ]; then
@@ -738,7 +757,9 @@ while true; do
         log "Try to run Clash again..." warn
         load_clash $fast_node $udp_enable
     fi
-
+    if [ "$net_rec" = "yes" ]; then
+        load_netrec
+    fi
     if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
         sleeptime=30
     fi

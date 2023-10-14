@@ -32,9 +32,11 @@ mkdir -p "$builddir"/iso
 mkdir -p "$builddir"/FILES/
 rm -rf "$builddir"/iso/*
 ls -lah "$builddir"/iso/
+export FULLMOD="no"
+#usefullmod export FULLMOD="yes"
 docker run --rm --name opbuilder \
     -e ppgwver="$ppgwver" \
-#usefullmod    -e FULLMOD="yes" \
+    -e FULLMOD="$FULLMOD" \
     -v "$builddir"/custom.config.sh:/src/custom.config.sh \
     -v "$builddir"/iso/:/src/iso/ \
     -v "$builddir"/FILES:/src/cpfiles/ \
@@ -80,7 +82,7 @@ if [ -f "$builddir""/sha.txt" ]; then
     ls -lah "$builddir"/iso/pack
     docker run --rm --name opbuilder \
         -v "$builddir"/iso/pack:/src/iso/ \
-        -e sha=$sha \
+        -e sha="$sha" \
         sliamb/opbuilder bash 7z.sh
     mv "$builddir"/iso/pack/*.7z "$builddir"/iso/
 fi
