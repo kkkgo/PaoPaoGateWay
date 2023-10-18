@@ -55,11 +55,6 @@ fast_node_sel() {
         touch /tmp/allnode.failed
     fi
 }
-kill_cron() {
-    if ps | grep -v "grep" | grep "/etc/cron"; then
-        /etc/init.d/cron stop
-    fi
-}
 kill_clash_cache() {
     if [ -f /etc/config/clash/cache.db ]; then
         rm -f /etc/config/clash/cache.db
@@ -544,7 +539,6 @@ reload_gw() {
         rm "/tmp/clash.yaml"
     fi
     if [ "$mode" = "socks5" ]; then
-        kill_cron
         sed -i "s/{clashmode}/rule/g" /tmp/clash_base.yaml
         sed 's/\r$//' /etc/config/clash/socks5.yaml >/tmp/clash_socks5.yaml
         sed -i "s/{socks5_ip}/$socks5_ip/g" /tmp/clash_socks5.yaml
@@ -552,11 +546,9 @@ reload_gw() {
         ppgw -input /tmp/clash_socks5.yaml -input /tmp/clash_base.yaml -output /tmp/clash.yaml
     fi
     if [ "$mode" = "yaml" ]; then
-        kill_cron
         try_conf "$yamlfile" "yaml"
     fi
     if [ "$mode" = "ovpn" ]; then
-        kill_cron
         try_conf "$ovpnfile" "ovpn"
         sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
         sed -i "s/#interface-name/interface-name/g" /tmp/clash_base.yaml
@@ -574,8 +566,6 @@ reload_gw() {
             else
                 get_conf "$suburl" "yaml"
             fi
-            ppgw -interval "$subtime"
-            /etc/init.d/cron reload
         else
             log "Bad suburl" warn
         fi
@@ -598,7 +588,6 @@ reload_gw() {
     fi
 
     if [ "$mode" = "free" ]; then
-        kill_cron
         sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
         cat /tmp/clash_base.yaml >/tmp/clash.yaml
     fi
@@ -630,19 +619,11 @@ if [ "$1" = "reload" ]; then
     exit
 fi
 
-if [ "$1" = "cron" ]; then
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
-    fi
-    get_conf "$suburl" "yaml"
-    reload_gw
-    exit
-fi
 sysctl -w net.ipv6.conf.all.disable_ipv6=1
 net_ready
 cat /etc/banner >/dev/tty0
 echo " " >/dev/tty0
-
+sleep_count=0
 last_hash="empty"
 last_yaml_hash="empty"
 last_ovpn_hash="empty"
@@ -768,5 +749,23 @@ while true; do
     else
         log "Same hash. Sleep ""$sleeptime""s."
         sleep "$sleeptime"
+        sleep_count=$((sleep_count + 1))
+    fi
+    if [ "$mode" = "suburl" ]; then
+        if [ -f /tmp/ppgw.ini ]; then
+            . /tmp/ppgw.ini 2>/dev/tty0
+        fi
+        if [ -z "$subtime" ]; then
+            subtime="1d"
+        fi
+        # ppgw apply subtime
+        ppgw_subtime=$(ppgw -interval "$subtime" -sleeptime "$sleeptime")
+        log "[NEXT SUB-TIME] ""$sleep_count""/""$ppgw_subtime"""
+        if [ "$sleep_count" -ge "$ppgw_subtime" ]; then
+            # apply ppgw_subtime
+            sleep_count=0
+            get_conf "$suburl" "yaml"
+            reload_gw
+        fi
     fi
 done

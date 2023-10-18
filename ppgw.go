@@ -40,6 +40,7 @@ var (
 	outputFile            string
 	yamlhashFile          string
 	interval              string
+	sleeptime             string
 	apiURL                string
 	secret                string
 	testNodeURL           string
@@ -136,6 +137,7 @@ func main() {
 	flag.StringVar(&downURL, "downURL", "", "downURL")
 	flag.StringVar(&server, "server", "", "DNS server to use")
 	flag.StringVar(&interval, "interval", "", "sub interval")
+	flag.StringVar(&sleeptime, "sleeptime", "", "sleeptime")
 	flag.StringVar(&testProxy, "testProxy", "", "http testProxy")
 	flag.StringVar(&dnslist, "dnslist", "", "dnslist")
 	flag.IntVar(&port, "port", 53, "DNS port")
@@ -424,13 +426,9 @@ func main() {
 		}
 	}
 	//gen_cron
-	if interval != "" {
-		err := updateCrontab(interval)
-		if err != nil {
-			fmt.Printf("Error updating crontab: %v\n", err)
-			return
-		}
-		fmt.Println("Crontab updated successfully.")
+	if interval != "" && sleeptime != "" {
+		result := parseSubtime(interval, sleeptime)
+		fmt.Printf("%d", result)
 		os.Exit(0)
 	}
 	//gen yaml hash
@@ -739,68 +737,36 @@ func nslookup(domain string) string {
 	ip := r[0].IP.String()
 	return ip
 }
-func updateCrontab(interval string) error {
-	interval = strings.ToLower(interval)
-	cronExpression, err := convertToCronExpression(interval)
-	if err != nil {
-		return err
-	}
-	return writeCrontab(cronExpression)
-}
 
-func convertToCronExpression(interval string) (string, error) {
-	lastChar := interval[len(interval)-1]
-	durationPart := interval[:len(interval)-1]
-	var totalMinutes int
-
-	switch lastChar {
-	case 'm':
-		duration, err := strconv.Atoi(durationPart)
-		if err != nil {
-			return "", err
+func parseSubtime(subtime, sleeptime string) int {
+	duration := 86400
+	if subtime != "" {
+		if strings.HasSuffix(subtime, "d") {
+			nStr := strings.TrimSuffix(subtime, "d")
+			n, err := strconv.Atoi(nStr)
+			if err == nil {
+				duration = n * 86400
+			}
+		} else if strings.HasSuffix(subtime, "h") {
+			nStr := strings.TrimSuffix(subtime, "h")
+			n, err := strconv.Atoi(nStr)
+			if err == nil {
+				duration = n * 3600
+			}
+		} else if strings.HasSuffix(subtime, "m") {
+			nStr := strings.TrimSuffix(subtime, "m")
+			n, err := strconv.Atoi(nStr)
+			if err == nil {
+				duration = n * 60
+			}
 		}
-		totalMinutes = duration
-	case 'h':
-		duration, err := strconv.Atoi(durationPart)
-		if err != nil {
-			return "", err
-		}
-		totalMinutes = duration * 60
-	case 'd':
-		duration, err := strconv.Atoi(durationPart)
-		if err != nil {
-			return "", err
-		}
-		totalMinutes = duration * 24 * 60
-	default:
-		return "", fmt.Errorf("invalid time interval")
 	}
-
-	switch {
-	case totalMinutes >= 24*60:
-		days := totalMinutes / (24 * 60)
-		return fmt.Sprintf("0 0 */%d * *", days), nil
-	case totalMinutes > 60:
-		hours := totalMinutes / 60
-		return fmt.Sprintf("0 */%d * * *", hours), nil
-	case totalMinutes > 0:
-		return fmt.Sprintf("*/%d * * * *", totalMinutes), nil
-	default:
-		return "", fmt.Errorf("invalid time interval")
-	}
-}
-
-func writeCrontab(cronExpression string) error {
-	filePath := "/etc/crontabs/root"
-	err := os.WriteFile(filePath, []byte(""), 0644)
+	sleeptimeInt, err := strconv.Atoi(sleeptime)
 	if err != nil {
-		return err
+		sleeptimeInt = 30
 	}
-	err = os.WriteFile(filePath, []byte(cronExpression+" /usr/bin/cron.sh\n"), 0644)
-	if err != nil {
-		return err
-	}
-	return nil
+	result := duration / sleeptimeInt
+	return result
 }
 
 func initDNS() {
