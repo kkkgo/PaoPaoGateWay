@@ -50,6 +50,7 @@ var (
 	reload                bool
 	closeall              bool
 	wsPort                string
+	net_rec_num           string
 )
 
 var orange = "\033[38;5;208m"
@@ -153,10 +154,15 @@ func main() {
 	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
 	//ws catch
 	flag.StringVar(&wsPort, "wsPort", "", "wsPort")
+	flag.StringVar(&net_rec_num, "net_rec_num", "", "net_rec_num")
 
 	flag.Parse()
 	//net_rec
 	if wsPort != "" && secret != "" {
+		max_rec, err := strconv.Atoi(net_rec_num)
+		if err != nil {
+			max_rec = 5000
+		}
 		wsURL := "ws://127.0.0.1:" + wsPort + "/connections?token=" + secret
 		fmt.Printf("\n" + green + "[PaoPaoGW REC]" + reset + "Start NET REC :" + wsPort + " \n")
 
@@ -224,22 +230,42 @@ func main() {
 							}
 						}
 					}
+
+					if len(domainInfoMap) > max_rec*2 {
+						var trimmedList []DomainInfo
+						for _, info := range domainInfoMap {
+							trimmedList = append(trimmedList, *info)
+						}
+						sort.Slice(trimmedList, func(i, j int) bool {
+							return trimmedList[i].Download+trimmedList[i].Upload > trimmedList[j].Download+trimmedList[j].Upload
+						})
+						if len(trimmedList) > max_rec {
+							trimmedList = trimmedList[:max_rec]
+						}
+						domainInfoMap = make(map[string]*DomainInfo)
+						for i := range trimmedList {
+							domainInfoMap[trimmedList[i].Domain] = &trimmedList[i]
+						}
+					}
 					mutex.Unlock()
 				}
 			}
 		}()
-
-		for range time.Tick(1 * time.Second) {
+		for range time.Tick(3 * time.Second) {
 			mutex.Lock()
 			domainInfoList = nil
 			for _, info := range domainInfoMap {
 				domainInfoList = append(domainInfoList, *info)
 			}
 			sort.Sort(domainInfoList)
-			mutex.Unlock()
-			file, err := os.Create("/etc/config/clash/clash-dashboard/data.csv")
+
+			newFilePath := "/etc/config/clash/clash-dashboard/data.csv.new"
+			oldFilePath := "/etc/config/clash/clash-dashboard/data.csv.old"
+			currentFilePath := "/etc/config/clash/clash-dashboard/data.csv"
+			file, err := os.Create(newFilePath)
 			if err != nil {
 				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Failed to create CSV file.\n")
+				mutex.Unlock()
 				continue
 			}
 			defer file.Close()
@@ -259,6 +285,19 @@ func main() {
 			if err := writer.Error(); err != nil {
 				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Error flushing CSV data.\n")
 			}
+			file.Close()
+			if _, err := os.Stat(currentFilePath); err == nil {
+				os.Rename(currentFilePath, oldFilePath)
+			}
+
+			if err := os.Rename(newFilePath, currentFilePath); err != nil {
+				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Failed to replace CSV file.\n")
+				os.Rename(oldFilePath, currentFilePath)
+			}
+			if _, err := os.Stat(oldFilePath); err == nil {
+				os.Remove(oldFilePath)
+			}
+			mutex.Unlock()
 		}
 		os.Exit(0)
 	}

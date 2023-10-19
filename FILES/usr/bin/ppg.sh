@@ -82,7 +82,13 @@ load_netrec() {
         if ps | grep -v "grep" | grep "wsPort"; then
             echo "PPGW REC RUNNING."
         else
-            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$clash_web_password" >/dev/tty0 2>&1 &
+            if [ -f /tmp/ppgw.ini ]; then
+                . /tmp/ppgw.ini 2>/dev/tty0
+            fi
+            if [ -z "$max_rec" ]; then
+                max_rec="5000"
+            fi
+            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$clash_web_password" -net_rec_num="$max_rec" >/dev/tty0 2>&1 &
         fi
     fi
 }
@@ -252,7 +258,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns""$net_rec"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns""$net_rec""$max_rec"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -635,6 +641,7 @@ while true; do
         old_clash_web_port=$clash_web_port
         old_clash_web_password=$clash_web_password
         old_net_rec=$net_rec
+        old_max_rec=$max_rec
     fi
     try_conf "ppgw.ini" "ini"
     hash=$(gen_hash)
@@ -662,6 +669,9 @@ while true; do
                 kill_netrec
             fi
             if [ "$old_net_rec" != "$net_rec" ]; then
+                kill_netrec
+            fi
+            if [ "$old_max_rec" != "$max_rec" ]; then
                 kill_netrec
             fi
             if [ "$mode" = "suburl" ]; then
