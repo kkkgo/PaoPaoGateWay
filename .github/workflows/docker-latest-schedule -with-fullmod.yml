@@ -1,8 +1,8 @@
 name: Schedule Latest Build Docker -with-full-mod
 
 on:
-  schedule:
-    - cron: '25 23 * * *'
+  # schedule:
+  #   - cron: '25 23 * * *'
   push:
     paths-ignore:
       - '*.md'
