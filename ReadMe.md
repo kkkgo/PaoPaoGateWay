@@ -100,7 +100,7 @@ ext_node="Traffic|Expire| GB|Days|Date"
 cpudelay="3000"
 
 # dns burn setting
-# depand on fast_node=yes & mode=suburl/yaml
+# depend on fast_node=yes & mode=suburl/yaml
 dns_burn=no
 # If used with PaoPaoDNS, you can set the PaoPaoDNS:53
 ex_dns="223.5.5.5:53"
