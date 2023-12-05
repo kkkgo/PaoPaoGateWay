@@ -25,3 +25,16 @@ dns:
   fake-ip-range: {fake_cidr}
   nameserver:
     - {dns_ip}:{dns_port}#eth0
+
+#mihomo exclude
+tls:
+external-controller-tls:
+external-ui-name:
+external-ui-url:
+tun:
+  enable: false
+ebpf:
+sniffer:
+  enable: false
+listeners:
+find-process-mode:
