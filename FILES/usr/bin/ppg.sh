@@ -746,6 +746,7 @@ while true; do
         fi
     else
         log "Try to run Clash again..." warn
+        get_conf "$suburl" "yaml"
         load_clash $fast_node $udp_enable
     fi
     if [ "$net_rec" = "yes" ]; then

@@ -1,8 +1,9 @@
 FROM alpine:edge AS singbuilder
-RUN apk add go
+RUN apk add go git
 WORKDIR /data
-RUN go mod init sing-box && go get -v github.com/sagernet/sing-box/cmd/sing-box@latest
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -extldflags -static" -trimpath -o /data/sing-box github.com/sagernet/sing-box/cmd/sing-box
+RUN git clone https://github.com/kkkgo/box.git box
+WORKDIR /data/box
+RUN go get -u && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -extldflags -static" -trimpath -tags "" -o /data/sing-box ./cmd/sing-box
 FROM alpine:edge
 WORKDIR /data
 COPY ./remakeiso.sh /
