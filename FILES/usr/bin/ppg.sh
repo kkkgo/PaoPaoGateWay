@@ -746,7 +746,12 @@ while true; do
         fi
     else
         log "Try to run Clash again..." warn
-        get_conf "$suburl" "yaml"
+        if [ "$mode" = "ovpn" ]; then
+            try_conf "$ovpnfile" "ovpn"
+        fi
+        if [ "$mode" = "suburl" ]; then
+            get_conf "$suburl" "yaml"
+        fi
         load_clash $fast_node $udp_enable
     fi
     if [ "$net_rec" = "yes" ]; then
