@@ -288,6 +288,9 @@ get_conf() {
     sleep 1
     down_url=$1
     down_type=$2
+    if [ -z "$down_url" ]; then
+        down_url="download_url_not_found"
+    fi
     if [ "$down_type" = "ini" ]; then
         if [ -f /www/ppgw.ini ]; then
             if [ -f /tmp/ppgw.ini ]; then
@@ -751,6 +754,9 @@ while true; do
         fi
         if [ "$mode" = "suburl" ]; then
             get_conf "$suburl" "yaml"
+        fi
+        if [ "$mode" = "yaml" ]; then
+            try_conf "$yamlfile" "yaml"
         fi
         load_clash $fast_node $udp_enable
     fi
