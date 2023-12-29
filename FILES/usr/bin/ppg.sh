@@ -25,6 +25,10 @@ net_ready() {
     log "eth0 ready: IP: [""$eth0ip""] MAC: [""$eth0mac""]" succ
 }
 
+getsha256(){
+    echo -n "$1"|sha256sum|cut -d" " -f1
+}
+
 fast_node_sel() {
     wait_delay=$1
     try_count=$2
@@ -50,7 +54,7 @@ fast_node_sel() {
         cpudelay="3000"
     fi
     log "Try to test node...[""$try_count""]" warn
-    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
+    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
     if [ "$?" = "1" ]; then
         touch /tmp/allnode.failed
     fi
@@ -88,7 +92,7 @@ load_netrec() {
             if [ -z "$max_rec" ]; then
                 max_rec="5000"
             fi
-            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$clash_web_password" -net_rec_num="$max_rec" >/dev/tty0 2>&1 &
+            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -net_rec_num="$max_rec" >/dev/tty0 2>&1 &
         fi
     fi
 }
@@ -117,7 +121,7 @@ load_clash() {
         fi
         sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
         if ps | grep -v "grep" | grep "/etc/config/clash"; then
-            ppgw -reload -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" >/dev/tty0 2>&1
+            ppgw -reload -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" >/dev/tty0 2>&1
         else
             /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
         fi
@@ -188,7 +192,7 @@ load_clash() {
             fi
         fi
     fi
-    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$clash_web_password" -closeall >/dev/tty0
+    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -closeall >/dev/tty0
 }
 
 kill_ovpn() {
@@ -541,7 +545,7 @@ reload_gw() {
     sed -i "s/{clash_web_port}/$clash_web_port/g" /tmp/clash_base.yaml
     sed -i "s/{dns_ip}/$dns_ip/g" /tmp/clash_base.yaml
     sed -i "s/{dns_port}/$dns_port/g" /tmp/clash_base.yaml
-    sed -i "s/{clash_web_password}/$clash_web_password/g" /tmp/clash_base.yaml
+    sed -i "s/{clash_web_password}/$(getsha256 "$clash_web_password")/g" /tmp/clash_base.yaml
     sed -i "s/{openport}/$openport/g" /tmp/clash_base.yaml
     sed -i "s/127.0.0.1/0.0.0.0/g" /tmp/clash_base.yaml
     if [ -e "/tmp/clash.yaml" ]; then
