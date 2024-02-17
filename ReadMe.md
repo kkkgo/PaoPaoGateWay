@@ -198,7 +198,7 @@ docker run --rm -v .:/data sliamb/ppgwiso
 只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。  
 
 #### 可选：物理网卡直通
-镜像因为是虚拟机专用默认仅包含虚拟网卡驱动，如果有物理网卡直通需求，你可以把定制的docker镜像切换成`fullmod`版本，增加驱动：  
+镜像因为是虚拟机专用默认仅包含虚拟网卡驱动，如果有物理网卡直通需求，你可以把定制的docker镜像切换成`fullmod`版本，增加驱动(还包含qemu-ga/open-vm-tools)：  
 ```shell
 docker pull sliamb/ppgwiso:fullmod
 docker run --rm -v .:/data sliamb/ppgwiso:fullmod
