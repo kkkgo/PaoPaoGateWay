@@ -188,7 +188,7 @@ ppgwurl="http://...."
 #### 最后一步：一键生成ISO
 你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  
 确保在每次进行操作之前，使用`docker pull`拉取最新的镜像（不同于release版本，docker版本会每天同步最新所有上游代码）。    
-在Linux上或者Windows上操作均可：
+在Linux上或者Windows上操作均可(在Linux路径错误的话，`.:/data`可以换成`$(pwd):/data`)：
 ```shell
 docker pull sliamb/ppgwiso
 docker run --rm -v .:/data sliamb/ppgwiso
