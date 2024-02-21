@@ -26,16 +26,16 @@ jobs:
     - name: show iso sha256sum
       run: cat ./iso/renote.txt
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v2
+      uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      uses: docker/setup-buildx-action@v3
     - name: Login to Docker Hub
-      uses: docker/login-action@v2
+      uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
     - name: Build and push
-      uses: docker/build-push-action@v4
+      uses: docker/build-push-action@v5
       with:
         context: "./iso"
         push: true
@@ -50,7 +50,7 @@ jobs:
         tag: ${{ env.TAG_NAME }}
         body: ${{ env.RE_NOTE }}
     - name: Remove old release
-      uses: dev-drprasad/delete-older-releases@v0.2.1
+      uses: dev-drprasad/delete-older-releases@v0.3.2
       with:
         keep_latest: 30
       env:
