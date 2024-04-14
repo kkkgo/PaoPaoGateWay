@@ -22,11 +22,25 @@ net_ready() {
     done
     export eth0ip=$(ip a | grep eth0 | grep inet | grep -Eo "$IPREX4" | head -1)
     eth0mac=$(ip link show dev eth0 | grep -Eo "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" | head -1)
-    log "eth0 ready: IP: [""$eth0ip""] MAC: [""$eth0mac""]" succ
+    dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
+    dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
+    if [ -z "$dns1" ]; then
+        log "Error: eth0 DNS not found." warn
+    fi
+    if [ "$dns1" != "$dns2" ]; then
+        if echo "$dns2" | grep -qEo "$IPREX4"; then
+            eth0dns="$dns1 $dns2"
+        fi
+    else
+        eth0dns="$dns1"
+    fi
+    eth0gw=$(ip r | grep eth0 | grep "default via" | grep -Eo "$IPREX4" | head -1)
+    log "eth0 ready: IP:[""$eth0ip""] MAC:[""$eth0mac""]" succ
+    log "            DNS:[""$eth0dns""] GW:[""$eth0gw""]" succ
 }
 
-getsha256(){
-    echo -n "$1"|sha256sum|cut -d" " -f1
+getsha256() {
+    echo -n "$1" | sha256sum | cut -d" " -f1
 }
 
 fast_node_sel() {
@@ -65,7 +79,7 @@ kill_clash_cache() {
     fi
 }
 kill_clash() {
-    if ps | grep -v "grep" | grep "/etc/config/clash"; then
+    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
         kill -9 $(pgrep -x "/usr/bin/clash")
     fi
     if [ -f /usr/bin/sing-box ]; then
@@ -76,13 +90,13 @@ kill_clash() {
     nft flush ruleset
 }
 kill_netrec() {
-    if ps | grep -v "grep" | grep "wsPort"; then
+    if ps | grep -v "grep" | grep "/usr/bin/ppgw" | grep "wsPort"; then
         kill -9 $(pgrep -x "/usr/bin/ppgw")
         log "NET REC SHUTDOWN." warn
     fi
 }
 load_netrec() {
-    if ps | grep -v "grep" | grep "/etc/config/clash"; then
+    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
         if ps | grep -v "grep" | grep "wsPort"; then
             echo "PPGW REC RUNNING."
         else
@@ -92,21 +106,26 @@ load_netrec() {
             if [ -z "$max_rec" ]; then
                 max_rec="5000"
             fi
-            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -net_rec_num="$max_rec" >/dev/tty0 2>&1 &
+            mkdir -p /etc/config/clash/clash-dashboard/rec_data
+            rm -rf /etc/config/clash/clash-dashboard/rec_data
+            mkdir -p /etc/config/clash/clash-dashboard/rec_data
+            rec_stamp=$(date +%s)$(cat /dev/urandom | tr -cd 'a-zA-Z0-9' | head -c 64)
+            echo "{\"reckey\": \"$rec_stamp\"}" >/etc/config/clash/clash-dashboard/reckey.json
+            reckey=$(getsha256 "$rec_stamp""$(getsha256 "$clash_web_password")")
+            /usr/bin/ppgw -wsPort="$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -net_rec_num="$max_rec" -reckey="$reckey" >/dev/tty0 2>&1 &
         fi
     fi
 }
 load_clash() {
-    log "Loading clash..." warn
-    # ulimit
-    if [ "$(ulimit -n)" -gt 999999 ]; then
-        log "ulimit adbove 1000000." succ
-    else
-        ulimit -SHn 1048576
-        log "ulimit:"$(ulimit -n)
-    fi
-
     if [ -f /tmp/clash.yaml ]; then
+        log "Loading clash..." warn
+        # ulimit
+        if [ "$(ulimit -n)" -gt 999999 ]; then
+            log "ulimit adbove 1000000." succ
+        else
+            ulimit -SHn 1048576
+            log "ulimit:"$(ulimit -n)
+        fi
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
         fi
@@ -120,8 +139,30 @@ load_clash() {
             clash_web_password="clashpass"
         fi
         sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
-        if ps | grep -v "grep" | grep "/etc/config/clash"; then
+        closeall_flag="yes"
+        log "[VERSION] :""$(clash -v)" succ
+        if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+            now_node_before=$(ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node)
+            if [ "$?" = "1" ]; then
+                now_node_before="now_node_before"
+            fi
             ppgw -reload -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" >/dev/tty0 2>&1
+            now_node_after=$(ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node)
+            if [ "$?" = "1" ]; then
+                now_node_after="now_node_after"
+            fi
+            if [ "$now_node_before" = "$now_node_after" ]; then
+                closeall_flag="no"
+                proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
+                if [ $? -eq 0 ]; then
+                    log "$proxytest" succ
+                else
+                    closeall_flag="yes"
+                fi
+            fi
+            if [ "$closeall_flag" = "yes" ]; then
+                ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -closeall >/dev/tty0
+            fi
         else
             /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
         fi
@@ -155,6 +196,10 @@ load_clash() {
         if [ -f /tmp/allnode.failed ]; then
             kill_clash
             return 3
+        fi
+    else
+        if [ "$mode" = "socks5" ]; then
+            ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -spec_node="ppgwsocks" >/dev/tty0
         fi
     fi
     if [ "$2" = "no" ]; then
@@ -192,7 +237,9 @@ load_clash() {
             fi
         fi
     fi
-    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -closeall >/dev/tty0
+    if [ ! -f /etc/watch ]; then
+        /usr/bin/watch.sh &
+    fi
 }
 
 kill_ovpn() {
@@ -318,17 +365,17 @@ get_conf() {
     fi
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-    fi
-    if [ -z "$dns_ip" ]; then
-        dns_ip="1.0.0.1"
-    fi
-    if [ -z "$dns_port" ]; then
-        dns_port="53"
+        if [ -z "$dns_ip" ]; then
+            dns_ip="1.0.0.1"
+        fi
+        if [ -z "$dns_port" ]; then
+            dns_port="53"
+        fi
     fi
     echo "127.0.0.1 localhost" >/etc/hosts
     genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
     if [ "$?" = "1" ]; then
-        log "Nslookup failed." warn
+        log "Nslookup DNS failed: ""$down_url" warn
         return 1
     fi
     echo "$genHost" >>/etc/hosts
@@ -421,23 +468,28 @@ try_conf() {
     fi
 
     if [ -n "$try_succ_host" ]; then
+        log "Try[0] to get ""$conf_name"" from last succ way."
         get_conf "http://""$try_succ_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ] || [ -z "$try_succ_host" ]; then
         paopao=$(ppgw -rawURL "http://paopao.dns" | cut -d" " -f1)
         try_host=$paopao
-        get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
+        log "Try[1] to get ""$conf_name"" from paopao.dns"
+        get_conf "http://paopao.dns":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ]; then
         try_host=$gw
+        log "Try[2] to get ""$conf_name"" from gateway ""$gw"
         get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ]; then
         try_host=$dns1
+        log "Try[3] to get ""$conf_name"" from dns1 ""$dns1"
         get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "1" ]; then
         try_host=$dns2
+        log "Try[4] to get ""$conf_name"" from dns2 ""$dns2"
         get_conf "http://""$try_host":"$conf_port""/""$conf_name" "$down_type"
     fi
     if [ "$?" = "0" ]; then
@@ -465,6 +517,10 @@ reload_gw() {
     . /tmp/ppgw.ini 2>/dev/tty0
     if [ -z "$udp_enable" ]; then
         udp_enable="no"
+    fi
+
+    if [ -n "$mode" ]; then
+        log "[MODE] :""$mode" succ
     fi
 
     # route table
@@ -552,7 +608,7 @@ reload_gw() {
         rm "/tmp/clash.yaml"
     fi
     if [ "$mode" = "socks5" ]; then
-        sed -i "s/{clashmode}/rule/g" /tmp/clash_base.yaml
+        sed -i "s/{clashmode}/global/g" /tmp/clash_base.yaml
         sed 's/\r$//' /etc/config/clash/socks5.yaml >/tmp/clash_socks5.yaml
         sed -i "s/{socks5_ip}/$socks5_ip/g" /tmp/clash_socks5.yaml
         sed -i "s/{socks5_port}/$socks5_port/g" /tmp/clash_socks5.yaml
@@ -628,7 +684,22 @@ reload_gw() {
 }
 
 if [ "$1" = "reload" ]; then
+    log "Force reload gateway..." warn
+    try_conf "ppgw.ini" "ini"
+    if [ -f /tmp/ppgw.ini ]; then
+        . /tmp/ppgw.ini 2>/dev/tty0
+    fi
+    if [ "$mode" = "yaml" ]; then
+        try_conf "$yamlfile" "yaml"
+    fi
+    if [ "$mode" = "suburl" ]; then
+        get_conf "$suburl" "yaml"
+    fi
+    if [ "$mode" = "ovpn" ]; then
+        try_conf "$ovpnfile" "ovpn"
+    fi
     reload_gw
+    log "Force reload gateway finsished." warn
     exit
 fi
 
@@ -685,6 +756,11 @@ while true; do
                 get_conf "$suburl" "yaml"
             fi
             reload_gw
+            if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
+                if [ -f "/tmp/ppgw.yaml.down" ]; then
+                    last_yaml_hash=$(gen_yaml_hash "/tmp/ppgw.yaml.down")
+                fi
+            fi
             if [ -f /tmp/ppgw.ini ]; then
                 last_hash=$(gen_hash)
             fi
@@ -730,7 +806,7 @@ while true; do
             fast_node=no
         fi
     fi
-    if ps | grep -v "grep" | grep "/etc/config/clash"; then
+    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
         echo "Clash running OK."
         if [ "$fast_node" = "yes" ] || [ "$fast_node" = "check" ]; then
             if [ -z "$test_node_url" ]; then
@@ -770,12 +846,14 @@ while true; do
     if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
         sleeptime=30
     fi
-    if [ -f /tmp/allnode.failed ] && [ "$fast_node" = "yes" ]; then
-        rm /tmp/allnode.failed
-    else
-        log "Same hash. Sleep ""$sleeptime""s."
-        sleep "$sleeptime"
-        sleep_count=$((sleep_count + 1))
+    if [ -f /tmp/ppgw.ini ]; then
+        if [ -f /tmp/allnode.failed ] && [ "$fast_node" = "yes" ]; then
+            rm /tmp/allnode.failed
+        else
+            log "Same hash. Sleep ""$sleeptime""s."
+            sleep "$sleeptime"
+            sleep_count=$((sleep_count + 1))
+        fi
     fi
     if [ "$mode" = "suburl" ]; then
         if [ -f /tmp/ppgw.ini ]; then
@@ -790,8 +868,16 @@ while true; do
         if [ "$sleep_count" -ge "$ppgw_subtime" ]; then
             # apply ppgw_subtime
             sleep_count=0
+            old_sub_yaml_hash=$(gen_yaml_hash "/tmp/ppgw.yaml.down")
+            log "[OLD SUB YAML HASH]: ""$old_sub_yaml_hash"
             get_conf "$suburl" "yaml"
-            reload_gw
+            new_sub_yaml_hash=$(gen_yaml_hash "/tmp/ppgw.yaml.down")
+            log "[NEW SUB YAML HASH]: ""$new_sub_yaml_hash"
+            if [ "$old_sub_yaml_hash" != "$new_sub_yaml_hash" ]; then
+                log "The sub hash has changed, reload gateway." warn
+                reload_gw
+                continue
+            fi
         fi
     fi
 done

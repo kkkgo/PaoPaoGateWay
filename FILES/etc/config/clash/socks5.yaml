@@ -1,9 +1,6 @@
 proxies:
-  - name: "socks"
+  - name: "ppgwsocks"
     type: socks5
     server: "{socks5_ip}"
     port: {socks5_port}
     udp: true
-rules:
-  - MATCH,socks
-  - MATCH,DIRECT

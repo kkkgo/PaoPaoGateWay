@@ -122,14 +122,14 @@ max_rec=5000
 - 5 `clash_web_port`和`clash_web_password`是clash web仪表板的设置，分别设置web的端口和访问密码，默认值为`80`和`clashpass`。网页登录地址为`http://网关IP:端口/ui`。你可以在web端查看流量和日志，以及选择节点等。不要忘了登录地址是`/ui`。
 - 6 `openport`设置是否向局域网开启一个1080端口的socks5+http代理，默认值为`no`，需要开启可以设置为`yes`。
 - 7 `udp_enable`: 是否允许UDP流量通过网关，默认值为no，设置为no则禁止UDP流量进入网关。（此选项只影响路由，不影响`openport`选项）注意：如果你的节点不支持UDP或者不稳定不建议开启，开启UDP将会导致QUIC失败导致网站有时候上不去的现象。   
-- 8 `sleeptime`是拉取配置检测更新的时间间隔，默认值是30，单位是秒。`sleeptime`在第一次成功获取到配置后生效，如果配置的值发生变化，将会重载网关配置。
+- 8 `sleeptime`是拉取配置检测更新的时间间隔，默认值是30，单位是秒。`sleeptime`在第一次成功获取到配置后生效，如果配置的值发生变化，将会重载网关配置。如果设置sleeptime低于30会被赋值为30。   
 - 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。
 - 10 `ovpnfile`，`ovpn_username`和`ovpn_password`: ovpn运行模式的专用设置，`ovpnfile`指定ovpn的文件名，系统将会从`ppgw.ini`的同一目录下载该文件。如果你的ovpn需要用户名和密码认证，可以指定`ovpn_username`和`ovpn_password`。
 - 11 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并使用`sleeptime`的值循环刷新检测配置文件变化，值发生变化则重载网关。
 - 12 `suburl`和`subtime`: suburl运行模式的专用配置，`suburl`指定订阅的地址（记得加英文半角双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔而不是`sleeptime`，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔，检测配置变化仍然是由`sleeptime`进行。注意如果开了`fast_node`功能，检测不通的时候会主动拉新订阅。  
 - 13 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能。`fast_node`默认值为no。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`https://www.youtube.com/generate_204`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。`fast_node`的行为如下：
   - 当`fast_node=yes`或者`fast_node=check`，系统将会在`sleeptime`间隔检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则立即停止clash并秒重载网关配置，如果是suburl模式，还会在重载前拉新订阅配置。
-  - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式。
+  - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。***`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式***。  
   - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
   - 注意，设置为`check`不会测速，设置为`yes`测速失败到阈值会杀死进程并终止应用网关并重载，而`check`不会杀死进程，仅重载所有配置并关闭所有现有的旧连接。  
   - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。
@@ -142,8 +142,7 @@ max_rec=5000
     - 1、重启或者修改ppgw的密码、Web端口、`max_rec`选项、关了再开`net_rec`选项会导致数据清空。
     - 2、如果流量太小连接持续时间过短，有可能在记录之前连接已经关闭，流量会显示为0B。
     - 3、客户端IP记录的是最后一次连接该域名的客户端IP。
-    - 4、数据下载没有身份验证。
-    - 5、理论上会略微增加资源占用，取决于你的并发连接数量以及`max_rec`，可适当增加运行资源。
+    - 4、理论上会略微增加资源占用，取决于你的并发连接数量以及`max_rec`，可适当增加运行资源。
 
 ## 使用docker定制ISO镜像:ppwgiso
 ![pull](https://img.shields.io/docker/pulls/sliamb/ppgwiso.svg) ![size](https://img.shields.io/docker/image-size/sliamb/ppgwiso)   
@@ -160,6 +159,7 @@ gw=10.10.10.1
 dns1=10.10.10.8
 dns2=10.10.10.9
 ```
+**虚拟机网卡分配的dns仅用于拉取`ppgw.ini`无其他作用。只有一个dns就只填dns1。*    
 #### 指定`ppgw.ini`的下载地址：`ppgwurl.ini`
 如果你要指定ppgw.ini的下载地址而不是按上面的规则来寻找，比如你弄了一个带鉴权的http服务器提高安全性，防止配置泄露，你可以新建一个`ppgwurl.ini`如下：
 ```ini
@@ -178,6 +178,7 @@ ppgwurl="http://...."
 注意：你仍然需要在`ppgw.ini`中指定`mode=yaml`才会使用到该文件。
 
 #### 替换clash/mihomo核心
+***由于第三方稳定性未知，不建议替换核心，除非内置核心不能满足需求***
 你可以把你的amd64的clash/mihomo二进制文件重命名为clash放到当前目录即可。通过替换clash核心，你可以支持更多的协议和规则功能，比如替换为[mihomo](https://github.com/MetaCubeX/mihomo/releases)。   
 注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。  
 

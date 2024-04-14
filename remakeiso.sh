@@ -143,6 +143,22 @@ if [ -f /data/network.ini ]; then
     echo Patching network...
     sed 's/\r$//' "/data/network.ini" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/network.ini"
     . /tmp/network.ini
+    if [ -z "$ip" ]; then
+        echo "Error: network.ini ip not found."
+        exit
+    fi
+    if [ -z "$mask" ]; then
+        echo "Error: network.ini mask not found."
+        exit
+    fi
+    if [ -z "$gw" ]; then
+        echo "Error: network.ini gw not found."
+        exit
+    fi
+    if [ "$ip" = "$gw" ]; then
+        echo "Error: ip=gw=""$ip"" ! The network IP address should not be equal to the gateway."
+        exit
+    fi
     cat >$root"/etc/config/network" <<EOF
 config interface 'loopback'
     option device 'lo'
@@ -157,6 +173,18 @@ config interface 'eth0'
     option netmask '$mask'
     option gateway '$gw'
 EOF
+    if [ -z "$dns1" ]; then
+        if [ -n "$dns" ]; then
+            dns1=$dns
+        else
+            if [ -n "$dns2" ]; then
+                dns1=$dns2
+            else
+                echo "Error: network.ini dns1=? or dns2=? not found."
+                exit
+            fi
+        fi
+    fi
     if [ -n "$dns2" ]; then
         echo "    option dns '$dns1 $dns2'" >>$root"/etc/config/network"
     else

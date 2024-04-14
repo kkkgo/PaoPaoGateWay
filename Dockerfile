@@ -1,5 +1,5 @@
 FROM alpine:edge AS singbuilder
-RUN apk add go git
+RUN apk add go git && apk upgrade
 WORKDIR /data
 RUN git clone https://github.com/kkkgo/box.git box
 WORKDIR /data/box

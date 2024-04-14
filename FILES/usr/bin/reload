@@ -1,4 +1,4 @@
 if [ -f /tmp/ppgw.ini ]; then
     . /tmp/ppgw.ini
 fi
-/usr/bin/ppg.sh reload &
+/usr/bin/ppg.sh reload

@@ -2,3 +2,6 @@ iso/
 ppgw/
 FILES/usr/bin/ppgw
 renote.txt
+go.mod
+go.sum
+ppgw.exe

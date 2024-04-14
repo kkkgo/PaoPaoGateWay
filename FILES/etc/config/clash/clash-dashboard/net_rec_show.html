@@ -12,6 +12,7 @@
     <meta name="application-name" content="PaoPaoGateWay" />
     <meta name="description" content="PaoPaoGateWay NET REC" />
     <title>PaoPao GateWay - NET REC</title>
+    <script src="./assets/sha.js"></script>
     <style>
         body {
             font-family: "Microsoft YaHei", "SF Pro SC", "SF Pro Text", "SF Pro Icons", "PingFang SC", "Segoe UI", "Lucida Grande", "Segoe UI Web (West European)", "Segoe UI", "-apple-system", "BlinkMacSystemFont", "FreeSans,Arimo", "Droid Sans", "wenquanyi micro hei", "Hiragino Sans GB", "Hiragino Sans GB W3", "Roboto", "Helvetica Neue", "Helvetica", "Arial", "sans-serif";
@@ -80,13 +81,60 @@
         &copy; PaoPaoGateWay | <a href="https://github.com/kkkgo/PaoPaoGateWay" target="_blank">GitHub</a>
     </footer>
     <script>
-        var csvFileURL = "./data.csv";
+        var secretKey = 'PaoPaoGateWay';
+        var rawStoredData = localStorage.getItem(secretKey);
+        if (!rawStoredData) {
+            window.location.href = "/ui/#/rec";
+        }
+
+        var storedData;
+        try {
+            storedData = JSON.parse(rawStoredData);
+        } catch (error) {
+            window.location.href = "/ui/#/rec";
+        }
+
+        if (!storedData.clashAPIConfigs || storedData.clashAPIConfigs.length === 0) {
+            window.location.href = "/ui/#/rec";
+        }
+        var secret = storedData.clashAPIConfigs[0].secret;
+
+        function getVersionAndRefreshTable() {
+            var unixTimestamp = Math.floor(Date.now() / 1000);
+            // Append the Unix timestamp to the request URL
+            fetch('./reckey.json?_=' + unixTimestamp)
+                .then(response => response.json())
+                .then(data => {
+                    var reckey = data.reckey;
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/version", true);
+                    xhr.setRequestHeader("Authorization", "Bearer " + secret);
+                    xhr.onreadystatechange = function () {
+                        if (xhr.readyState === 4) {
+                            if (xhr.status === 200) {
+                                var version = xhr.responseText;
+                                var hash = sha256(reckey + secret);
+                                var csvFileURL = "./rec_data/" + hash + "/data.csv";
+                                refreshTable(csvFileURL);
+                            } else {
+                                window.location.href = "/ui/#/rec";
+                            }
+                        }
+                    };
+                    xhr.send();
+                })
+                .catch(error => {
+                    console.error('Error fetching reckey:', error);
+                    window.location.href = "/ui/#/rec";
+                });
+        }
+
         var table = document.getElementById("csvTable");
         var refreshButton = document.getElementById("refreshButton");
         var autoRefreshCheckbox = document.getElementById("autoRefreshCheckbox");
         var autoRefreshInterval;
 
-        function refreshTable() {
+        function refreshTable(csvFileURL) {
             var xhr = new XMLHttpRequest();
             xhr.open("GET", csvFileURL, true);
             xhr.onreadystatechange = function () {
@@ -112,16 +160,19 @@
             xhr.send();
         }
 
-        refreshButton.addEventListener("click", refreshTable);
+        refreshButton.addEventListener("click", getVersionAndRefreshTable);
 
         autoRefreshCheckbox.addEventListener("change", function () {
             if (autoRefreshCheckbox.checked) {
-                autoRefreshInterval = setInterval(refreshTable, 3000);
+                autoRefreshInterval = setInterval(getVersionAndRefreshTable, 3000);
             } else {
                 clearInterval(autoRefreshInterval);
             }
         });
+
+        getVersionAndRefreshTable();
     </script>
 </body>
+
 
 </html>

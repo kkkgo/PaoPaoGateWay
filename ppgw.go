@@ -43,6 +43,7 @@ var (
 	sleeptime             string
 	apiURL                string
 	secret                string
+	reckey                string
 	testNodeURL           string
 	extNodeStr            string
 	testProxy             string
@@ -51,6 +52,8 @@ var (
 	closeall              bool
 	wsPort                string
 	net_rec_num           string
+	now_node              bool
+	spec_node             string
 )
 
 var orange = "\033[38;5;208m"
@@ -61,12 +64,17 @@ var reset = "\033[0m"
 type inputFlags []string
 
 type ClashNode struct {
-	Node  string `json:"name"`
-	Proxy string `json:"type"`
+	Node string `json:"name"`
+	Type string `json:"type"`
+	Now  string `json:"now,omitempty"`
 }
 
 type ClashAPIResponse struct {
 	Proxies map[string]ClashNode `json:"proxies"`
+}
+
+type ConfigResponse struct {
+	Mode string `json:"mode"`
 }
 
 type PingResult struct {
@@ -75,8 +83,7 @@ type PingResult struct {
 }
 
 type PingResponse struct {
-	Delay     int `json:"delay"`
-	MeanDelay int `json:"meanDelay"`
+	Delay int `json:"delay"`
 }
 
 type Downloader struct {
@@ -146,19 +153,22 @@ func main() {
 	//clashapi
 	flag.StringVar(&apiURL, "apiurl", "", "Clash API")
 	flag.StringVar(&secret, "secret", "", "Clash secret")
+	flag.StringVar(&spec_node, "spec_node", "", "specified node by name")
+	flag.StringVar(&reckey, "reckey", "", "netrec reckey")
 	flag.StringVar(&testNodeURL, "test_node_url", "", "test_node_url")
 	flag.StringVar(&extNodeStr, "ext_node", "", "ext_node")
 	flag.StringVar(&waitdelay, "waitdelay", "1000", "node delay")
 	flag.IntVar(&maxSystemCommandDelay, "cpudelay", 300, "CPU delay")
 	flag.BoolVar(&reload, "reload", false, "reload yaml")
 	flag.BoolVar(&closeall, "closeall", false, "close all connections.")
+	flag.BoolVar(&now_node, "now_node", false, "now_node.")
 	//ws catch
 	flag.StringVar(&wsPort, "wsPort", "", "wsPort")
 	flag.StringVar(&net_rec_num, "net_rec_num", "", "net_rec_num")
 
 	flag.Parse()
 	//net_rec
-	if wsPort != "" && secret != "" {
+	if wsPort != "" && secret != "" && reckey != "" {
 		max_rec, err := strconv.Atoi(net_rec_num)
 		if err != nil {
 			max_rec = 5000
@@ -258,10 +268,11 @@ func main() {
 				domainInfoList = append(domainInfoList, *info)
 			}
 			sort.Sort(domainInfoList)
-
-			newFilePath := "/etc/config/clash/clash-dashboard/data.csv.new"
-			oldFilePath := "/etc/config/clash/clash-dashboard/data.csv.old"
-			currentFilePath := "/etc/config/clash/clash-dashboard/data.csv"
+			recPath := "/etc/config/clash/clash-dashboard/rec_data/" + reckey
+			os.MkdirAll(recPath, 0755)
+			newFilePath := recPath + "/data.csv.new"
+			oldFilePath := recPath + "/data.csv.old"
+			currentFilePath := recPath + "/data.csv"
 			file, err := os.Create(newFilePath)
 			if err != nil {
 				fmt.Printf("\n" + red + "[PaoPaoGW REC]" + reset + "Failed to create CSV file.\n")
@@ -371,13 +382,42 @@ func main() {
 		}
 		os.Exit(0)
 	}
+	if now_node {
+		if secret == "" || apiURL == "" {
+			os.Exit(1)
+		}
+		mode, _ := getMode(apiURL, secret)
+		if mode != "global" {
+			os.Exit(1)
+		}
+		_, now, err := getNodes(apiURL, secret)
+		if err != nil {
+			fmt.Print("Unable to get the now node.\n")
+		} else {
+			fmt.Print(now)
+		}
+		if now != "" {
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}
+	if apiURL != "" && secret != "" && spec_node != "" {
+		err := selectNode(apiURL, secret, spec_node)
+		if err != nil {
+			fmt.Printf(red+"[PaoPaoGW SOCKS]"+reset+"Unable to select ppgwsocks ：%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("\n" + green + "[PaoPaoGW SOCKS]" + reset + "The ppgwsocks node selected.")
+		// deleteConnections(apiURL, secret)
+		os.Exit(0)
+	}
 	//fast_node
 	if apiURL != "" {
 		if secret == "" || testNodeURL == "" {
 			os.Exit(1)
 		}
 
-		nodes, err := getNodes(apiURL, secret)
+		nodes, _, err := getNodes(apiURL, secret)
 		if err != nil {
 			fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to get node list:%v\n", err)
 			return
@@ -429,9 +469,10 @@ func main() {
 			err := selectNode(apiURL, secret, fastestNode)
 			if err != nil {
 				fmt.Printf(red+"[PaoPaoGW Fast]"+reset+"Unable to select node %s：%v\n", fastestNode, err)
+				os.Exit(1)
 			}
 			fmt.Printf("\n"+green+"[PaoPaoGW Fast]"+reset+"The fastest node selected:%s\n", fastestNode)
-			deleteConnections(apiURL, secret)
+			// deleteConnections(apiURL, secret)
 			os.Exit(0)
 		} else {
 			fmt.Println("\n" + red + "[PaoPaoGW Fast]" + reset + "All nodes failed !")
@@ -724,7 +765,7 @@ func (d *Downloader) Download() error {
 	if err != nil {
 		return fmt.Errorf(red+"[PaoPaoGW Get]"+reset+host+"failed to perform DNS lookup: %v", err)
 	}
-	fmt.Println(orange+"[PaoPaoGW Get]"+reset+host+" IP:", strings.Join(addrs, ", "))
+	fmt.Println(orange+"[PaoPaoGW Get]"+reset+"HOST:"+host+" IP:", strings.Join(addrs, ", "))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -838,40 +879,77 @@ func printPingResults(results []PingResult) {
 	}
 }
 
-func getNodes(apiURL, secret string) ([]ClashNode, error) {
-	client := &http.Client{}
-
+func getNodes(apiURL, secret string) ([]ClashNode, string, error) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil,
+		},
+	}
 	req, err := http.NewRequest("GET", apiURL+"/proxies", nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-
 	var apiResponse ClashAPIResponse
 	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		return nil, err
-	}
+		return nil, "", fmt.Errorf(resp.Status + ":" + err.Error())
 
+	}
 	nodes := make([]ClashNode, 0, len(apiResponse.Proxies))
 	for _, node := range apiResponse.Proxies {
-		if !isSystemNode(node.Proxy) {
+		if !isSystemNode(node.Type) {
 			nodes = append(nodes, node)
 		}
 	}
+	globalProxy, ok := apiResponse.Proxies["GLOBAL"]
+	if ok {
+		return nodes, globalProxy.Now, nil
+	}
+	return nodes, "", nil
+}
 
-	return nodes, nil
+func getMode(apiURL, secret string) (string, error) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil,
+		},
+	}
+	req, err := http.NewRequest("GET", apiURL+"/configs", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var configResponse ConfigResponse
+	err = json.Unmarshal(body, &configResponse)
+	if err != nil {
+		return "", fmt.Errorf(resp.Status + ":" + err.Error())
+	}
+
+	return configResponse.Mode, nil
 }
 
 func parseExcludedNodes(extNodeStr string) []string {
