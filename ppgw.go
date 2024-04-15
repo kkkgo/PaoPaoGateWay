@@ -974,7 +974,7 @@ func filterNodes(nodes []ClashNode, excludedNodes []string) []ClashNode {
 }
 
 func isSystemNode(nodeName string) bool {
-	systemNodes := []string{"REJECT", "DIRECT", "GLOBAL", "SELECTOR", "RELAY", "FALLBACK", "URLTEST", "LOADBALANCE", "UNKNOWN"}
+	systemNodes := []string{"REJECT", "DIRECT", "GLOBAL", "UNKNOWN"}
 	nodeName = strings.ToUpper(nodeName)
 	for _, sysNode := range systemNodes {
 		if nodeName == sysNode {

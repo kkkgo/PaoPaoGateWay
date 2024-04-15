@@ -141,6 +141,11 @@ load_clash() {
         sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
         closeall_flag="yes"
         log "[VERSION] :""$(clash -v)" succ
+        echo "127.0.0.1 localhost" >/etc/hosts
+        grep -Eo '[https]+://[a-zA-Z0-9.-]+' "/tmp/clash.yaml" | while read -r down_url; do
+            genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
+            echo "$genHost" >>/etc/hosts
+        done
         if ps | grep -v "grep" | grep "d /etc/config/clash"; then
             now_node_before=$(ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node)
             if [ "$?" = "1" ]; then
@@ -170,8 +175,21 @@ load_clash() {
         log "The clash.yaml generation failed." warn
         return 1
     fi
-    if [ "$1" = "yes" ]; then
-        sleep 3
+    clash_start_time=$(date +%s)
+    while true; do
+        ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node
+        if [ $? -eq 0 ]; then
+            echo "clash api ok."
+            break
+        fi
+        clash_current_time=$(date +%s)
+        if [ $((clash_current_time - clash_start_time)) -ge 10 ]; then
+            echo "clash api timeout."
+            break
+        fi
+        sleep 1
+    done
+    if ps | grep -v "grep" | grep "d /etc/config/clash" && [ "$1" = "yes" ]; then
         fast_node_sel 1500 1
         if [ -f /tmp/allnode.failed ]; then
             sleep 3
@@ -198,27 +216,31 @@ load_clash() {
             return 3
         fi
     else
-        if [ "$mode" = "socks5" ]; then
+        if ps | grep -v "grep" | grep "d /etc/config/clash" && [ "$mode" = "socks5" ]; then
             ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -spec_node="ppgwsocks" >/dev/tty0
         fi
     fi
-    if [ "$2" = "no" ]; then
+    if ps | grep -v "grep" | grep "d /etc/config/clash" && [ "$2" = "no" ]; then
         if nft list ruleset | grep "clashtcp"; then
             log "[OK] nft rule TCP OK." succ
 
         else
-            log "[ADD] Add nft rule TCP..." warn
-            /usr/bin/nft_tcp.sh
+            if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+                log "[ADD] Add nft rule TCP..." warn
+                /usr/bin/nft_tcp.sh
+            fi
         fi
     else
-        if nft list ruleset | grep "clashboth"; then
+        if nft list ruleset | grep -q "clashboth"; then
             log "[OK] nft rule TCP/UDP OK." succ
         else
-            log "[ADD] Add nft rule TCP/UDP..." warn
-            /usr/bin/nft.sh
+            if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+                log "[ADD] Add nft rule TCP/UDP..." warn
+                /usr/bin/nft.sh
+            fi
         fi
     fi
-    if [ -f /usr/bin/sing-box ]; then
+    if ps | grep -v "grep" | grep "d /etc/config/clash" && [ -f /usr/bin/sing-box ]; then
         if ps | grep -v "grep" | grep "/etc/config/sing-box"; then
             log "[OK] SNIFF OK." succ
         else
@@ -231,9 +253,13 @@ load_clash() {
                 fi
                 sed "s/dns_ip/$dns_ip/g" /etc/config/sing-box/sniff.json >/tmp/sniff.json
                 sed -i "s/dns_port/$dns_port/g" /tmp/sniff.json
-                /usr/bin/sing-box run -c /tmp/sniff.json >/dev/tty0 2>&1 &
+                if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+                    /usr/bin/sing-box run -c /tmp/sniff.json >/dev/tty0 2>&1 &
+                fi
             else
-                /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
+                if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+                    /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
+                fi
             fi
         fi
     fi
@@ -407,7 +433,11 @@ get_conf() {
                 . /www/ppgw.ini
             fi
             if [ "$fast_node" = "yes" ]; then
-                sed 's/\r$//' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/proxy-groups:/proxy-disable-groups:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
+                if grep -oq "proxy-providers:" "$file_down"; then
+                    sed 's/\r$//' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
+                else
+                    sed 's/\r$//' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/proxy-groups:/proxy-disable-groups:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
+                fi
             else
                 if [ -f /www/clash_core ]; then
                     sed 's/\r$//' "$file_down" >"/tmp/paopao_custom.yaml"
