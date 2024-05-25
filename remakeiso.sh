@@ -112,7 +112,7 @@ if [ -f /data/Country.mmdb ]; then
     cp /data/Country.mmdb $root"/etc/config/clash/Country.mmdb"
 fi
 
-if [ "$SNIFF" = "yes" ]; then
+if [ "$SNIFF" = "yes" ] || [ "$SNIFF" = "dns" ]|| [ "$sniff" = "yes" ]|| [ "$sniff" = "dns" ]; then
     echo Patching sniff...
     mkdir -p $root"/etc/config/sing-box"
     echo "$json" >$root"/etc/config/sing-box/sniff.json"
@@ -121,15 +121,15 @@ if [ "$SNIFF" = "yes" ]; then
     cp /sing-box $root"/usr/bin/"
 fi
 
-if [ "$SNIFF" = "dns" ]; then
-    echo Patching sniff with dns...
-    mkdir -p $root"/etc/config/sing-box"
-    echo "$dnsjson" >$root"/etc/config/sing-box/sniff.json"
-    sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
-    sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
-    cp /sing-box $root"/usr/bin/"
-    touch $root"/www/sniffdns"
-fi
+# if [ "$SNIFF" = "dns" ]; then
+#     echo Patching sniff with dns...
+#     mkdir -p $root"/etc/config/sing-box"
+#     echo "$dnsjson" >$root"/etc/config/sing-box/sniff.json"
+#     sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
+#     sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
+#     cp /sing-box $root"/usr/bin/"
+#     touch $root"/www/sniffdns"
+# fi
 
 if [ -f /data/clash ]; then
     ls -lah /data/clash

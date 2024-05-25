@@ -222,12 +222,6 @@ docker run --rm -v .:/data sliamb/ppgwiso:fullmod
 docker pull sliamb/ppgwiso
 docker run --rm -e SNIFF=yes -v .:/data sliamb/ppgwiso
 ```
-此外，有时候节点远程解析的DNS存在问题或者其他自定义原因，而又没有节点服务器的控制权，出于避免DNS请求泄漏到节点或者其他场景，如果你想在嗅探的基础上，使用本地可信任DNS（ppgw.ini中所配置的）来解析所有请求来代替远程解析，可以使用`SNIFF=dns`：
-```shell
-docker pull sliamb/ppgwiso
-docker run --rm -e SNIFF=dns -v .:/data sliamb/ppgwiso
-```
-*注：一般情况下，远程解析可以获得更快的连接速度，如无特殊自定义需求不建议定制`SNIFF=dns`。*
 ## 与DNS服务器配合完成分流
 PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   
 配合[PaoPaoDNS](https://github.com/kkkgo/PaoPaoDNS)的`CUSTOM_FORWARD`功能就可以完成简单精巧的分流，以下是一个简单的非CN IP的域名转发到PaoPao GateWay的docker compose配置：  
