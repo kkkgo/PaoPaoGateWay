@@ -244,23 +244,23 @@ load_clash() {
         if ps | grep -v "grep" | grep "/etc/config/sing-box"; then
             log "[OK] SNIFF OK." succ
         else
-            if [ -f /www/sniffdns ]; then
-                #     if [ -z "$dns_ip" ]; then
-                #         dns_ip="1.0.0.1"
-                #     fi
-                #     if [ -z "$dns_port" ]; then
-                #         dns_port="53"
-                #     fi
-                #     sed "s/dns_ip/$dns_ip/g" /etc/config/sing-box/sniff.json >/tmp/sniff.json
-                #     sed -i "s/dns_port/$dns_port/g" /tmp/sniff.json
-                #     if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-                #         /usr/bin/sing-box run -c /tmp/sniff.json >/dev/tty0 2>&1 &
-                #     fi
-                # else
-                if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-                    /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
-                fi
+            # if [ -f /www/sniffdns ]; then
+            #     if [ -z "$dns_ip" ]; then
+            #         dns_ip="1.0.0.1"
+            #     fi
+            #     if [ -z "$dns_port" ]; then
+            #         dns_port="53"
+            #     fi
+            #     sed "s/dns_ip/$dns_ip/g" /etc/config/sing-box/sniff.json >/tmp/sniff.json
+            #     sed -i "s/dns_port/$dns_port/g" /tmp/sniff.json
+            #     if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+            #         /usr/bin/sing-box run -c /tmp/sniff.json >/dev/tty0 2>&1 &
+            #     fi
+            # else
+            if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+                /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
             fi
+            # fi
         fi
     fi
     if [ ! -f /etc/watch ]; then
