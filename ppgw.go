@@ -974,7 +974,11 @@ func filterNodes(nodes []ClashNode, excludedNodes []string) []ClashNode {
 }
 
 func isSystemNode(nodeName string) bool {
-	systemNodes := []string{"REJECT", "DIRECT", "GLOBAL", "UNKNOWN"}
+	systemNodes := []string{"REJECT", "GLOBAL", "UNKNOWN"}
+	append_direct := os.Getenv("append_direct")
+	if append_direct != "yes" {
+		systemNodes = append(systemNodes, "DIRECT")
+	}
 	nodeName = strings.ToUpper(nodeName)
 	for _, sysNode := range systemNodes {
 		if nodeName == sysNode {

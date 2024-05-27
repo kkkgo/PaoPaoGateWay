@@ -138,6 +138,12 @@ load_clash() {
         if [ -z "$clash_web_password" ]; then
             clash_web_password="clashpass"
         fi
+        if [ "$allow_free" = "yes" ]; then
+            append_direct=yes
+        else
+            append_direct=no
+        fi
+        export append_direct
         sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
         closeall_flag="yes"
         log "[VERSION] :""$(clash -v)" succ
@@ -335,7 +341,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns""$net_rec""$max_rec"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns""$net_rec""$max_rec""$allow_free"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
