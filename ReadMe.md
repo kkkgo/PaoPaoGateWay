@@ -194,7 +194,7 @@ ppgwurl="http://...."
 docker pull sliamb/ppgwiso
 docker run --rm -v .:/data sliamb/ppgwiso
 ```
-*如果你的网络环境访问Dokcer镜像有困难，可以尝试使用[上海交大](https://mirror.sjtu.edu.cn/docs/docker-registry)的镜像。*   
+*如果你的网络环境访问Dokcer镜像有困难，可以尝试使用[docker镜像](https://www.bing.com/search?q=docker%E9%95%9C%E5%83%8F%E4%BB%A3%E7%90%86)。*   
 
 只需等待十几秒，你就可以在当前目录看到你定制的`paopao-gateway-x86-64-custom-[hash].iso`。  
 
