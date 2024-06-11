@@ -1,0 +1,27 @@
+name: ecr-test
+
+
+on:
+  # schedule:
+  #   - cron: '25 23 * * *'
+  push:
+permissions:
+  contents: write
+
+jobs:
+  push-ecr:
+    runs-on: ubuntu-latest
+    container: alpine:edge
+    steps:
+    - name: "Configure AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@v4.0.2
+      with:
+        aws-region: us-east-1
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    - name: install skopeo
+      run: apk update && apk upgrade && apk add skopeo aws-cli
+    - name: login ecr
+      run: aws ecr-public get-login-password --region us-east-1 | skopeo login --username AWS --password-stdin public.ecr.aws
+    - name: push ecr
+      run: skopeo copy --all docker://sliamb/ppgwiso:fullmod docker://public.ecr.aws/sliamb/ppgwiso:fullmod
