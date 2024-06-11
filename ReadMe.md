@@ -194,7 +194,7 @@ ppgwurl="http://...."
 docker pull sliamb/ppgwiso
 docker run --rm -v .:/data sliamb/ppgwiso
 ```
-如果你的网络环境访问Dokcer Hub镜像有困难，***可以尝试使用public.ecr.aws镜像:***    
+如果你的网络环境访问Docker Hub镜像有困难，***可以尝试使用public.ecr.aws镜像:***    
 - 示例： `docker pull public.ecr.aws/sliamb/ppgwiso`  
 - 示例： `docker run -d public.ecr.aws/sliamb/ppgwiso`  
 
