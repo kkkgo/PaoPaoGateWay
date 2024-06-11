@@ -48,6 +48,12 @@ jobs:
         push: true
         platforms: linux/amd64
         tags: sliamb/ppgwiso:fullmod
+
+  push-ecr:
+    needs: build_release
+    runs-on: ubuntu-latest
+    container: alpine:edge
+    steps:
     - name: "Configure AWS Credentials"
       uses: aws-actions/configure-aws-credentials@v4.0.2
       with:
@@ -55,7 +61,7 @@ jobs:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
     - name: install skopeo
-      run: sudo apt-get -qq -y install skopeo
+      run: apk update && apk upgrade && apk add skopeo
     - name: login ecr
       run: aws ecr-public get-login-password --region us-east-1 | skopeo login --username AWS --password-stdin public.ecr.aws
     - name: push ecr
