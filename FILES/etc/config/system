@@ -6,6 +6,5 @@ config system
         option zonename 'Asia/Shanghai'
         option timezone 'CST-8'
 config timeserver 'ntp'
-        option enabled '1'
+        option enabled '0'
         option enable_server '0'
-        list server 'ntp.aliyun.com'

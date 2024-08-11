@@ -98,7 +98,7 @@ fast_node=yes
 test_node_url="https://www.youtube.com/generate_204"
 ext_node="Traffic|Expire| GB|Days|Date"
 cpudelay="3000"
-
+fall_direct="no"
 # dns burn setting
 # depend on fast_node=yes & mode=suburl/yaml
 dns_burn=no
@@ -132,8 +132,9 @@ max_rec=5000
   - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。***`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式***。  
   - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点。
   - 注意，设置为`check`不会测速，设置为`yes`测速失败到阈值会杀死进程并终止应用网关并重载，而`check`不会杀死进程，仅重载所有配置并关闭所有现有的旧连接。  
-  - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。
-  - `cpudelay`选项是设定如果CPU处理延迟大于指定值则放弃本次测速。该选项是防止低性能设备负载过高导致死机，默认值为3000。设置更小的值可能会放弃更多测速，设置更高的值可能会让低性能设备负载过高。  
+  - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。  
+  - `cpudelay`选项是设定如果CPU处理延迟大于指定值则放弃本次测速。该选项是防止低性能设备负载过高导致死机，默认值为3000。设置更小的值可能会放弃更多测速，设置更高的值可能会让低性能设备负载过高。    
+  - `fall_direct`选项设置为`yes`在`fast_node`测试全部节点失败的时候，若互联网路由可达，则尝试切换到`DIRECT`直连。（仅在开启`fast_node=yes`的时候生效）        
 - 14 `dns_burn`选项和`ex_dns`选项：`dns_burn`功能可以把所有节点的域名解析成所有可能的IP结果，把server字段替换为解析的IP结果，以`节点名-IP`的名称作为新节点加入，临时硬编码到配置文件中。上面设置的`dns_ip`和`dns_port`，和`ex_dns`选项会被用于`dns_burn`功能，`ex_dns`选项用于指定额外的DNS用于解析节点，建议设置为境内DNS以获得不同的结果，如果为空默认值为`223.5.5.5:53`，如果配合PaoPaoDNS使用，则可以设置为PaoPaoDNSIP:53。你也可以设置多个`ex_dns`，格式为逗号分隔，比如`ex_dns=223.5.5.5:53,119.29.29.29:53`。`dns_burn`功能默认为no，适用于`suburl`模式和`yaml`模式，依赖于`fast_node=yes`。该功能的优点和应用场景如下：
     - 1、节点使用了分区域解析，只有使用了境内DNS才能连接，参见[issue](https://github.com/kkkgo/PaoPaoGateWay/issues/20)，`dns_burn`功能可以额外对节点进行解析。
     - 2、节点DNS解析存在多个解析入口，`dns_burn`功能会把所有可能的入口都作为新节点加入到配置文件中，在测速的时候就可以选择到速度最好的入口，而不是随机选择。
@@ -178,7 +179,7 @@ ppgwurl="http://...."
 注意：你仍然需要在`ppgw.ini`中指定`mode=yaml`才会使用到该文件。
 
 #### 替换clash/mihomo核心
-***由于第三方稳定性未知，不建议替换核心，除非内置核心不能满足需求***
+***由于指定版本稳定性未知，不建议替换核心，除非内置核心不能满足需求***
 你可以把你的amd64的clash/mihomo二进制文件重命名为clash放到当前目录即可。通过替换clash核心，你可以支持更多的协议和规则功能，比如替换为[mihomo](https://github.com/MetaCubeX/mihomo/releases)。   
 注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。  
 
@@ -213,6 +214,7 @@ docker run --rm -v .:/data sliamb/ppgwiso:fullmod
 
 优点：
 - 即使FAKE DNS缓存出错也能正确连接常见协议（http/tls），可以避免因网站使用了QUIC不稳定导致网页断流；   
+- 禁用bt协议
 - 重启虚拟机也不会因FAKE IP映射不正确而引起无法访问的短暂故障、对DNS TTL处理不正常的客户端兼容更好；   
 
 缺点： 

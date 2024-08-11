@@ -39,6 +39,10 @@ net_ready() {
     log "            DNS:[""$eth0dns""] GW:[""$eth0gw""]" succ
 }
 
+sync_ntp() {
+    ntpd -n -q -p 203.107.6.88 -p 106.55.184.199 >/dev/tty0
+}
+
 getsha256() {
     echo -n "$1" | sha256sum | cut -d" " -f1
 }
@@ -67,6 +71,7 @@ fast_node_sel() {
     if [ -z "$cpudelay" ]; then
         cpudelay="3000"
     fi
+    cpudelay=$(echo $cpudelay | grep -Eo "[0-9]+" | head -1)
     log "Try to test node...[""$try_count""]" warn
     ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
     if [ "$?" = "1" ]; then
@@ -138,6 +143,9 @@ load_clash() {
         if [ -z "$clash_web_password" ]; then
             clash_web_password="clashpass"
         fi
+        if [ -z "$fall_direct" ]; then
+            fall_direct="no"
+        fi
         sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
         closeall_flag="yes"
         log "[VERSION] :""$(clash -v)" succ
@@ -169,6 +177,7 @@ load_clash() {
                 ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -closeall >/dev/tty0
             fi
         else
+            sync_ntp
             /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
         fi
     else
@@ -212,7 +221,17 @@ load_clash() {
             fast_node_sel 2000 5
         fi
         if [ -f /tmp/allnode.failed ]; then
-            kill_clash
+            if [ "$fall_direct" = "yes" ]; then
+                ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -spec_node="DIRECT" >/dev/tty0
+                www_test=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "http://120.53.53.53")
+                if [ $? -eq 0 ]; then
+                    log "[fall_direct] Switch to DIRECT." succ
+                else
+                    kill_clash
+                fi
+            else
+                kill_clash
+            fi
             return 3
         fi
     else
@@ -246,7 +265,7 @@ load_clash() {
         else
             # if [ -f /www/sniffdns ]; then
             #     if [ -z "$dns_ip" ]; then
-            #         dns_ip="1.0.0.1"
+            #         dns_ip="223.5.5.5"
             #     fi
             #     if [ -z "$dns_port" ]; then
             #         dns_port="53"
@@ -335,7 +354,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$dns_burn""$ex_dns""$net_rec""$max_rec"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$fast_node""$test_node_url""$ext_node""$cpudelay""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -392,7 +411,7 @@ get_conf() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
         if [ -z "$dns_ip" ]; then
-            dns_ip="1.0.0.1"
+            dns_ip="223.5.5.5"
         fi
         if [ -z "$dns_port" ]; then
             dns_port="53"
@@ -405,6 +424,9 @@ get_conf() {
         return 1
     fi
     echo "$genHost" >>/etc/hosts
+    if echo "$down_url" | grep https; then
+        sync_ntp
+    fi
     ppgw -downURL "$down_url" -output "$file_down_tmp" >/dev/tty0 2>&1
     echo "127.0.0.1 localhost" >/etc/hosts
     if [ "$down_type" = "ini" ]; then
@@ -462,7 +484,6 @@ get_conf() {
 
 try_conf() {
     net_ready
-    ntpd -n -q -p ntp.aliyun.com >/dev/tty0
     export gw=$(ip route show | grep "default via" | head -1 | grep -Eo "$IPREX4" | head -1)
     dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
     dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
@@ -573,7 +594,7 @@ reload_gw() {
     fi
 
     if [ -z "$dns_ip" ]; then
-        dns_ip="1.0.0.1"
+        dns_ip="223.5.5.5"
     fi
 
     if [ -z "$dns_port" ]; then

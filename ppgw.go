@@ -744,10 +744,14 @@ func QueryARecords(ctx context.Context, domain *string, dnsServer string) ([]net
 }
 
 func NewDownloader(url, outputFile string) *Downloader {
+	userAgent := "ClashforWindows/clash-verge/Clash/clash"
+	if _, err := os.Stat("/www/clash_core"); err == nil {
+		userAgent = "clash-verge/v1.6.6" //auto update, do not change
+	}
 	return &Downloader{
 		URL:        url,
 		OutputFile: outputFile,
-		UserAgent:  "ClashforWindows/clash-verge/Clash/clash",
+		UserAgent:  userAgent,
 		Timeout:    10 * time.Second,
 	}
 }

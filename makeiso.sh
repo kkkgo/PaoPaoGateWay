@@ -14,7 +14,7 @@ if [ -f "$builddir"/FILES/usr/bin/ppgw ]; then
 fi
 docker pull golang:alpine
 docker run --rm --name gobuilder \
-    -v "$builddir"/ppgw.go:/go/build/main.go \
+    -v "$builddir"/ppgw.go:/go/main.go \
     -v "$builddir"/FILES/usr/bin/:/go/ppgw/ \
     -v "$builddir"/buildppgw.sh:/go/build/buildppgw.sh \
     golang:alpine sh /go/build/buildppgw.sh

@@ -33,8 +33,19 @@ rm 99_10_failsafe_login
 if [ -f /src/iso/root.7z ]; then
     rm /src/iso/root.7z
 fi
+rootfs="$(dirname "$1""/*")"
+bootdir="$(dirname "$2""/*")"
+echo "exec /sbin/init" > "$rootfs"/init
+echo "echo" > "$rootfs"/sbin/wifi
+chmod +x "$rootfs"/init
+chmod +x "$rootfs"/sbin/wifi
+cd $rootfs || exit
+mkdir -p /tmp/cdrom
+find . | cpio -H newc -o | gzip -9 >/tmp/cdrom/initrd.gz
+cp "$bootdir"/boot/vmlinuz /tmp/cdrom/
+
 packroot="/tmp/ppgwroot.tar"
-tar -cf "$packroot" -C "$(dirname "$1""/*")" ./ -C "$(dirname "$2""/*")" ./
+tar -cf "$packroot" -C "/tmp/cdrom/" ./
 rootsha=$(sha256sum $packroot | cut -d ' ' -f 1)
 echo "$rootsha" >/src/iso/rootsha.txt
 7z a -t7z -m0=lzma2 -mx=9 -mfb=64 -md=32m -ms=on -mhe=on -bsp1 -bso1 -bse1 -y -p"$rootsha" "/src/iso/root.7z" "$packroot"

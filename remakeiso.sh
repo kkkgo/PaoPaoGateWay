@@ -36,7 +36,8 @@ json='{
         "rules": [
             {
                 "protocol": [
-                    "quic"
+                    "quic",
+                    "bitTorrent"
                 ],
                 "outbound": "block-quic"
             }
@@ -101,10 +102,16 @@ dnsjson='{
 
 echo Patching new iso ...
 7z x -p"$sha" -o"/tmp/" /root.7z >/dev/null
-root=/tmp/remakeroot
-mkdir -p $root
-tar -xf /tmp/ppgwroot.tar -C $root >/dev/null
+cdroot=/tmp/cdrom
+mkdir -p $cdroot
+tar -xf /tmp/ppgwroot.tar -C $cdroot >/dev/null
 rm /tmp/ppgwroot.tar /root.7z
+mkdir $cdroot/rootfs
+mv $cdroot/initrd.gz $cdroot/rootfs
+cd $cdroot/rootfs || exit
+gunzip -c initrd.gz | cpio -idmv >/dev/null 2>&1
+rm initrd.gz
+root=$cdroot/rootfs
 
 if [ -f /data/Country.mmdb ]; then
     ls -lah /data/Country.mmdb
@@ -112,7 +119,7 @@ if [ -f /data/Country.mmdb ]; then
     cp /data/Country.mmdb $root"/etc/config/clash/Country.mmdb"
 fi
 
-if [ "$SNIFF" = "yes" ] || [ "$SNIFF" = "dns" ]|| [ "$sniff" = "yes" ]|| [ "$sniff" = "dns" ]; then
+if [ "$SNIFF" = "yes" ] || [ "$SNIFF" = "dns" ] || [ "$sniff" = "yes" ] || [ "$sniff" = "dns" ]; then
     echo Patching sniff...
     mkdir -p $root"/etc/config/sing-box"
     echo "$json" >$root"/etc/config/sing-box/sniff.json"
@@ -217,9 +224,17 @@ if [ -f /data/custom.ovpn ]; then
 fi
 
 echo "Making iso..."
-xorriso -as mkisofs -R -b boot/grub/eltorito.img \
-    -no-emul-boot -boot-info-table \
-    -o /tmp/paopao-gateway-x86-64-custom.iso /tmp/remakeroot >/dev/null 2>&1
+cd $root || exit
+find . | cpio -H newc -o | gzip -9 >$cdroot/initrd.gz
+cd $cdroot || exit
+rm -rf rootfs
+cp -r /isolinux .
+xorriso -as mkisofs -o /tmp/paopao-gateway-x86-64-custom.iso \
+    -isohybrid-mbr isolinux/isolinux.bin \
+    -c isolinux/boot.cat -b isolinux/isolinux.bin \
+    -no-emul-boot -boot-load-size 4 -boot-info-table \
+    -eltorito-alt-boot -e /isolinux/efi.img \
+    -no-emul-boot -isohybrid-gpt-basdat -V "paopao-gateway" $cdroot >/dev/null 2>&1
 
 sha=$(sha256sum /tmp/paopao-gateway-x86-64-custom.iso | grep -Eo "^[0-9a-z]{7}")
 mv /tmp/paopao-gateway-x86-64-custom.iso /data/paopao-gateway-x86-64-custom-"$sha".iso

@@ -9,6 +9,7 @@ WORKDIR /data
 COPY ./remakeiso.sh /
 COPY ./root.7z /
 COPY --from=singbuilder /data/sing-box /sing-box
+COPY --from=sliamb/opbuilder /src/isolinux /isolinux
 RUN apk add --no-cache xorriso 7zip && chmod +x /sing-box && chmod +x /remakeiso.sh
 ENV sha="rootsha"
 ENV SNIFF=no
