@@ -49,6 +49,7 @@ rootsha=$(head -1 "$builddir""/iso/rootsha.txt")
 echo "docker rootsha: ""$rootsha"
 sed "s/rootsha/$rootsha/g" "$builddir"/Dockerfile >"$builddir"/iso/Dockerfile
 cp "$builddir"/remakeiso.sh "$builddir"/iso/
+sed -i "s/PPGW_version/$ppgwver/g" "$builddir"/iso/remakeiso.sh
 if [ -f "$builddir""/sha.txt" ]; then
     ls -lah "$builddir"/iso/
 else

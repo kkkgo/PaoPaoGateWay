@@ -1,5 +1,7 @@
 #!/bin/sh
 
+echo iso builder version: PPGW_version
+echo run docker pull to fetch the latest image.
 json='{
     "log": {
         "level": "info"
