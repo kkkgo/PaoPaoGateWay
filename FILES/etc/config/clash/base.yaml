@@ -19,6 +19,8 @@ hosts:
     paopaogateway.dns: 127.0.0.1
 dns:
   enable: true
+  use-hosts: false
+  use-system-hosts: false
   listen: 0.0.0.0:53
   ipv6: false
   enhanced-mode: fake-ip
