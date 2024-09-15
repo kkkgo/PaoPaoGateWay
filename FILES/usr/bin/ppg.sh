@@ -432,10 +432,10 @@ get_conf() {
     if [ "$down_type" = "ini" ]; then
         if head -1 "$file_down_tmp" | grep -q "#paopao-gateway"; then
             checkflag=0
-            if sed 's/\r$//' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+="[^\"]+$' >/dev/tty0 2>&1; then
+            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+="[^\"]+$' >/dev/tty0 2>&1; then
                 checkflag=1
             fi
-            if sed 's/\r$//' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+=[^"]+"$' >/dev/tty0 2>&1; then
+            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+=[^"]+"$' >/dev/tty0 2>&1; then
                 checkflag=1
             fi
             if [ "$checkflag" = "1" ]; then
@@ -443,7 +443,7 @@ get_conf() {
                 return 1
             fi
             cp "$file_down_tmp" "$file_down"
-            sed 's/\r$//' "$file_down" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/ppgw.ini"
+            sed 's/\r/\n/g' "$file_down" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/ppgw.ini"
             log "[Succ] Get ""$down_url" succ
             return 0
         fi
@@ -456,15 +456,15 @@ get_conf() {
             fi
             if [ "$fast_node" = "yes" ]; then
                 if grep -oq "proxy-providers:" "$file_down"; then
-                    sed 's/\r$//' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
+                    sed 's/\r/\n/g' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
                 else
-                    sed 's/\r$//' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/proxy-groups:/proxy-disable-groups:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
+                    sed 's/\r/\n/g' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/proxy-groups:/proxy-disable-groups:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
                 fi
             else
                 if [ -f /www/clash_core ]; then
-                    sed 's/\r$//' "$file_down" >"/tmp/paopao_custom.yaml"
+                    sed 's/\r/\n/g' "$file_down" >"/tmp/paopao_custom.yaml"
                 else
-                    sed 's/\r$//' "$file_down" | grep -v "\- RULE-SET" >"/tmp/paopao_custom.yaml"
+                    sed 's/\r/\n/g' "$file_down" | grep -v "\- RULE-SET" >"/tmp/paopao_custom.yaml"
                 fi
             fi
             log "[Succ] Get ""$down_url" succ
@@ -647,7 +647,7 @@ reload_gw() {
     fi
 
     fake_cidr_escaped=$(echo "$fake_cidr" | sed 's/\//\\\//g')
-    sed 's/\r$//' /etc/config/clash/base.yaml >/tmp/clash_base.yaml
+    sed 's/\r/\n/g' /etc/config/clash/base.yaml >/tmp/clash_base.yaml
     sed -i "s/{fake_cidr}/$fake_cidr_escaped/g" /tmp/clash_base.yaml
     sed -i "s/{clash_web_port}/$clash_web_port/g" /tmp/clash_base.yaml
     sed -i "s/{dns_ip}/$dns_ip/g" /tmp/clash_base.yaml
@@ -660,7 +660,7 @@ reload_gw() {
     fi
     if [ "$mode" = "socks5" ]; then
         sed -i "s/{clashmode}/global/g" /tmp/clash_base.yaml
-        sed 's/\r$//' /etc/config/clash/socks5.yaml >/tmp/clash_socks5.yaml
+        sed 's/\r/\n/g' /etc/config/clash/socks5.yaml >/tmp/clash_socks5.yaml
         sed -i "s/{socks5_ip}/$socks5_ip/g" /tmp/clash_socks5.yaml
         sed -i "s/{socks5_port}/$socks5_port/g" /tmp/clash_socks5.yaml
         ppgw -input /tmp/clash_socks5.yaml -input /tmp/clash_base.yaml -output /tmp/clash.yaml

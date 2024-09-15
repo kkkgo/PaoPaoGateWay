@@ -150,7 +150,7 @@ fi
 if [ -f /data/network.ini ]; then
     ls -lah /data/network.ini
     echo Patching network...
-    sed 's/\r$//' "/data/network.ini" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/network.ini"
+    sed 's/\r/\n/g' "/data/network.ini" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/network.ini"
     . /tmp/network.ini
     if [ -z "$ip" ]; then
         echo "Error: network.ini ip not found."
@@ -204,19 +204,19 @@ if [ -f /data/ppgwurl.ini ]; then
     if grep -q "ppgwurl=" /data/ppgwurl.ini; then
         ls -lah /data/ppgwurl.ini
         echo Patching ppgwurl.ini...
-        sed 's/\r$//' "/data/ppgwurl.ini" | grep "ppgwurl=" >$root"/www/ppgwurl.ini"
+        sed 's/\r/\n/g' "/data/ppgwurl.ini" | grep "ppgwurl=" >$root"/www/ppgwurl.ini"
     fi
 fi
 if [ -f /data/ppgw.ini ]; then
     ls -lah /data/ppgw.ini
     echo Patching ppgw.ini...
-    sed 's/\r$//' "/data/ppgw.ini" | grep -E "^[_a-zA-Z0-9]+=" >$root"/www/ppgw.ini"
+    sed 's/\r/\n/g' "/data/ppgw.ini" | grep -E "^[_a-zA-Z0-9]+=" >$root"/www/ppgw.ini"
 fi
 
 if [ -f /data/custom.yaml ]; then
     ls -lah /data/custom.yaml
     echo Patching custom.yaml...
-    sed 's/\r$//' /data/custom.yaml >$root"/www/custom.yaml"
+    sed 's/\r/\n/g' /data/custom.yaml >$root"/www/custom.yaml"
 fi
 
 if [ -f /data/custom.ovpn ]; then
