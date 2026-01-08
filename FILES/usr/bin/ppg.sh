@@ -122,7 +122,7 @@ load_netrec() {
     fi
 }
 load_clash() {
-    if [ -f /tmp/clash.yaml ]; then
+    if [ -f /etc/config/clash/clash.yaml ]; then
         log "Loading clash..." warn
         # ulimit
         if [ "$(ulimit -n)" -gt 999999 ]; then
@@ -150,7 +150,7 @@ load_clash() {
         closeall_flag="yes"
         log "[VERSION] :""$(clash -v)" succ
         echo "127.0.0.1 localhost" >/etc/hosts
-        grep -Eo '[https]+://[a-zA-Z0-9.-]+' "/tmp/clash.yaml" | while read -r down_url; do
+        grep -Eo '[https]+://[a-zA-Z0-9.-]+' "/etc/config/clash/clash.yaml" | while read -r down_url; do
             genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
             echo "$genHost" >>/etc/hosts
         done
@@ -178,7 +178,7 @@ load_clash() {
             fi
         else
             sync_ntp
-            /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
+            /usr/bin/clash -d /etc/config/clash -f /etc/config/clash/clash.yaml >/dev/tty0 2>&1 &
         fi
     else
         log "The clash.yaml generation failed." warn
@@ -550,6 +550,9 @@ try_conf() {
 
 reload_gw() {
     . /etc/profile
+    # Ensure clash config directory exists and is writable
+    mkdir -p /etc/config/clash
+    mkdir -p /etc/config/clash/clash-dashboard
     # ip_forward
     if sysctl -a 2>&1 | grep -qE "net\.ipv4\.ip_forward[ =]+1"; then
         log "[SYSCTL] Turn off net.ipv4.ip_forward..." warn
@@ -655,15 +658,15 @@ reload_gw() {
     sed -i "s/{clash_web_password}/$(getsha256 "$clash_web_password")/g" /tmp/clash_base.yaml
     sed -i "s/{openport}/$openport/g" /tmp/clash_base.yaml
     sed -i "s/127.0.0.1/0.0.0.0/g" /tmp/clash_base.yaml
-    if [ -e "/tmp/clash.yaml" ]; then
-        rm "/tmp/clash.yaml"
+    if [ -e "/etc/config/clash/clash.yaml" ]; then
+        rm "/etc/config/clash/clash.yaml"
     fi
     if [ "$mode" = "socks5" ]; then
         sed -i "s/{clashmode}/global/g" /tmp/clash_base.yaml
         sed 's/\r/\n/g' /etc/config/clash/socks5.yaml >/tmp/clash_socks5.yaml
         sed -i "s/{socks5_ip}/$socks5_ip/g" /tmp/clash_socks5.yaml
         sed -i "s/{socks5_port}/$socks5_port/g" /tmp/clash_socks5.yaml
-        ppgw -input /tmp/clash_socks5.yaml -input /tmp/clash_base.yaml -output /tmp/clash.yaml
+        ppgw -input /tmp/clash_socks5.yaml -input /tmp/clash_base.yaml -output /etc/config/clash/clash.yaml
     fi
     if [ "$mode" = "yaml" ]; then
         try_conf "$yamlfile" "yaml"
@@ -672,7 +675,7 @@ reload_gw() {
         try_conf "$ovpnfile" "ovpn"
         sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
         sed -i "s/#interface-name/interface-name/g" /tmp/clash_base.yaml
-        cat /tmp/clash_base.yaml >/tmp/clash.yaml
+        cat /tmp/clash_base.yaml >/etc/config/clash/clash.yaml
         kill_ovpn
         load_ovpn
     fi
@@ -703,13 +706,13 @@ reload_gw() {
         fi
         if [ -f /tmp/paopao_custom.yaml ]; then
             sed -i "s/{clashmode}/$clashmode/g" /tmp/clash_base.yaml
-            ppgw -input /tmp/paopao_custom.yaml -input /tmp/clash_base.yaml -output /tmp/clash.yaml
+            ppgw -input /tmp/paopao_custom.yaml -input /tmp/clash_base.yaml -output /etc/config/clash/clash.yaml
         fi
     fi
 
     if [ "$mode" = "free" ]; then
         sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
-        cat /tmp/clash_base.yaml >/tmp/clash.yaml
+        cat /tmp/clash_base.yaml >/etc/config/clash/clash.yaml
     fi
     log "Load clash config..." warn
     if [ -z "$fast_node" ]; then
@@ -723,9 +726,9 @@ reload_gw() {
     if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
         if [ "$fast_node" = "yes" ]; then
             if [ "$dns_burn" = "yes" ]; then
-                ppgw -dnslist "$dns_ip"":""$dns_port"",""$ex_dns" -dnsinput /tmp/clash.yaml -output /tmp/clash_dnsburn.yaml
+                ppgw -dnslist "$dns_ip"":""$dns_port"",""$ex_dns" -dnsinput /etc/config/clash/clash.yaml -output /tmp/clash_dnsburn.yaml
                 if grep -q tproxy-port /tmp/clash_dnsburn.yaml; then
-                    cat /tmp/clash_dnsburn.yaml >/tmp/clash.yaml
+                    cat /tmp/clash_dnsburn.yaml >/etc/config/clash/clash.yaml
                 fi
             fi
         fi

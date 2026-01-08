@@ -1077,7 +1077,7 @@ func selectNode(apiURL, secret, nodeName string) error {
 
 func reloadYaml(apiURL, secret string) error {
 	client := &http.Client{}
-	data := []byte(fmt.Sprintf(`{"path":"/tmp/clash.yaml"}`))
+	data := []byte(fmt.Sprintf(`{"path":"/etc/config/clash/clash.yaml"}`))
 	req, err := http.NewRequest("PUT", apiURL+"/configs", strings.NewReader(string(data)))
 	if err != nil {
 		return err
