@@ -149,7 +149,7 @@ max_rec=5000
 
 #### 基本使用流程
 
-1. 从左侧菜单 PPsub 编辑器开始，编辑你的订阅提供商、节点组、规则组后，导出 json 文件。也可以下载离线编辑器：https://raw.githubusercontent.com/kkkgo/PaoPaoGateWay/main/ppsub_offline.html
+1. 从左侧菜单 PPsub 编辑器开始，编辑你的订阅提供商、节点组、规则组后，导出 json 文件。也可以下载离线编辑器：https://github.com/kkkgo/PaoPaoGateWay/blob/main/ppsub_offline.html
 2. 导出了 json 配置后，设置 `ppgw.ini` 的 `mode=suburl`， 设置 `suburl="ppsub@http://.../ppsub.json"`（suburl 前面加 `ppsub@`）
 
 #### 全局健康监测
