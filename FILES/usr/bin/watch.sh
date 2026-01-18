@@ -4,7 +4,7 @@ getsha256() {
     echo -n "$1" | sha256sum | cut -d" " -f1
 }
 
-home="/etc/config/clash/clash-dashboard/"
+home="/etc/config/clash/clash-dashboard"
 
 if [ -f /tmp/ppgw.ini ]; then
     echo 1 >/etc/watch

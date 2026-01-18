@@ -5,3 +5,7 @@ renote.txt
 go.mod
 go.sum
 ppgw.exe
+*.iso
+clash
+*.ini
+/*.txt

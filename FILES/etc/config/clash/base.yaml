@@ -40,3 +40,4 @@ sniffer:
   enable: false
 listeners:
 find-process-mode:
+geo-auto-update: true

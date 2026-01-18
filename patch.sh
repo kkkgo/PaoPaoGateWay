@@ -1,8 +1,8 @@
 #!/bin/sh
 echo $1
 cd "$1"
-
 rm etc/banner.failsafe
+rm etc/device_info
 rm etc/board.d/01_leds
 rm -rf etc/capabilities
 rm etc/init.d/gpio_switch

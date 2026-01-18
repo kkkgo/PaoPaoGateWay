@@ -6,6 +6,7 @@ if [ -f "$builddir""/sha.txt" ]; then
     ppgwver="$ppgwver""$sha"
     sed -i "s/PPGW_version/$ppgwver/g" "$builddir"/custom.config.sh
     sed -i '/.*dropbear.*/s/.*/-dropbear/' "$builddir"/pkg.conf
+    sed -i '/.*psmisc.*/s/.*/-psmisc/' "$builddir"/pkg.conf
 fi
 
 # build ppgw

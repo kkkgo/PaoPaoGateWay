@@ -9,9 +9,9 @@ fi
 apk update
 apk upgrade
 apk add curl
-version=$(curl -s https://raw.githubusercontent.com/clash-verge-rev/clash-verge-rev/main/package.json|grep version|grep -Eo "[0-9.]+"|head -n 1)
-if [ -z "$version" ]; then
-    version="1.9.9"
+version=$(curl -s https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/autobuild|grep -Eo "releases/download/autobuild/Clash.Verge_[^_]+"|cut -d"_" -f2|head -n 1)
+if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+.+'; then
+    version="2.4.5+autobuild.0117.20ed7a3"
 fi
 echo "clash-verge version: $version"
 sed -i "s/1.6.6/$version/g" /go/build/main.go
