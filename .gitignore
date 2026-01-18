@@ -6,6 +6,6 @@ go.mod
 go.sum
 ppgw.exe
 *.iso
-clash
+/clash
 *.ini
 /*.txt
