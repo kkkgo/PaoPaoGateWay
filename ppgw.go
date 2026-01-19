@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
@@ -248,6 +249,9 @@ func main() {
 	flag.StringVar(&exDNS, "ex_dns", "", "Extra DNS servers (comma separated)")
 	flag.StringVar(&healthCheckFile, "healthcheck", "", "Health check config file")
 	flag.Parse()
+
+	ipv6Enabled = checkIPv6Support()
+
 	// health check logic
 	if healthCheckFile != "" {
 		configData, err := os.ReadFile(healthCheckFile)
@@ -882,7 +886,6 @@ func main() {
 		if exDNSEnv := os.Getenv("ex_dns"); exDNSEnv != "" {
 			exDNS = exDNSEnv
 		}
-
 		err := processPPSub(ppsubFile, outputFile, dnsBurn, exDNS)
 		if err != nil {
 			fmt.Printf(red+"[PaoPaoGW PPSub]"+reset+"PPSub processing failed: %v\n", err)
@@ -1162,6 +1165,9 @@ func QueryDNSIPs(ctx context.Context, domain *string, dnsServer string) ([]net.I
 			dialer := net.Dialer{
 				Timeout: 1 * time.Second,
 			}
+			if !strings.Contains(dnsServer, ":") {
+				return dialer.DialContext(ctx, "udp", dnsServer+":53")
+			}
 			return dialer.DialContext(ctx, "udp", dnsServer)
 		},
 	}
@@ -1173,7 +1179,7 @@ func QueryDNSIPs(ctx context.Context, domain *string, dnsServer string) ([]net.I
 
 	ips, err := dnsResolver.LookupIP(ctx, networkType, *domain)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lookup failed via %s: %w", dnsServer, err)
 	}
 
 	if len(ips) == 0 {
@@ -1197,20 +1203,49 @@ func NewDownloader(url, outputFile string) *Downloader {
 }
 
 func (d *Downloader) Download() error {
+	var dnsServers []string
+
+	dnsIP := os.Getenv("dns_ip")
+	dnsPort := os.Getenv("dns_port")
+	if dnsIP != "" {
+		if dnsPort != "" {
+			dnsServers = append(dnsServers, net.JoinHostPort(dnsIP, dnsPort))
+		} else {
+			dnsServers = append(dnsServers, dnsIP+":53")
+		}
+	}
+
+	exDNS := os.Getenv("ex_dns")
+	if exDNS != "" {
+		servers := strings.Split(exDNS, ",")
+		for _, s := range servers {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				if !strings.Contains(s, ":") {
+					s = s + ":53"
+				}
+				dnsServers = append(dnsServers, s)
+			}
+		}
+	}
+	fmt.Printf(green+"[PaoPaoGW Get]"+reset+"DNS List: %s\n", dnsServers)
+	for _, dnsServer := range dnsServers {
+		fmt.Printf(green+"[PaoPaoGW Get]"+reset+"Trying Custom DNS: %s\n", dnsServer)
+		err := d.downloadWithCustomDNS(dnsServer)
+		if err == nil {
+			return nil
+		}
+		fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"Custom DNS %s failed: %v\n", dnsServer, err)
+	}
+
+	fmt.Printf(green + "[PaoPaoGW Get]" + reset + "Trying System DNS...\n")
 	err := d.downloadWithSystemDNS()
 	if err == nil {
 		return nil
 	}
-	dnsIP := os.Getenv("dns_ip")
-	dnsPort := os.Getenv("dns_port")
-	if dnsIP != "" && dnsPort != "" {
-		dnsServer := net.JoinHostPort(dnsIP, dnsPort)
-		err = d.downloadWithCustomDNS(dnsServer)
-		if err == nil {
-			return nil
-		}
-	}
+	fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"System DNS failed: %v\n", err)
 
+	fmt.Printf(green + "[PaoPaoGW Get]" + reset + "Trying Socks5 Proxy...\n")
 	err = d.downloadWithSocks5("127.0.0.1:1080")
 	if err == nil {
 		return nil
@@ -1312,6 +1347,16 @@ func (d *Downloader) doDownload(client *http.Client) error {
 	}
 	req.Header.Set("User-Agent", d.UserAgent)
 
+	var remoteAddr string
+	trace := &httptrace.ClientTrace{
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			if connInfo.Conn != nil {
+				remoteAddr = connInfo.Conn.RemoteAddr().String()
+			}
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
 	parsedURL, _ := url.Parse(d.URL)
 	host := parsedURL.Hostname()
 	if parsedURL.Scheme == "http" && net.ParseIP(host) != nil {
@@ -1333,11 +1378,15 @@ func (d *Downloader) doDownload(client *http.Client) error {
 	finalURL := resp.Request.URL.String()
 	finalHost := resp.Request.URL.Hostname()
 
-	addrs, err := net.LookupHost(finalHost)
-	if err == nil && len(addrs) > 0 {
-		fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"HOST: %s IP: %s\n", finalHost, strings.Join(addrs, ", "))
+	if remoteAddr != "" {
+		fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"HOST: %s IP: %s\n", finalHost, remoteAddr)
 	} else {
-		fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"HOST: %s\n", finalHost)
+		addrs, err := net.LookupHost(finalHost)
+		if err == nil && len(addrs) > 0 {
+			fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"HOST: %s IP: %s\n", finalHost, strings.Join(addrs, ", "))
+		} else {
+			fmt.Printf(orange+"[PaoPaoGW Get]"+reset+"HOST: %s\n", finalHost)
+		}
 	}
 
 	if finalURL != d.URL {
