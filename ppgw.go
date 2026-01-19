@@ -2357,6 +2357,9 @@ func processRules(ruleSets []RuleSet, proxyGroups []map[string]interface{}) ([]s
 				"url":      ruleSet.URL,
 				"interval": 86400,
 				"behavior": "classical",
+				"header": map[string]interface{}{
+					"User-Agent": []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0 gzip, deflate, br"},
+				},
 			}
 			if ruleSet.Behavior != "" {
 				provider["behavior"] = ruleSet.Behavior
