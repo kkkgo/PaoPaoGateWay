@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,6 +60,7 @@ var (
 	dnsBurn               bool
 	exDNS                 string
 	healthCheckFile       string
+	ipv6Enabled           bool
 )
 
 var orange = "\033[38;5;208m"
@@ -181,6 +183,8 @@ type RuleSet struct {
 	Interval int      `json:"interval,omitempty"`
 	FixRule  []string `json:"fixrule,omitempty"`
 	IsForced bool     `json:"isforced,omitempty"`
+	Format   string   `json:"format,omitempty"`
+	Proxy    string   `json:"proxy,omitempty"`
 }
 
 type ClashConfig struct {
@@ -1144,36 +1148,8 @@ func formatBytes(bytes int64) string {
 		return fmt.Sprintf("%dB", bytes)
 	}
 }
-func dnsRes(domain string, dnsServers []string) []string {
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	ipSet := make(map[string]struct{})
-	for _, dnsServer := range dnsServers {
-		wg.Add(1)
-		go func(server string) {
-			defer wg.Done()
-			ipAddrs, err := QueryARecords(context.Background(), &domain, server)
-			if err == nil {
-				mu.Lock()
-				for _, ipAddr := range ipAddrs {
-					ipSet[ipAddr.String()] = struct{}{}
-				}
-				mu.Unlock()
-			}
-		}(dnsServer)
-	}
 
-	wg.Wait()
-
-	uniqueIPs := make([]string, 0, len(ipSet))
-	for ip := range ipSet {
-		uniqueIPs = append(uniqueIPs, ip)
-	}
-
-	return uniqueIPs
-}
-
-func QueryARecords(ctx context.Context, domain *string, dnsServer string) ([]net.IP, error) {
+func QueryDNSIPs(ctx context.Context, domain *string, dnsServer string) ([]net.IP, error) {
 	dnsResolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -1184,13 +1160,18 @@ func QueryARecords(ctx context.Context, domain *string, dnsServer string) ([]net
 		},
 	}
 
-	ips, err := dnsResolver.LookupIP(ctx, "ip4", *domain)
+	networkType := "ip4"
+	if ipv6Enabled {
+		networkType = "ip"
+	}
+
+	ips, err := dnsResolver.LookupIP(ctx, networkType, *domain)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A records found for domain: %s", *domain)
+		return nil, fmt.Errorf("no records found for domain: %s", *domain)
 	}
 
 	return ips, nil
@@ -1381,8 +1362,27 @@ func nslookup(domain string) string {
 	if len(r) == 0 {
 		os.Exit(1)
 	}
-	ip := r[0].IP.String()
-	return ip
+
+	var v6Candidate string
+
+	for _, ipAddr := range r {
+		ip := ipAddr.IP
+		if ip.To4() != nil {
+			return ip.String()
+		}
+		if ipv6Enabled && ip.To4() == nil && ip.To16() != nil {
+			if v6Candidate == "" {
+				v6Candidate = ip.String()
+			}
+		}
+	}
+
+	if v6Candidate != "" {
+		return v6Candidate
+	}
+
+	os.Exit(1)
+	return ""
 }
 
 func parseSubtime(subtime, sleeptime string) int {
@@ -2106,12 +2106,13 @@ func resolveDomainIPs(domain string, extraDNS []string) []string {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 
-		ips, err := QueryARecords(ctx, &domain, dnsServer)
-
+		ips, err := QueryDNSIPs(ctx, &domain, dnsServer)
 		cancel()
 		if err == nil {
 			for _, ip := range ips {
 				if ip.To4() != nil {
+					ipSet[ip.String()] = true
+				} else if ipv6Enabled && ip.To16() != nil {
 					ipSet[ip.String()] = true
 				}
 			}
@@ -2189,9 +2190,30 @@ func checkSubDependencies(subs []string, subResults map[string]*SubDownloadResul
 	}
 	return true
 }
+func parseKeywords(keywords []string) ([]string, []*regexp.Regexp) {
+	var simple []string
+	var regexes []*regexp.Regexp
 
+	for _, k := range keywords {
+		if strings.HasPrefix(k, "exp#") {
+			pattern := strings.TrimPrefix(k, "exp#")
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"Regex compile error for '%s': %v (Skipping)\n", k, err)
+				continue
+			}
+			regexes = append(regexes, re)
+		} else {
+			simple = append(simple, k)
+		}
+	}
+	return simple, regexes
+}
 func filterProxiesByGroup(group NodeGroup, allProxies []map[string]interface{}, subResults map[string]*SubDownloadResult) []string {
 	var matched []string
+
+	incSimple, incRegex := parseKeywords(group.Keywords)
+	excSimple, excRegex := parseKeywords(group.ExcludeKeywords)
 
 	for _, proxy := range allProxies {
 		name, ok := proxy["name"].(string)
@@ -2205,11 +2227,11 @@ func filterProxiesByGroup(group NodeGroup, allProxies []map[string]interface{}, 
 			continue
 		}
 
-		if matchesAnyKeyword(name, group.ExcludeKeywords) {
+		if matchesAnyKeyword(name, excSimple, excRegex) {
 			continue
 		}
 
-		if len(group.Keywords) > 0 && !matchesAnyKeyword(name, group.Keywords) {
+		if len(group.Keywords) > 0 && !matchesAnyKeyword(name, incSimple, incRegex) {
 			continue
 		}
 
@@ -2235,12 +2257,18 @@ func matchSubSource(proxyName string, subs []string) bool {
 	return false
 }
 
-func matchesAnyKeyword(text string, keywords []string) bool {
-	for _, keyword := range keywords {
+func matchesAnyKeyword(text string, simple []string, regexes []*regexp.Regexp) bool {
+	for _, keyword := range simple {
 		if strings.Contains(text, keyword) {
 			return true
 		}
 	}
+	for _, re := range regexes {
+		if re.MatchString(text) {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -2279,6 +2307,13 @@ func processRules(ruleSets []RuleSet, proxyGroups []map[string]interface{}) ([]s
 			if ruleSet.Interval < 60 {
 				provider["interval"] = 60
 			}
+			if ruleSet.Format != "" {
+				provider["format"] = ruleSet.Format
+			}
+			if ruleSet.Proxy != "" {
+				provider["proxy"] = ruleSet.Proxy
+			}
+
 			definedProviders[ruleSet.Name] = provider
 			continue
 		}
@@ -2473,6 +2508,30 @@ func generateSuffix(n int) string {
 }
 
 func generateNodeName(baseName, ip string, usedNames map[string]bool) string {
+	if strings.Contains(ip, ":") {
+		cleanIP := strings.ReplaceAll(ip, ":", "")
+		suffix := ""
+		if len(cleanIP) > 4 {
+			suffix = cleanIP[len(cleanIP)-4:]
+		} else {
+			suffix = cleanIP
+		}
+
+		candidate := fmt.Sprintf("%s@%s", baseName, suffix)
+
+		if !usedNames[candidate] {
+			return candidate
+		}
+		counter := 0
+		for {
+			s := generateSuffix(counter)
+			newCandidate := candidate + s
+			if !usedNames[newCandidate] {
+				return newCandidate
+			}
+			counter++
+		}
+	}
 	parts := strings.Split(ip, ".")
 	lastOctet := parts[len(parts)-1]
 
@@ -2491,4 +2550,11 @@ func generateNodeName(baseName, ip string, usedNames map[string]bool) string {
 		}
 		counter++
 	}
+}
+func checkIPv6Support() bool {
+	content, err := os.ReadFile("/etc/config/network")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(content), "eth06")
 }
