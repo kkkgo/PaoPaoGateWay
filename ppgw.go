@@ -403,6 +403,9 @@ func main() {
 							}
 
 							sourceIP := connection.Metadata.SourceIP
+							if sourceIP == "" {
+								sourceIP = "127.0.0.1"
+							}
 
 							if isValidDestination(dest) && sourceIP != "127.0.0.1" {
 								backupIPMap[dest] = BackupIPMapping{
@@ -476,6 +479,9 @@ func main() {
 
 						activeConnIDs[connection.ID] = true
 						sourceIP := connection.Metadata.SourceIP
+						if sourceIP == "" {
+							sourceIP = "127.0.0.1"
+						}
 
 						if sourceIP == "127.0.0.1" && backupWsURL != "" {
 							backupMapMutex.RLock()
