@@ -1012,6 +1012,7 @@ func main() {
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 
+		fmt.Printf(green+"[PaoPaoGW DNS]"+reset+"DNS List: %v\n", dnsServers)
 		fmt.Printf(green + "[PaoPaoGW DNS]" + reset + "Start DNS Burn process...\n")
 
 		for _, proxy := range proxies {
@@ -2068,6 +2069,10 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 		dnsServers = append(dnsServers, exList...)
 	}
 
+	if len(dnsServers) > 0 {
+		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"Combined DNS List: %v\n", dnsServers)
+	}
+
 	for subName, result := range subResults {
 		if !result.Success {
 			continue
@@ -2159,7 +2164,7 @@ func resolveDomainIPs(domain string, extraDNS []string) []string {
 			dnsServer = dnsServer + ":53"
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 
 		ips, err := QueryDNSIPs(ctx, &domain, dnsServer)
 		cancel()
