@@ -151,6 +151,15 @@ kill_netrec() {
 load_netrec() {
     /usr/bin/net_rec.sh &
 }
+load_singbox() {
+    if ps | grep -v grep | grep "config/sing"; then
+        log "SNIFF Running OK." succ
+    else
+        if [ -f /usr/bin/sing-box ]; then
+            /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
+        fi
+    fi
+}
 load_clash() {
     if [ -f /tmp/clash.yaml ]; then
         log "Loading clash..." warn
@@ -290,28 +299,8 @@ load_clash() {
             fi
         fi
     fi
-    if ps | grep -v "grep" | grep "d /etc/config/clash" && [ -f /usr/bin/sing-box ]; then
-        if ps | grep -v "grep" | grep "/etc/config/sing-box"; then
-            log "[OK] SNIFF OK." succ
-        else
-            # if [ -f /www/sniffdns ]; then
-            #     if [ -z "$dns_ip" ]; then
-            #         dns_ip="223.5.5.5"
-            #     fi
-            #     if [ -z "$dns_port" ]; then
-            #         dns_port="53"
-            #     fi
-            #     sed "s/dns_ip/$dns_ip/g" /etc/config/sing-box/sniff.json >/tmp/sniff.json
-            #     sed -i "s/dns_port/$dns_port/g" /tmp/sniff.json
-            #     if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-            #         /usr/bin/sing-box run -c /tmp/sniff.json >/dev/tty0 2>&1 &
-            #     fi
-            # else
-            if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-                /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
-            fi
-            # fi
-        fi
+    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+        load_singbox
     fi
     if [ ! -f /etc/watch ]; then
         /usr/bin/watch.sh &
@@ -581,6 +570,17 @@ get_conf() {
             ppgw -ppsub "$file_down_tmp" -output "$ppsub_output" >/dev/tty0 2>&1
             if grep -q "proxies:" "$ppsub_output"; then
                 cp "$ppsub_output" "$ppsub_cpy"
+                ppsub_home="/etc/config/clash/clash-dashboard/ppsub_readonly/"
+                rm -rf "$ppsub_home"
+                mkdir -p "$ppsub_home"
+                if [ -z "$clash_web_password" ]; then
+                    clash_web_password="clashpass"
+                fi
+                ppsub_readkey_stamp=$(date +%s)$(cat /dev/urandom | tr -cd 'a-zA-Z0-9' | head -c 64)
+                echo "{\"ppsub_readkey\": \"$ppsub_readkey_stamp\"}" >"$ppsub_home"ppsub_readkey.json
+                ppsub_readkey=$(getsha256 "$ppsub_readkey_stamp""$(getsha256 "$clash_web_password")")
+                mkdir -p "$ppsub_home""$ppsub_readkey"
+                cp "$file_down_tmp" "$ppsub_home""$ppsub_readkey"/ppsub.json
                 return 0
             fi
         fi
@@ -967,7 +967,8 @@ while true; do
         fi
     fi
     if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-        echo "Clash running OK."
+        log "Clash Running OK." succ
+        load_singbox
         if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
             ppgw -healthcheck "/tmp/ppsub.json" >/dev/tty0 2>&1
             if [ $? -eq 0 ]; then

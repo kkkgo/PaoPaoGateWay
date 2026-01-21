@@ -10,7 +10,7 @@ FROM downloader AS singbuilder
 WORKDIR /data
 RUN git clone https://github.com/kkkgo/box.git box --depth 1
 WORKDIR /data/box
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -extldflags -static" -trimpath -tags "with_clash_api" -buildvcs=false -o /data/sing-box ./cmd/sing-box
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$(git describe --tags --always)' -s -w" -trimpath -tags "with_clash_api" -buildvcs=false -o /data/sing-box ./cmd/sing-box 
 
 FROM alpine:edge
 RUN apk add --no-cache xorriso 7zip
