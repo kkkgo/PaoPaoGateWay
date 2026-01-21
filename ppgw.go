@@ -2488,7 +2488,29 @@ func validateRule(rule string, groupNames map[string]bool) bool {
 		return true
 	}
 
-	target := strings.TrimSpace(parts[len(parts)-1])
+	ruleOptions := map[string]bool{
+		"no-resolve": true,
+		"src":        true,
+		"dst":        true,
+		"no-redir":   true,
+		"not":        true,
+	}
+
+	targetIndex := len(parts) - 1
+	for targetIndex >= 0 {
+		candidate := strings.TrimSpace(parts[targetIndex])
+		candidateLower := strings.ToLower(candidate)
+		if !ruleOptions[candidateLower] {
+			break
+		}
+		targetIndex--
+	}
+
+	if targetIndex < 1 {
+		return true
+	}
+
+	target := strings.TrimSpace(parts[targetIndex])
 
 	builtinPolicies := map[string]bool{
 		"DIRECT":  true,
