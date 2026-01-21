@@ -108,6 +108,19 @@ if [ -f /data/clash ]; then
   chmod +x $root"/usr/bin/clash"
   patchclash=1
   $root"/usr/bin/clash" -v
+else
+  if [ -n "$MI" ]; then
+    ver=mihomo_compatible
+    if [ "$MI" = "3" ]; then
+      ver=mihomo_v3
+    fi
+    patch Use the embedded Mihomo ..."$ver"
+    touch $root"/www/clash_core"
+    cp /clash/$ver $root"/usr/bin/clash"
+    chmod +x $root"/usr/bin/clash"
+    patchclash=1
+    $root"/usr/bin/clash" -v
+  fi
 fi
 if [ -f /data/network.ini ]; then
   ls -lah /data/network.ini

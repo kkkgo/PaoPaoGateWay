@@ -271,8 +271,7 @@ ppgwurl="http://...."
 你应该下载类似mihomo-linux-amd64-v3-xxx.gz的文件并解压重命名为clash   
 如果你的虚拟机平台不支持v3 CPU（比如PVE，默认类型不支持，你需要把CPU类别设置为host）或者不确定你应该下载什么，那么你应该下载类似mihomo-linux-amd64-compatible-xxx.gz的文件并解压重命名为clash   
 
-注意：使用Wireguard出站建议设置`remote-dns-resolve: false`。  
-
+*快捷测试*：使用`-e MI=y`，可以便捷使用内置下载好的mihomo内核（不一定是最新版本）。如果你的CPU和虚拟机平台支持v3，可以使用`-e MI=3`。该选项仅当前目录没有clash核心的时候生效。
 #### 替换Geo数据文件
 默认的GEOIP数据仅包含`CN`和`PRIVATE`地址（在没有替换核心的情况下）。    
 默认替换核心下，会引入额外的自带Geo完整数据文件（占用一定体积），避免初次拉取数据文件时启动失败。  
