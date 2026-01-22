@@ -127,7 +127,9 @@ max_rec=5000
    - `suburl`：自定义远程订阅clash配置，不过是从给定的url下载配置。注意事项与`yaml`模式基本一样，不能使用包含开源clash功能之外的规则的订阅，或者参考**使用docker定制ISO镜像**一节更换定制的clash核心。推荐nodelist类型订阅，或者使用subconverter等程序转换订阅。
     - `free`: 自由出站模式，选择此模式的场景是，假定你在IP层面把虚拟机IP出口走了专线，流量直接出站处理。
 - 3 `fake_cidr`是指定你的FakeIP地址池范围。比如默认值是`7.0.0.0/8`，你需要在主路由上设置一条静态路由`7.0.0.0/8`到PaoPaoGateWay。你应该使用一些看起来是公网但实际上不是（或者不会被实际使用）的地址段，比如实验用地址段、DoD网络地址段。如果你有其他真实的公网IP段需要被网关处理，直接写对应的静态路由即可（比如某些聊天软件走的是IP直连而不是域名），除了指定的`fake_cidr`段会被建立域名映射，其他公网IP地址段都会被网关按普通流量处理分流。[【ROS用户看这里】](https://github.com/kkkgo/PaoPaoGateWay/discussions/48#discussioncomment-7978269)  [【爱快用户看这里】](https://github.com/kkkgo/PaoPaoGateWay/discussions/26) 除了静态路由，[或者你可以顺便添加DHCP option 121优化](https://github.com/kkkgo/PaoPaoGateWay/discussions/25#discussioncomment-7221895)。
-不建议使用`198.18.0.0/15`作为`fake_cidr`段，Chrome会认为这个是局域网段并警告，请参考：https://developer.chrome.google.cn/blog/local-network-access?hl=zh-cn  https://wicg.github.io/local-network-access/
+不建议使用`198.18.0.0/15`作为`fake_cidr`段，Chrome会认为这个是局域网段并警告，请参考：
+- https://developer.chrome.google.cn/blog/local-network-access?hl=zh-cn 
+- https://wicg.github.io/local-network-access/
 - 4 `dns_ip`和`dns_port`用于设置可信任的DNS服务器，“可信任”意味着真实无污染的原始解析结果。如果你配合PaoPaoDNS使用，可以把`dns_ip`设置成PaoPaoDNS的IP，把`dns_port`设置成映射的5304端口，详情可参见PaoPaoDNS的可映射端口说明。该DNS服务在代理出站的时候实际上不会被用到，流量还是会以域名发送到远端，更多的是用于其他模式的节点解析、规则匹配。
 - 5 `clash_web_port`和`clash_web_password`是clash web仪表板的设置，分别设置web的端口和访问密码，默认值为`80`和`clashpass`。网页登录地址为`http://网关IP:端口/ui`。你可以在web端查看流量和日志，以及选择节点等。不要忘了登录地址是`/ui`。`clash_web_password`选项兼容除特殊字符外所有字符串（比如可以设置clash_web_password="一去二三里烟村四五家"）。  
 - 6 `openport`设置是否向局域网开启一个1080端口的socks5+http代理，默认值为`no`，需要开启可以设置为`yes`。
