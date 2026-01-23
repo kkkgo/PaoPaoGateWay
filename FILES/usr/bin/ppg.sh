@@ -762,6 +762,9 @@ reload_gw() {
     sed -i "s/{clash_web_password}/$(getsha256 "$clash_web_password")/g" /tmp/clash_base.yaml
     sed -i "s/{openport}/$openport/g" /tmp/clash_base.yaml
     sed -i "s/127.0.0.1/0.0.0.0/g" /tmp/clash_base.yaml
+    if grep -q -r eth06 /etc/config/network; then
+        sed -i 's/^ipv6: false$/ipv6: true/' /tmp/clash_base.yaml
+    fi
     if [ -e "/tmp/clash.yaml" ]; then
         rm "/tmp/clash.yaml"
     fi
