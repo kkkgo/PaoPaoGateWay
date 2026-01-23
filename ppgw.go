@@ -2352,8 +2352,12 @@ func filterProxiesByGroup(group NodeGroup, allProxies []map[string]interface{}, 
 }
 
 func matchSubSource(proxyName string, subs []string) bool {
-	if len(subs) == 0 || (len(subs) == 1 && subs[0] == "all") {
+	if subs == nil {
 		return true
+	}
+
+	if len(subs) == 0 {
+		return false
 	}
 
 	for _, sub := range subs {
