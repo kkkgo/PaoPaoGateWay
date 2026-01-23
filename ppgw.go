@@ -170,6 +170,7 @@ type NodeGroup struct {
 	Keywords        []string `json:"keywords"`
 	ExcludeKeywords []string `json:"exclude_keywords"`
 	Subs            []string `json:"subs"`
+	Include         []string `json:"include,omitempty"`
 	Mode            string   `json:"mode,omitempty"`
 	SpeedtestURL    string   `json:"speedtest_url,omitempty"`
 	Interval        int      `json:"interval,omitempty"`
@@ -2192,21 +2193,70 @@ func resolveDomainIPs(domain string, extraDNS []string) []string {
 func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interface{}, subResults map[string]*SubDownloadResult) ([]map[string]interface{}, error) {
 	var proxyGroups []map[string]interface{}
 
+	groupDirectProxies := make(map[string][]string)
+	groupMap := make(map[string]NodeGroup)
+	potentialGroups := make([]string, 0, len(nodeGroups))
+
 	for _, group := range nodeGroups {
+		groupMap[group.Name] = group
 		if !checkSubDependencies(group.Subs, subResults) {
 			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"Skipping node group %s (dependent subscription not downloaded)\n", group.Name)
 			continue
 		}
 
 		matchedProxies := filterProxiesByGroup(group, allProxies, subResults)
-		if len(matchedProxies) == 0 {
-			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"Skipping node group %s (no matching nodes)\n", group.Name)
+		groupDirectProxies[group.Name] = matchedProxies
+		potentialGroups = append(potentialGroups, group.Name)
+	}
+
+	isValid := make(map[string]bool)
+
+	for _, name := range potentialGroups {
+		if len(groupDirectProxies[name]) > 0 {
+			isValid[name] = true
+		}
+	}
+
+	changed := true
+	for changed {
+		changed = false
+		for _, name := range potentialGroups {
+			if isValid[name] {
+				continue
+			}
+			group := groupMap[name]
+			for _, includedName := range group.Include {
+				if _, exists := groupMap[includedName]; exists && isValid[includedName] {
+					isValid[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	for _, group := range nodeGroups {
+		if _, ok := groupDirectProxies[group.Name]; !ok {
 			continue
+		}
+
+		if !isValid[group.Name] {
+			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"Skipping node group %s (no matching nodes and no valid included groups)\n", group.Name)
+			continue
+		}
+
+		finalProxies := make([]string, 0, len(groupDirectProxies[group.Name])+len(group.Include))
+		finalProxies = append(finalProxies, groupDirectProxies[group.Name]...)
+
+		for _, incName := range group.Include {
+			if isValid[incName] {
+				finalProxies = append(finalProxies, incName)
+			}
 		}
 
 		proxyGroup := make(map[string]interface{})
 		proxyGroup["name"] = group.Name
-		proxyGroup["proxies"] = matchedProxies
+		proxyGroup["proxies"] = finalProxies
 
 		if group.SpeedtestURL != "" && strings.TrimSpace(group.SpeedtestURL) != "" {
 			proxyGroup["type"] = "url-test"
