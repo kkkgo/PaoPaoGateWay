@@ -2270,7 +2270,7 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 				interval = 30
 			}
 			proxyGroup["interval"] = interval
-			proxyGroup["tolerance"] = 2000
+			proxyGroup["tolerance"] = 1
 
 			fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"Node group %s: url-test mode (URL: %s, Interval: %d)\n",
 				group.Name, group.SpeedtestURL, interval)
