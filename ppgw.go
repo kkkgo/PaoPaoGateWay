@@ -174,6 +174,8 @@ type NodeGroup struct {
 	Mode            string   `json:"mode,omitempty"`
 	SpeedtestURL    string   `json:"speedtest_url,omitempty"`
 	Interval        int      `json:"interval,omitempty"`
+	UsePreProxy     bool     `json:"use_pre_proxy,omitempty"`
+	PreProxyGroup   string   `json:"pre_proxy_group,omitempty"`
 }
 
 type RuleSet struct {
@@ -190,11 +192,12 @@ type RuleSet struct {
 }
 
 type ClashConfig struct {
-	Proxies       []map[string]interface{} `yaml:"proxies"`
-	ProxyGroups   []map[string]interface{} `yaml:"proxy-groups"`
-	RuleProviders map[string]interface{}   `yaml:"rule-providers,omitempty"`
-	Rules         []string                 `yaml:"rules"`
-	Mode          string                   `yaml:"mode,omitempty"`
+	Proxies        []map[string]interface{} `yaml:"proxies"`
+	ProxyGroups    []map[string]interface{} `yaml:"proxy-groups"`
+	ProxyProviders map[string]interface{}   `yaml:"proxy-providers,omitempty"`
+	RuleProviders  map[string]interface{}   `yaml:"rule-providers,omitempty"`
+	Rules          []string                 `yaml:"rules"`
+	Mode           string                   `yaml:"mode,omitempty"`
 }
 type SubscriptionUserInfo struct {
 	Total    int64
@@ -1892,11 +1895,11 @@ func processPPSub(configFile, outputFile string, dnsBurn bool, exDNS string) err
 	fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+" Get %d proxy nodes\n", len(allProxies))
 
 	fmt.Printf("\n" + orange + "[PaoPaoGW PPSub]" + reset + "========== Step 3/4: Generating proxy groups ==========\n")
-	proxyGroups, err := generateProxyGroups(config.NodeGroups, allProxies, subResults)
+	proxyGroups, proxyProviders, err := generateProxyGroups(config.NodeGroups, allProxies, subResults)
 	if err != nil {
 		return fmt.Errorf("Failed to generate proxy groups: %v", err)
 	}
-	fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+" Generated %d proxy groups\n", len(proxyGroups))
+	fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+" Generated %d proxy groups, %d proxy providers\n", len(proxyGroups), len(proxyProviders))
 
 	fmt.Printf("\n" + orange + "[PaoPaoGW PPSub]" + reset + "========== Step 4/4: Processing rules ==========\n")
 	rules, ruleProviders, err := processRules(config.Rules, proxyGroups)
@@ -1906,11 +1909,12 @@ func processPPSub(configFile, outputFile string, dnsBurn bool, exDNS string) err
 	fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+" Generated %d rules, %d rule providers\n", len(rules), len(ruleProviders))
 
 	finalConfig := ClashConfig{
-		Proxies:       allProxies,
-		ProxyGroups:   proxyGroups,
-		Rules:         rules,
-		RuleProviders: ruleProviders,
-		Mode:          "rule",
+		Proxies:        allProxies,
+		ProxyGroups:    proxyGroups,
+		ProxyProviders: proxyProviders,
+		Rules:          rules,
+		RuleProviders:  ruleProviders,
+		Mode:           "rule",
 	}
 
 	yamlData, err := yaml.Marshal(&finalConfig)
@@ -2190,12 +2194,15 @@ func resolveDomainIPs(domain string, extraDNS []string) []string {
 
 	return result
 }
-func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interface{}, subResults map[string]*SubDownloadResult) ([]map[string]interface{}, error) {
+func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interface{}, subResults map[string]*SubDownloadResult) ([]map[string]interface{}, map[string]interface{}, error) {
 	var proxyGroups []map[string]interface{}
+	proxyProviders := make(map[string]interface{})
 
 	groupDirectProxies := make(map[string][]string)
 	groupMap := make(map[string]NodeGroup)
 	potentialGroups := make([]string, 0, len(nodeGroups))
+
+	groupFullProxies := make(map[string][]map[string]interface{})
 
 	for _, group := range nodeGroups {
 		groupMap[group.Name] = group
@@ -2207,6 +2214,11 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 		matchedProxies := filterProxiesByGroup(group, allProxies, subResults)
 		groupDirectProxies[group.Name] = matchedProxies
 		potentialGroups = append(potentialGroups, group.Name)
+
+		if group.UsePreProxy {
+			fullProxies := filterProxiesObjectsByGroup(group, allProxies)
+			groupFullProxies[group.Name] = fullProxies
+		}
 	}
 
 	isValid := make(map[string]bool)
@@ -2245,18 +2257,35 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 			continue
 		}
 
-		finalProxies := make([]string, 0, len(groupDirectProxies[group.Name])+len(group.Include))
-		finalProxies = append(finalProxies, groupDirectProxies[group.Name]...)
-
-		for _, incName := range group.Include {
-			if isValid[incName] {
-				finalProxies = append(finalProxies, incName)
-			}
-		}
-
 		proxyGroup := make(map[string]interface{})
 		proxyGroup["name"] = group.Name
-		proxyGroup["proxies"] = finalProxies
+
+		// Handle Pre-Proxy Logic
+		if group.UsePreProxy && group.PreProxyGroup != "" {
+			providerName := fmt.Sprintf("%s=(%s🔗%s)", group.Name, group.PreProxyGroup, group.Name)
+
+			// Generate Proxy Provider
+			provider := map[string]interface{}{
+				"type": "inline",
+				"override": map[string]interface{}{
+					"dialer-proxy": group.PreProxyGroup,
+				},
+				"payload": groupFullProxies[group.Name],
+			}
+			proxyProviders[providerName] = provider
+
+			proxyGroup["use"] = []string{providerName}
+		} else {
+			finalProxies := make([]string, 0, len(groupDirectProxies[group.Name])+len(group.Include))
+			finalProxies = append(finalProxies, groupDirectProxies[group.Name]...)
+
+			for _, incName := range group.Include {
+				if isValid[incName] {
+					finalProxies = append(finalProxies, incName)
+				}
+			}
+			proxyGroup["proxies"] = finalProxies
+		}
 
 		if group.SpeedtestURL != "" && strings.TrimSpace(group.SpeedtestURL) != "" {
 			proxyGroup["type"] = "url-test"
@@ -2270,7 +2299,7 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 				interval = 30
 			}
 			proxyGroup["interval"] = interval
-			proxyGroup["tolerance"] = 1
+			proxyGroup["tolerance"] = 0
 
 			fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"Node group %s: url-test mode (URL: %s, Interval: %d)\n",
 				group.Name, group.SpeedtestURL, interval)
@@ -2282,7 +2311,39 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 		proxyGroups = append(proxyGroups, proxyGroup)
 	}
 
-	return proxyGroups, nil
+	return proxyGroups, proxyProviders, nil
+}
+
+func filterProxiesObjectsByGroup(group NodeGroup, allProxies []map[string]interface{}) []map[string]interface{} {
+	var matched []map[string]interface{}
+
+	incSimple, incRegex := parseKeywords(group.Keywords)
+	excSimple, excRegex := parseKeywords(group.ExcludeKeywords)
+
+	for _, proxy := range allProxies {
+		name, ok := proxy["name"].(string)
+		if !ok {
+			continue
+		}
+		if isSystemNode(name) {
+			continue
+		}
+		if !matchSubSource(name, group.Subs) {
+			continue
+		}
+
+		if matchesAnyKeyword(name, excSimple, excRegex) {
+			continue
+		}
+
+		if len(group.Keywords) > 0 && !matchesAnyKeyword(name, incSimple, incRegex) {
+			continue
+		}
+
+		matched = append(matched, proxy)
+	}
+
+	return matched
 }
 
 func checkSubDependencies(subs []string, subResults map[string]*SubDownloadResult) bool {
