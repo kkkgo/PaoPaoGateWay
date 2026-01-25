@@ -1,5 +1,6 @@
 iso/
 ppgw/
+ppgw
 FILES/usr/bin/ppgw
 renote.txt
 go.mod

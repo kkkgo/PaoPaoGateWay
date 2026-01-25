@@ -2238,6 +2238,11 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 			}
 			group := groupMap[name]
 			for _, includedName := range group.Include {
+				if includedName == "DIRECT" || includedName == "REJECT" {
+					isValid[name] = true
+					changed = true
+					break
+				}
 				if _, exists := groupMap[includedName]; exists && isValid[includedName] {
 					isValid[name] = true
 					changed = true
@@ -2280,6 +2285,10 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 			finalProxies = append(finalProxies, groupDirectProxies[group.Name]...)
 
 			for _, incName := range group.Include {
+				if incName == "DIRECT" || incName == "REJECT" {
+					finalProxies = append(finalProxies, incName)
+					continue
+				}
 				if isValid[incName] {
 					finalProxies = append(finalProxies, incName)
 				}
