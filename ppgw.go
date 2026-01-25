@@ -2280,7 +2280,10 @@ func generateProxyGroups(nodeGroups []NodeGroup, allProxies []map[string]interfa
 			finalProxies = append(finalProxies, groupDirectProxies[group.Name]...)
 
 			for _, incName := range group.Include {
-				if isValid[incName] {
+				// 兼容 Clash 内置代理
+				if incName == "DIRECT" || incName == "REJECT" {
+					finalProxies = append(finalProxies, incName)
+				} else if isValid[incName] {
 					finalProxies = append(finalProxies, incName)
 				}
 			}
