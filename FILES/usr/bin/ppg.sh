@@ -187,7 +187,7 @@ load_clash() {
         fi
         sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
         closeall_flag="yes"
-        log "[VERSION] :""$(clash -v)" succ
+        log "[MODE]:""$mode"" [VERSION] :""$(clash -v)" succ
         echo "127.0.0.1 localhost" >/etc/hosts
         grep -Eo '[https]+://[a-zA-Z0-9.-]+' "/tmp/clash.yaml" | while read -r down_url; do
             genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
@@ -420,7 +420,17 @@ get_conf() {
             if [ -f /tmp/ppgw.ini ]; then
                 log "Load local ppgw.ini" succ
             else
-                cp /www/ppgw.ini /tmp/ppgw.ini
+                cp /www/ppgw.ini /tmp/ppgw.ini.tmp
+                submode_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^mode[ ]*=" | tail -1)
+                suburl_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^suburl[ ]*=" | tail -1)
+                if (echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && echo "$suburl_flag" | grep -E -q "^suburl=[\"']?ppsub@") || echo "$submode_flag" | grep -E -q "^mode=[\"']?free[\"']?"; then
+                    grep -v "^fast_node" "/tmp/ppgw.ini.tmp" >"/tmp/ppgw.ini"
+                    echo 'fast_node=no' >>"/tmp/ppgw.ini"
+                    echo 'fall_direct=no' >>"/tmp/ppgw.ini"
+                else
+                    cat "/tmp/ppgw.ini.tmp" >"/tmp/ppgw.ini"
+                fi
+                rm "/tmp/ppgw.ini.tmp"
             fi
             return 0
         fi
@@ -497,7 +507,7 @@ get_conf() {
             sed 's/\r/\n/g' "$file_down" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/ppgw.ini.tmp"
             submode_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^mode[ ]*=" | tail -1)
             suburl_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^suburl[ ]*=" | tail -1)
-            if echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && echo "$suburl_flag" | grep -E -q "^suburl=[\"']?ppsub@"; then
+            if (echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && echo "$suburl_flag" | grep -E -q "^suburl=[\"']?ppsub@") || echo "$submode_flag" | grep -E -q "^mode=[\"']?free[\"']?"; then
                 grep -v "^fast_node" "/tmp/ppgw.ini.tmp" >"/tmp/ppgw.ini"
                 echo 'fast_node=no' >>"/tmp/ppgw.ini"
                 echo 'fall_direct=no' >>"/tmp/ppgw.ini"
