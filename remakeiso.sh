@@ -211,6 +211,21 @@ config interface 'eth06'
 	option ip6gw '$gw6'
 EOF
   fi
+  if [ -n "$localnet" ]; then
+    patch "Custom localnet configuration detected: $localnet"
+    reserved_ips="0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4, 240.0.0.0-255.255.255.255"
+    full_localnet="$reserved_ips, $localnet"
+    # Patch nft.sh
+    sed -i '/set localnetwork/,/}/ {
+      /elements = {/,/}/c\
+                elements = { '"$full_localnet"' }
+    }' "$root/usr/bin/nft.sh"
+    # Patch nft_tcp.sh
+    sed -i '/set localnetwork/,/}/ {
+      /elements = {/,/}/c\
+                elements = { '"$full_localnet"' }
+    }' "$root/usr/bin/nft_tcp.sh"
+  fi
 fi
 
 if [ -f /data/ppgwurl.ini ]; then
