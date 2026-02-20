@@ -5,6 +5,8 @@ tproxy-port: 1082
 mixed-port: 1080
 allow-lan: {openport}
 bind-address: '127.0.0.1'
+#authentication:
+#  - "username:password"
 mode: {clashmode}
 external-controller: 0.0.0.0:{clash_web_port}
 #interface-name: tun114

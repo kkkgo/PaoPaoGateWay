@@ -65,6 +65,7 @@ clash_web_password="clashpass"
 # default：openport=no
 # socks+http mixed 1080
 openport=no
+#openport_auth="username:password"
 
 # default: udp_enable=no
 udp_enable=no
@@ -77,6 +78,8 @@ sleeptime=30
 socks5_ip="10.10.10.5"
 # default: socks5_port="7890"
 socks5_port="7890"
+#socks5_username="username"
+#socks5_password="password"
 
 # ovpn mode settting
 # The ovpn file in the same directory as the ppgw.ini.
@@ -125,10 +128,10 @@ max_rec=5000
   - https://wicg.github.io/local-network-access/
 - 4 `dns_ip`和`dns_port`用于设置可信任的DNS服务器，“可信任”意味着真实无污染的原始解析结果。如果你配合PaoPaoDNS使用，可以把`dns_ip`设置成PaoPaoDNS的IP，把`dns_port`设置成映射的5304端口，详情可参见PaoPaoDNS的可映射端口说明。该DNS服务在代理出站的时候实际上不会被用到，流量还是会以域名发送到远端，更多的是用于其他模式的节点解析、规则匹配。
 - 5 `clash_web_port`和`clash_web_password`是clash web仪表板的设置，分别设置web的端口和访问密码，默认值为`80`和`clashpass`。网页登录地址为`http://网关IP:端口/ui`。你可以在web端查看流量和日志，以及选择节点等。不要忘了登录地址是`/ui`。`clash_web_password`选项兼容除特殊字符外所有字符串（比如可以设置clash_web_password="一去二三里烟村四五家"）。  
-- 6 `openport`设置是否向局域网开启一个1080端口的socks5+http代理，默认值为`no`，需要开启可以设置为`yes`。
+- 6 `openport`设置是否向局域网开启一个1080端口的socks5+http代理，默认值为`no`，需要开启可以设置为`yes`。如果你想为代理增加额外的用户密码验证，可以设置`openport_auth="username:password"`，格式为`"用户名:密码"`。
 - 7 `udp_enable`: 是否允许UDP流量通过网关，默认值为no，设置为no则禁止UDP流量进入网关。（此选项只影响路由，不影响`openport`选项）注意：如果你的节点不支持UDP或者不稳定不建议开启，开启UDP将会导致QUIC失败导致网站有时候上不去的现象。   
 - 8 `sleeptime`是拉取配置检测更新的时间间隔，默认值是30，单位是秒。`sleeptime`在第一次成功获取到配置后生效，如果配置的值发生变化，将会重载网关配置。如果设置sleeptime低于30会被赋值为30。   
-- 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。
+- 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。如果socks5有用户验证，可以指定`socks5_username`和`socks5_password`。
 - 10 `ovpnfile`，`ovpn_username`和`ovpn_password`: ovpn运行模式的专用设置，`ovpnfile`指定ovpn的文件名，系统将会从`ppgw.ini`的同一目录下载该文件。如果你的ovpn需要用户名和密码认证，可以指定`ovpn_username`和`ovpn_password`。
 - 11 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并使用`sleeptime`的值循环刷新检测配置文件变化，值发生变化则重载网关。
 - 12 `suburl`和`subtime`和`subcron`: suburl运行模式的专用配置，`suburl`指定订阅的地址（记得加英文半角双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔而不是`sleeptime`，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔，检测配置变化仍然是由`sleeptime`进行。注意如果开了`fast_node`功能，检测不通的时候会主动拉新订阅。`subcron`参数支持指定每天0-23时刷新订阅，比如`subcron=5`每天凌晨5点内刷新订阅。该参数启用的时候`subtime`参数会失效。    
