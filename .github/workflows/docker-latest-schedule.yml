@@ -51,7 +51,7 @@ jobs:
   push-ecr:
     needs: build_release
     runs-on: ubuntu-latest
-    container: alpine:edge
+    container: alpine
     steps:
     - name: "Configure AWS Credentials"
       uses: aws-actions/configure-aws-credentials@main
