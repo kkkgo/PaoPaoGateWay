@@ -77,6 +77,7 @@ if (injectionPoint) {
     const toggleLang = () => {
         const newLang = i18n.language.startsWith('zh') ? 'en' : 'zh';
         i18n.changeLanguage(newLang);
+        localStorage.setItem('language', newLang);
     };
     // ------------------------------------------
     `;
@@ -89,8 +90,8 @@ if (injectionPoint) {
 // 4. Inject Buttons in Header
 console.log('Injecting Buttons in Header...');
 // Find where the buttons are. We removed one button.
-// Look for `handleExportJSON` button to place ours before/after.
-const exportBtnRegex = /<button onClick={handleExportJSON}.*?>/;
+// Look for export button to place ours before/after.
+const exportBtnRegex = /<button onClick={\(e\) => setExportPopup\(\{ x: e\.clientX, y: e\.clientY \}\)}.*?>/;
 const buttonsCode = `
                         {/* Injected Toggles */}
                         <button onClick={toggleTheme} style={{ ...styles.loadBtn, marginRight: '10px' }}>
@@ -122,6 +123,8 @@ import { data as en } from '../src/i18n/en';
 import { data as zh } from '../src/i18n/zh';
 
 // Init i18n
+const savedLang = localStorage.getItem('language');
+const defaultLang = savedLang ? savedLang : (navigator.language.startsWith('zh') ? 'zh' : 'en');
 i18n
   .use(initReactI18next)
   .init({
@@ -129,7 +132,7 @@ i18n
       en: { translation: en },
       zh: { translation: zh }
     },
-    lng: navigator.language.startsWith('zh') ? 'zh' : 'en',
+    lng: defaultLang,
     fallbackLng: 'en',
     interpolation: {
       escapeValue: false
