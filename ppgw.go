@@ -1937,6 +1937,7 @@ type SubDownloadResult struct {
 	UserInfo    *SubscriptionUserInfo
 	Error       error
 	RawResponse *http.Response
+	RawYAML     []byte
 }
 
 func downloadSubscription(sub SubProvider) *SubDownloadResult {
@@ -1974,6 +1975,8 @@ func downloadSubscription(sub SubProvider) *SubDownloadResult {
 			lastErr = err
 			continue
 		}
+
+		result.RawYAML = data
 
 		var yamlData map[string]interface{}
 		if err := yaml.Unmarshal(data, &yamlData); err != nil {
@@ -2049,6 +2052,200 @@ func parseSubscriptionUserInfo(header string) *SubscriptionUserInfo {
 
 	return nil
 }
+type exDNSResult struct {
+	addr    string
+	cleanup func()
+}
+
+func startExDNSForSubAsync(subName string, result *SubDownloadResult, index int) chan *exDNSResult {
+	ch := make(chan *exDNSResult, 1)
+
+	if !result.Success || len(result.RawYAML) == 0 {
+		ch <- nil
+		return ch
+	}
+
+	var fullYAML map[string]interface{}
+	if err := yaml.Unmarshal(result.RawYAML, &fullYAML); err != nil {
+		ch <- nil
+		return ch
+	}
+
+	dnsSection, hasDNS := fullYAML["dns"]
+	proxiesSection, hasProxies := fullYAML["proxies"]
+	if !hasDNS || !hasProxies {
+		ch <- nil
+		return ch
+	}
+
+	dnsMap, ok := dnsSection.(map[interface{}]interface{})
+	if !ok {
+		ch <- nil
+		return ch
+	}
+
+	port := 5304 + index
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	tmpConfig := fmt.Sprintf("/tmp/exdns_only_%d.yaml", index)
+
+	dnsMap["listen"] = listenAddr
+	dnsMap["enable"] = true
+
+	// remove fields that depend on external config or are irrelevant for pure DNS
+	for _, key := range []string{
+		"enhanced-mode", "fake-ip-range", "fake-ip-range6", "fake-ip-filter-mode",
+		"fake-ip-filter", "fake-ip-ttl", "fallback-filter",
+		"direct-nameserver", "direct-nameserver-follow-policy",
+		"respect-rules", "use-hosts", "use-system-hosts",
+	} {
+		delete(dnsMap, key)
+	}
+
+	// remove system/dhcp entries from DNS server lists
+	for _, listKey := range []string{"nameserver", "default-nameserver", "fallback", "proxy-server-nameserver"} {
+		if listRaw, ok := dnsMap[listKey]; ok {
+			if list, ok := listRaw.([]interface{}); ok {
+				var filtered []interface{}
+				for _, item := range list {
+					if s, ok := item.(string); ok {
+						if s == "system" || strings.HasPrefix(s, "dhcp://") {
+							continue
+						}
+					}
+					filtered = append(filtered, item)
+				}
+				if len(filtered) > 0 {
+					dnsMap[listKey] = filtered
+				} else {
+					delete(dnsMap, listKey)
+				}
+			}
+		}
+	}
+
+	// remove geosite/geoip/rule-set dependent keys from policy maps
+	for _, policyKey := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
+		if policyRaw, ok := dnsMap[policyKey]; ok {
+			if policy, ok := policyRaw.(map[interface{}]interface{}); ok {
+				for key := range policy {
+					if keyStr, ok := key.(string); ok {
+						lower := strings.ToLower(keyStr)
+						if strings.Contains(lower, "rule-set:") ||
+							strings.Contains(lower, "geosite:") ||
+							strings.Contains(lower, "geoip:") {
+							delete(policy, key)
+						}
+					}
+				}
+				if len(policy) == 0 {
+					delete(dnsMap, policyKey)
+				}
+			}
+		}
+	}
+
+	minConfig := map[string]interface{}{
+		"dns":     dnsMap,
+		"proxies": proxiesSection,
+	}
+
+	configData, err := yaml.Marshal(minConfig)
+	if err != nil {
+		fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: failed to marshal config from %s: %v\n", subName, err)
+		ch <- nil
+		return ch
+	}
+
+	if err := os.WriteFile(tmpConfig, configData, 0644); err != nil {
+		fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: failed to write %s: %v\n", tmpConfig, err)
+		ch <- nil
+		return ch
+	}
+
+	fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: starting temp clash with dns from %s (listen %s)\n", subName, listenAddr)
+
+	cmd := exec.Command("/usr/bin/clash", "-d", "/etc/config/clash", "-f", tmpConfig)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: failed to start clash: %v\n", err)
+		os.Remove(tmpConfig)
+		ch <- nil
+		return ch
+	}
+
+	go func() {
+		time.Sleep(2 * time.Second)
+
+		if cmd.Process == nil {
+			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: clash process not running\n")
+			os.Remove(tmpConfig)
+			ch <- nil
+			return
+		}
+
+		conn, err := net.DialTimeout("udp", listenAddr, 1*time.Second)
+		if err != nil {
+			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: cannot reach %s, stopping temp clash\n", listenAddr)
+			cmd.Process.Kill()
+			cmd.Wait()
+			os.Remove(tmpConfig)
+			ch <- nil
+			return
+		}
+		conn.Close()
+
+		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: temp clash [%s] ready at %s\n", subName, listenAddr)
+		ch <- &exDNSResult{
+			addr: listenAddr,
+			cleanup: func() {
+				fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: stopping temp clash [%s]\n", subName)
+				if cmd.Process != nil {
+					cmd.Process.Kill()
+					cmd.Wait()
+				}
+				if os.Getenv("KEEP_EXDNS_CONFIG") != "yes" {
+					os.Remove(tmpConfig)
+					fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: cleaned up %s\n", tmpConfig)
+				} else {
+					fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: keeping %s for review\n", tmpConfig)
+				}
+			},
+		}
+	}()
+
+	return ch
+}
+
+func generateSubDNSNodeName(baseName, ip string, usedNames map[string]bool) string {
+	var suffix string
+	if strings.Contains(ip, ":") {
+		cleanIP := strings.ReplaceAll(ip, ":", "")
+		if len(cleanIP) > 4 {
+			suffix = cleanIP[len(cleanIP)-4:]
+		} else {
+			suffix = cleanIP
+		}
+	} else {
+		parts := strings.Split(ip, ".")
+		suffix = parts[len(parts)-1]
+	}
+
+	candidate := fmt.Sprintf("%s@subdns%s", baseName, suffix)
+	if !usedNames[candidate] {
+		return candidate
+	}
+	counter := 0
+	for {
+		s := generateSuffix(counter)
+		newCandidate := candidate + s
+		if !usedNames[newCandidate] {
+			return newCandidate
+		}
+		counter++
+	}
+}
+
 func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDNS string) ([]map[string]interface{}, error) {
 	var allProxies []map[string]interface{}
 	var userInfo *SubscriptionUserInfo
@@ -2075,9 +2272,17 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 	}
 
 	if len(dnsServers) > 0 {
-		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"Combined DNS List: %v\n", dnsServers)
+		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"Base DNS List: %v\n", dnsServers)
 	}
 
+	type subExDNSPending struct {
+		subName string
+		proxies []map[string]interface{}
+		ch      chan *exDNSResult
+	}
+	var pendingSubDNS []subExDNSPending
+
+	subIndex := 0
 	for subName, result := range subResults {
 		if !result.Success {
 			continue
@@ -2087,6 +2292,11 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 			userInfo = result.UserInfo
 			userInfoSubName = subName
 			fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"USE %s traffic info\n", subName)
+		}
+
+		var exCh chan *exDNSResult
+		if dnsBurn {
+			exCh = startExDNSForSubAsync(subName, result, subIndex)
 		}
 
 		for _, proxy := range result.Proxies {
@@ -2128,6 +2338,85 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 				}
 			}
 		}
+
+		if dnsBurn && exCh != nil {
+			pendingSubDNS = append(pendingSubDNS, subExDNSPending{
+				subName: subName,
+				proxies: result.Proxies,
+				ch:      exCh,
+			})
+		}
+		subIndex++
+	}
+
+	for _, pending := range pendingSubDNS {
+		exResult := <-pending.ch
+		if exResult == nil {
+			continue
+		}
+
+		subDNS := []string{exResult.addr}
+		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"SubDNS [%s]: resolving with %s\n", pending.subName, exResult.addr)
+
+		resolvedIPs := make(map[string]map[string]bool)
+
+		for _, proxy := range pending.proxies {
+			server, ok := proxy["server"].(string)
+			if !ok || net.ParseIP(server) != nil {
+				continue
+			}
+
+			if resolvedIPs[server] != nil {
+				continue
+			}
+			resolvedIPs[server] = make(map[string]bool)
+
+			ips := resolveDomainIPs(server, subDNS)
+			if len(ips) == 0 {
+				continue
+			}
+
+			var newIPs []string
+			for _, ip := range ips {
+				alreadyKnown := false
+				for _, p := range allProxies {
+					if s, ok := p["server"].(string); ok && s == ip {
+						alreadyKnown = true
+						break
+					}
+				}
+				if !alreadyKnown {
+					newIPs = append(newIPs, ip)
+				}
+			}
+
+			if len(newIPs) == 0 {
+				continue
+			}
+
+			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"SubDNS Burn [%s]: %s -> %v (new)\n", pending.subName, server, newIPs)
+
+			originalName := ""
+			if name, ok := proxy["name"].(string); ok {
+				originalName = name
+			}
+
+			for _, ip := range newIPs {
+				ipProxy := make(map[string]interface{})
+				for k, v := range proxy {
+					ipProxy[k] = v
+				}
+				ipProxy["server"] = ip
+
+				newName := generateSubDNSNodeName(originalName, ip, usedNames)
+				ipProxy["name"] = newName
+
+				usedNames[newName] = true
+				allProxies = append(allProxies, ipProxy)
+			}
+		}
+
+		exResult.cleanup()
 	}
 
 	if userInfo != nil && len(allProxies) >= 1 {
