@@ -9,6 +9,9 @@ home="/etc/config/clash/clash-dashboard"
 if [ -f /tmp/ppgw.ini ]; then
     echo 1 >/etc/watch
     . /tmp/ppgw.ini 2>/dev/tty0
+    if [ -z "$clash_web_password" ]; then
+        clash_web_password="clashpass"
+    fi
     secret="$(getsha256 "$clash_web_password")"
     stamp=$(date +%s)$(cat /dev/urandom | tr -cd 'a-zA-Z0-9' | head -c 64)
     echo "{\"stamp\": \"$stamp\"}" >"$home/stamp.json"

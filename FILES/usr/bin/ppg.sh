@@ -616,6 +616,15 @@ try_conf() {
         fi
     fi
 
+    if [ -f /www/ppgw.ini ] && [ "$down_type" = "ini" ]; then
+        if [ -f /tmp/ppgw.ini ]; then
+            log "Load local ppgw.ini" succ
+        else
+            get_conf "local" "ini"
+        fi
+        return 0
+    fi
+
     if [ -f /www/custom.yaml ] && [ "$down_type" = "yaml" ]; then
         if [ -f "/tmp/ppgw.yaml.down" ] && [ -f "/tmp/paopao_custom.yaml" ]; then
             log "Load local yaml" succ
