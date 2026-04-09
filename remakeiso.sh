@@ -23,10 +23,7 @@ json='
       "type": "tproxy",
       "tag": "sniff",
       "listen": "127.0.0.1",
-      "listen_port": 1081,
-      "sniff": true,
-      "sniff_override_destination": true,
-      "sniff_timeout": "300ms"
+      "listen_port": 1081
     }
   ],
   "outbounds": [
@@ -35,25 +32,22 @@ json='
       "tag": "clash",
       "server": "127.0.0.1",
       "server_port": 1080,
-      "version": "5",
-      "domain_strategy": ""
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
+      "version": "5"
     }
   ],
   "route": {
     "rules": [
       {
-        "protocol": "bittorrent",
-        "outbound": "block"
+        "inbound": "sniff",
+        "action": "sniff",
+        "timeout": "300ms"
       },
       {
+        "protocol": "bittorrent",
+        "action": "reject"
+      },
+      {
+        "action": "route",
         "outbound": "clash"
       }
     ],
