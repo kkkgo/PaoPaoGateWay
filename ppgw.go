@@ -2165,6 +2165,7 @@ func startExDNSForSubAsync(subName string, result *SubDownloadResult, index int)
 	fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: starting temp clash with dns from %s (listen %s)\n", subName, listenAddr)
 
 	cmd := exec.Command("/usr/bin/clash", "-d", "/etc/config/clash", "-f", tmpConfig)
+	cmd.Env = append(os.Environ(), "SAFE_PATHS=/tmp/")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
