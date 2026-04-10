@@ -5,6 +5,10 @@ rm etc/banner.failsafe
 rm etc/device_info
 rm etc/board.d/01_leds
 rm -rf etc/capabilities
+rm -rf etc/apk
+rm -rf etc/profile.d
+rm -rf lib/apk
+sed -i '/add_list system\.ntp\.server/d' bin/config_generate
 rm etc/init.d/gpio_switch
 rm etc/init.d/led
 rm etc/openwrt_release
@@ -22,6 +26,7 @@ rm -rf usr/lib/os-release
 rm sbin/firstboot
 rm sbin/sysupgrade
 rm sbin/wifi
+rm sbin/led.sh
 rm -rf usr/lib/share/acl.d
 rm -rf usr/lib/share/libubox
 cd lib/preinit
