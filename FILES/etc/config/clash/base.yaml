@@ -38,6 +38,7 @@ external-ui-url:
 tun:
   enable: false
 ebpf:
+iptables:
 sniffer:
   enable: false
 listeners:
