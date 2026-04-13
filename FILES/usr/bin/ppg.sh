@@ -449,44 +449,44 @@ get_conf() {
     if [ -f "$file_down_tmp" ]; then
         rm "$file_down_tmp"
     fi
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
-        if [ -z "$dns_ip" ]; then
-            dns_ip="223.5.5.5"
-        fi
-        if [ -z "$dns_port" ]; then
-            dns_port="53"
-        fi
-    fi
-    echo "127.0.0.1 localhost" >/etc/hosts
-    if [ "$down_url" = "http://paopao.dns" ]; then
-        dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
-        dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
-        genHost_p1=$(ppgw -server "$dns1" -port "53" -rawURL "$down_url" | cut -d" " -f1)
-        genHost_p2=$(ppgw -server "$dns2" -port "53" -rawURL "$down_url" | cut -d" " -f1)
-        genHost_p3=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url" | cut -d" " -f1)
-        paopaohost_list="$genHost_p1 $genHost_p2 $genHost_p3"
-        paopaohost=$(echo "$paopaohost_list" | grep "$IPREX4" | head -1)
-        if [ -z "$paopaohost" ]; then
-            log "Nslookup DNS failed: ""$down_url" warn
-            return 1
-        fi
-        echo "$paopaohost" >>/etc/hosts
-    else
-        genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
-        if [ "$?" = "1" ]; then
-            log "Nslookup DNS failed: ""$down_url" warn
-            return 1
-        fi
-        echo "$genHost" >>/etc/hosts
-    fi
-    if echo "$down_url" | grep https; then
-        sync_ntp
-    fi
     if [ "$down_type" = "ppsub" ] && [ -f /www/ppsub.json ]; then
         cp /www/ppsub.json "$file_down_tmp"
         log "Load local ppsub.json" succ
     else
+        if [ -f /tmp/ppgw.ini ]; then
+            . /tmp/ppgw.ini 2>/dev/tty0
+            if [ -z "$dns_ip" ]; then
+                dns_ip="223.5.5.5"
+            fi
+            if [ -z "$dns_port" ]; then
+                dns_port="53"
+            fi
+        fi
+        echo "127.0.0.1 localhost" >/etc/hosts
+        if [ "$down_url" = "http://paopao.dns" ]; then
+            dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
+            dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
+            genHost_p1=$(ppgw -server "$dns1" -port "53" -rawURL "$down_url" | cut -d" " -f1)
+            genHost_p2=$(ppgw -server "$dns2" -port "53" -rawURL "$down_url" | cut -d" " -f1)
+            genHost_p3=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url" | cut -d" " -f1)
+            paopaohost_list="$genHost_p1 $genHost_p2 $genHost_p3"
+            paopaohost=$(echo "$paopaohost_list" | grep "$IPREX4" | head -1)
+            if [ -z "$paopaohost" ]; then
+                log "Nslookup DNS failed: ""$down_url" warn
+                return 1
+            fi
+            echo "$paopaohost" >>/etc/hosts
+        else
+            genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
+            if [ "$?" = "1" ]; then
+                log "Nslookup DNS failed: ""$down_url" warn
+                return 1
+            fi
+            echo "$genHost" >>/etc/hosts
+        fi
+        if echo "$down_url" | grep https; then
+            sync_ntp
+        fi
         ppgw -downURL "$down_url" -output "$file_down_tmp" >/dev/tty0 2>&1
     fi
     echo "127.0.0.1 localhost" >/etc/hosts
