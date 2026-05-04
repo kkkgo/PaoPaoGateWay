@@ -200,7 +200,7 @@ config interface 'eth06'
 	option device 'eth0'
 	option proto 'dhcpv6'
 	option reqaddress 'try'
-	option reqprefix 'auto'
+	option reqprefix 'no'
 EOF
   elif [ "$ipv6_mode" = "static" ]; then
     cat >>"$network_config" <<EOF

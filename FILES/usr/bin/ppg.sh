@@ -683,6 +683,9 @@ reload_gw() {
     else
         log "[OK] ip_forward disable." succ
     fi
+    if sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 && sysctl -w net.ipv6.conf.default.forwarding=0 >/dev/null 2>&1; then
+        log "[OK] IPv6 forwarding disabled." succ
+    fi
 
     # fake ping
     if sysctl -a 2>&1 | grep -qE "net\.ipv4\.conf\.all\.route_localnet[ =]+1"; then

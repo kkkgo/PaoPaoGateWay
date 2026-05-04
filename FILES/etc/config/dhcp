@@ -1,0 +1,12 @@
+config dhcp 'eth0'
+	option interface 'eth0'
+	option ignore '1'
+	option ra 'disabled'
+	option dhcpv6 'disabled'
+	option ndp 'disabled'
+
+config odhcpd 'odhcpd'
+	option maindhcp '0'
+	option leasefile '/tmp/hosts/odhcpd'
+	option leasetrigger '/usr/sbin/odhcpd-update'
+	option loglevel '4'

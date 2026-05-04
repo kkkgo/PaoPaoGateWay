@@ -233,7 +233,7 @@ dns2=10.10.10.9
 ```ini
 ip6=auto
 ```
-该配置将会使用`DHCPv6 + SLAAC`获取IPv6地址。  
+该配置将会使用`DHCPv6 + SLAAC`获取IPv6地址，不请求前缀委派，也不会向局域网广播IPv6 RA/DHCPv6。  
 如果需要配置静态IPv6地址，配置示例如下：  
 ```ini
 ip6=240e:3b6:2333:4444:215:5dff:fe0a:e200/64
