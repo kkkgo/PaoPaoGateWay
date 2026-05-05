@@ -399,6 +399,10 @@ gen_ovpn_hash() {
     fi
 }
 
+yaml_conf_ok() {
+    grep -qE "^(proxies|proxy-providers):" "$1"
+}
+
 get_conf() {
     net_ready
     sleep 1
@@ -520,7 +524,7 @@ get_conf() {
         fi
     fi
     if [ "$down_type" = "yaml" ]; then
-        if grep -q "proxies:" "$file_down_tmp"; then
+        if yaml_conf_ok "$file_down_tmp"; then
             cp "$file_down_tmp" "$file_down"
             if [ -f /www/ppgw.ini ]; then
                 . /www/ppgw.ini
@@ -818,7 +822,7 @@ reload_gw() {
             if [ -z "$subtime" ]; then
                 subtime="1d"
             fi
-            if grep -q "proxies:" "/tmp/ppgw.yaml.down"; then
+            if yaml_conf_ok "/tmp/ppgw.yaml.down"; then
                 log "Sub yaml OK, skip get."
             else
                 get_conf "$suburl" "yaml"
