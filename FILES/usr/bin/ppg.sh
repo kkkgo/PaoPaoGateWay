@@ -61,33 +61,67 @@ getsha256() {
 safe_kill() {
     target_path="$1"
     if [ -z "$target_path" ]; then return 1; fi
-    pids=$(pgrep -f "$target_path" | grep -v "$$")
+    self_pid="$$"
+    parent_pid="$PPID"
+    pids=""
+    for pid in $(pgrep -f "$target_path"); do
+        if [ "$pid" = "$self_pid" ] || [ "$pid" = "$parent_pid" ]; then
+            continue
+        fi
+        if [ ! -r "/proc/$pid/cmdline" ]; then
+            continue
+        fi
+        exe_link=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        cmd0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
+        if [ "$exe_link" = "$target_path" ] || [ "$cmd0" = "$target_path" ]; then
+            pids="$pids $pid"
+        fi
+    done
+    pids=$(echo $pids)
     if [ -z "$pids" ]; then
         return 0
     fi
-    kill "$pids" 2>/dev/null
+    # SIGTERM (graceful)
+    for pid in $pids; do
+        kill -TERM "$pid" 2>/dev/null
+    done
+    # wait up to 10s, re-send TERM at 5s in case the process was not ready
+    i=0
+    while [ "$i" -lt 10 ]; do
+        all_dead=1
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                all_dead=0
+                break
+            fi
+        done
+        if [ "$all_dead" -eq 1 ]; then
+            log "$target_path stopped." succ
+            return 0
+        fi
+        if [ "$i" -eq 5 ]; then
+            for pid in $pids; do
+                kill -TERM "$pid" 2>/dev/null
+            done
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    # SIGKILL fallback
     for pid in $pids; do
         if kill -0 "$pid" 2>/dev/null; then
-            sleep 1
-            break
+            kill -KILL "$pid" 2>/dev/null
         fi
     done
+    sleep 1
     for pid in $pids; do
         if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null
+            log "$target_path kill FAILED pid=$pid" warn
+            return 1
         fi
     done
-    still_alive=0
-    for pid in $pids; do
-        if kill -0 "$pid" 2>/dev/null; then
-            still_alive=1
-            break
-        fi
-    done
-
-    if [ "$still_alive" -eq 0 ]; then
-        log "$target_path Killed." warn
-    fi
+    log "$target_path force killed." warn
+    return 0
 }
 
 fast_node_sel() {
@@ -200,7 +234,7 @@ load_clash() {
             now_node_after=$(ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node)
             if [ "$now_node_before" = "$now_node_after" ]; then
                 closeall_flag="no"
-                proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url" -openport_auth "$openport_auth")
+                proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
                 if [ $? -eq 0 ]; then
                     log "$proxytest" succ
                 else
@@ -263,7 +297,7 @@ load_clash() {
         if [ -f /tmp/allnode.failed ]; then
             if [ "$fall_direct" = "yes" ]; then
                 ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -spec_node="DIRECT" >/dev/tty0
-                www_test=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "http://120.53.53.53" -openport_auth "$openport_auth")
+                www_test=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "http://120.53.53.53")
                 if [ $? -eq 0 ]; then
                     log "[fall_direct] Switch to DIRECT." succ
                 else
@@ -487,7 +521,7 @@ get_conf() {
         if echo "$down_url" | grep https; then
             sync_ntp
         fi
-        ppgw -downURL "$down_url" -output "$file_down_tmp" -openport_auth "$openport_auth" >/dev/tty0 2>&1
+        ppgw -downURL "$down_url" -output "$file_down_tmp" >/dev/tty0 2>&1
     fi
     echo "127.0.0.1 localhost" >/etc/hosts
     if [ "$down_type" = "ini" ]; then
@@ -779,12 +813,23 @@ reload_gw() {
     sed -i "s/{dns_ip}/$dns_ip/g" /tmp/clash_base.yaml
     sed -i "s/{dns_port}/$dns_port/g" /tmp/clash_base.yaml
     sed -i "s/{clash_web_password}/$(getsha256 "$clash_web_password")/g" /tmp/clash_base.yaml
-    sed -i "s/{openport}/$openport/g" /tmp/clash_base.yaml
-    if [ -n "$openport_auth" ] && [ "$openport" = "true" ]; then
-        sed -i 's/#authentication:/authentication:/' /tmp/clash_base.yaml
-        sed -i "s/#  - \"username:password\"/  - \"$openport_auth\"/" /tmp/clash_base.yaml
+    if [ -n "$openport_auth" ]; then
+        sed -i "s/{openport}/false/g" /tmp/clash_base.yaml
+        sed -i "s/{bind_address}/127.0.0.1/g" /tmp/clash_base.yaml
+        sed -i 's/#auth//g' /tmp/clash_base.yaml
+        sed -i 's/#users:/users:/' /tmp/clash_base.yaml
+        auth_user=$(echo "$openport_auth" | cut -d: -f1)
+        auth_pass=$(echo "$openport_auth" | cut -d: -f2-)
+        sed -i "s|#  - username: username|  - username: $auth_user|" /tmp/clash_base.yaml
+        sed -i "s|#    password: password|    password: $auth_pass|" /tmp/clash_base.yaml
+    else
+        sed -i "s/{openport}/$openport/g" /tmp/clash_base.yaml
+        if [ "$openport" = "true" ]; then
+            sed -i "s/{bind_address}/0.0.0.0/g" /tmp/clash_base.yaml
+        else
+            sed -i "s/{bind_address}/127.0.0.1/g" /tmp/clash_base.yaml
+        fi
     fi
-    sed -i "s/127.0.0.1/0.0.0.0/g" /tmp/clash_base.yaml
     if grep -q -r eth06 /etc/config/network; then
         sed -i 's/^ipv6: false$/ipv6: true/' /tmp/clash_base.yaml
     fi
@@ -1000,7 +1045,7 @@ while true; do
         log "Clash Running OK." succ
         load_singbox
         if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
-            ppgw -healthcheck "/tmp/ppsub.json" -openport_auth "$openport_auth" >/dev/tty0 2>&1
+            ppgw -healthcheck "/tmp/ppsub.json" -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" >/dev/tty0 2>&1
             if [ $? -eq 0 ]; then
                 echo PPsub health check succ
             else
@@ -1013,7 +1058,7 @@ while true; do
             if [ -z "$test_node_url" ]; then
                 test_node_url="https://www.youtube.com/generate_204"
             fi
-            proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url" -openport_auth "$openport_auth")
+            proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
             if echo "$proxytest" | grep -q "success"; then
                 log "$proxytest" succ
             else

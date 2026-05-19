@@ -177,6 +177,17 @@ type NodeGroup struct {
 	Interval        int      `json:"interval,omitempty"`
 	UsePreProxy     bool     `json:"use_pre_proxy,omitempty"`
 	PreProxyGroup   string   `json:"pre_proxy_group,omitempty"`
+	Failover        bool     `json:"failover,omitempty"`
+	MonitorURL      string   `json:"monitor_url,omitempty"`
+	ExpectedStatus  string   `json:"expected_status,omitempty"`
+	Retries         *int     `json:"retries,omitempty"`
+}
+
+type GroupInfo struct {
+	Type string   `json:"type"`
+	Now  string   `json:"now"`
+	All  []string `json:"all"`
+	Name string   `json:"name"`
 }
 
 type RuleSet struct {
@@ -270,6 +281,11 @@ func main() {
 		if err := json.Unmarshal(configData, &config); err != nil {
 			fmt.Printf(red+"[PaoPaoGW Health]Failed to parse config file: %v\n"+reset, err)
 			os.Exit(255)
+		}
+
+		// Per-group manual-selection failover must run BEFORE global health detection.
+		if apiURL != "" && secret != "" {
+			runGroupFailover(apiURL, secret, &config)
 		}
 
 		monitor := config.GlobalMonitor
@@ -1797,6 +1813,220 @@ func deleteConnections(apiURL, secret string) error {
 
 	return fmt.Errorf("Failed to delete connections, response status code: %d", resp.StatusCode)
 }
+
+func getGroupInfo(apiURL, secret, groupName string) (*GroupInfo, error) {
+	requestURL := apiURL + "/group/" + url.PathEscape(groupName)
+	req, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var info GroupInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// normalizeExpectedStatus maps the frontend's "0"/empty (= any HTTP code) to a wide
+// range mihomo will accept; non-empty specific values are passed through unchanged.
+func normalizeExpectedStatus(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return "100-599"
+	}
+	return s
+}
+
+func testNodeDelayHTTP(apiURL, secret, nodeName, testURL, expectedStatus string, timeoutMs int) (int, error) {
+	requestURL := fmt.Sprintf("%s/proxies/%s/delay?timeout=%d&url=%s&expected=%s",
+		apiURL, url.PathEscape(nodeName), timeoutMs, url.QueryEscape(testURL), url.QueryEscape(normalizeExpectedStatus(expectedStatus)))
+	req, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	client := &http.Client{Timeout: time.Duration(timeoutMs+3000) * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("%s", resp.Status)
+	}
+	var p PingResponse
+	if err := json.Unmarshal(body, &p); err != nil {
+		return 0, err
+	}
+	if p.Delay <= 0 {
+		return 0, fmt.Errorf("no delay")
+	}
+	return p.Delay, nil
+}
+
+func testGroupDelayHTTP(apiURL, secret, groupName, testURL, expectedStatus string, timeoutMs int) (map[string]int, error) {
+	requestURL := fmt.Sprintf("%s/group/%s/delay?timeout=%d&url=%s&expected=%s",
+		apiURL, url.PathEscape(groupName), timeoutMs, url.QueryEscape(testURL), url.QueryEscape(normalizeExpectedStatus(expectedStatus)))
+	req, err := http.NewRequest("GET", requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	client := &http.Client{Timeout: time.Duration(timeoutMs+10000) * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// mihomo returns 504 with {"message":"get delay: all proxies timeout"} when nothing responded.
+	if resp.StatusCode == http.StatusGatewayTimeout {
+		return map[string]int{}, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var m map[string]int
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func setGroupSelected(apiURL, secret, groupName, nodeName string) error {
+	payload, err := json.Marshal(map[string]string{"name": nodeName})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("PUT", apiURL+"/proxies/"+url.PathEscape(groupName), bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+}
+
+func runGroupFailover(apiURL, secret string, config *PPSubConfig) {
+	const timeoutMs = 5000
+	const retryWait = time.Second
+	defaultURL := strings.TrimSpace(config.GlobalMonitor.URL)
+	if defaultURL == "" {
+		defaultURL = "https://www.youtube.com/generate_204"
+	}
+	for _, g := range config.NodeGroups {
+		if !g.Failover {
+			continue
+		}
+		// Only manual-selection groups are eligible; speedtest groups manage themselves.
+		if g.SpeedtestURL != "" || g.Interval > 0 {
+			continue
+		}
+		testURL := strings.TrimSpace(g.MonitorURL)
+		if testURL == "" {
+			testURL = defaultURL
+		}
+		retries := 3
+		if g.Retries != nil {
+			retries = *g.Retries
+			if retries < 0 {
+				retries = 0
+			}
+		}
+		info, err := getGroupInfo(apiURL, secret, g.Name)
+		if err != nil {
+			fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: lookup failed: %v\n", g.Name, err)
+			continue
+		}
+		if !strings.EqualFold(info.Type, "Selector") {
+			fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: not a Selector (%s), skip\n", g.Name, info.Type)
+			continue
+		}
+		if info.Now == "" {
+			fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: no current node, skip\n", g.Name)
+			continue
+		}
+		// Probe the currently selected node up to retries+1 times (1s between attempts).
+		var lastErr error
+		nodeOK := false
+		for attempt := 0; attempt <= retries; attempt++ {
+			delay, err := testNodeDelayHTTP(apiURL, secret, info.Now, testURL, g.ExpectedStatus, timeoutMs)
+			if err == nil && delay > 0 {
+				fmt.Printf(green+"[PaoPaoGW Failover]"+reset+" Group %q: current %q delay=%dms (attempt %d/%d)\n",
+					g.Name, info.Now, delay, attempt+1, retries+1)
+				nodeOK = true
+				break
+			}
+			lastErr = err
+			fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: current %q attempt %d/%d failed (%v)\n",
+				g.Name, info.Now, attempt+1, retries+1, err)
+			if attempt < retries {
+				time.Sleep(retryWait)
+			}
+		}
+		if nodeOK {
+			continue
+		}
+		fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: current %q failed %d time(s) (last: %v), testing group...\n",
+			g.Name, info.Now, retries+1, lastErr)
+		delays, err := testGroupDelayHTTP(apiURL, secret, g.Name, testURL, g.ExpectedStatus, timeoutMs)
+		if err != nil {
+			fmt.Printf(red+"[PaoPaoGW Failover]"+reset+" Group %q: group delay request error: %v\n", g.Name, err)
+			continue
+		}
+		if len(delays) == 0 {
+			fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: all nodes timeout, keep current\n", g.Name)
+			continue
+		}
+		bestName := ""
+		bestDelay := 0
+		for name, d := range delays {
+			if d <= 0 {
+				continue
+			}
+			if bestName == "" || d < bestDelay {
+				bestName = name
+				bestDelay = d
+			}
+		}
+		if bestName == "" {
+			fmt.Printf(orange+"[PaoPaoGW Failover]"+reset+" Group %q: no valid delays, keep current\n", g.Name)
+			continue
+		}
+		if bestName == info.Now {
+			fmt.Printf(green+"[PaoPaoGW Failover]"+reset+" Group %q: %q already best (%dms)\n", g.Name, bestName, bestDelay)
+			continue
+		}
+		if err := setGroupSelected(apiURL, secret, g.Name, bestName); err != nil {
+			fmt.Printf(red+"[PaoPaoGW Failover]"+reset+" Group %q: switch to %q failed: %v\n", g.Name, bestName, err)
+			continue
+		}
+		fmt.Printf(green+"[PaoPaoGW Failover]"+reset+" Group %q: switched %q -> %q (delay=%dms)\n", g.Name, info.Now, bestName, bestDelay)
+	}
+}
+
 func isValidDestination(destination string) bool {
 	if destination == "" {
 		return false
@@ -2470,32 +2700,47 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 }
 
 func resolveDomainIPs(domain string, extraDNS []string) []string {
-	ipSet := make(map[string]bool)
-	for _, dnsServer := range extraDNS {
-		dnsServer = strings.TrimSpace(dnsServer)
-		if dnsServer == "" {
-			continue
-		}
-
-		if !strings.Contains(dnsServer, ":") {
-			dnsServer = dnsServer + ":53"
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-
-		ips, err := QueryDNSIPs(ctx, &domain, dnsServer)
-		cancel()
-		if err == nil {
-			for _, ip := range ips {
-				if ip.To4() != nil {
-					ipSet[ip.String()] = true
-				} else if ipv6Enabled && ip.To16() != nil {
-					ipSet[ip.String()] = true
-				}
+	queryDNS := func(servers []string) map[string]bool {
+		ipSet := make(map[string]bool)
+		for _, dnsServer := range servers {
+			dnsServer = strings.TrimSpace(dnsServer)
+			if dnsServer == "" {
+				continue
 			}
-		} else {
-			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"DNS query failed (via %s): %v\n", dnsServer, err)
+
+			if !strings.Contains(dnsServer, ":") {
+				dnsServer = dnsServer + ":53"
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+			ips, err := QueryDNSIPs(ctx, &domain, dnsServer)
+			cancel()
+			if err == nil {
+				for _, ip := range ips {
+					if ip.IsLoopback() {
+						fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"DNS Burn: discard loopback result %s for %s (via %s)\n", ip.String(), domain, dnsServer)
+						continue
+					}
+					if ip.To4() != nil {
+						ipSet[ip.String()] = true
+					} else if ipv6Enabled && ip.To16() != nil {
+						ipSet[ip.String()] = true
+					}
+				}
+			} else {
+				fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"DNS query failed (via %s): %v\n", dnsServer, err)
+			}
 		}
+		return ipSet
+	}
+
+	ipSet := queryDNS(extraDNS)
+
+	if len(ipSet) == 0 {
+		fallbackDNS := []string{"223.5.5.5", "1.0.0.1"}
+		fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"DNS Burn: no result for %s, fallback to %v\n", domain, fallbackDNS)
+		ipSet = queryDNS(fallbackDNS)
 	}
 
 	var result []string

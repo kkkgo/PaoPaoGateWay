@@ -4,9 +4,7 @@ redir-port: 0
 tproxy-port: 1082
 mixed-port: 1080
 allow-lan: {openport}
-bind-address: '127.0.0.1'
-#authentication:
-#  - "username:password"
+bind-address: '{bind_address}'
 mode: {clashmode}
 external-controller: 0.0.0.0:{clash_web_port}
 #interface-name: tun114
@@ -42,5 +40,13 @@ iptables:
 sniffer:
   enable: false
 listeners:
+#auth  - name: public-auth
+#auth    type: mixed
+#auth    listen: 0.0.0.0
+#auth    port: 1088
+#auth    udp: true
+#auth    #users:
+#auth    #  - username: username
+#auth    #    password: password
 find-process-mode:
 geo-auto-update: true

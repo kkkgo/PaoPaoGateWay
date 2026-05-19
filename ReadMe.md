@@ -66,6 +66,7 @@ clash_web_password="clashpass"
 # socks+http mixed 1080
 openport=no
 #openport_auth="username:password"
+#openport_auth use mixed 1088.
 
 # default: udp_enable=no
 udp_enable=no
@@ -128,7 +129,9 @@ max_rec=5000
   - https://wicg.github.io/local-network-access/
 - 4 `dns_ip`和`dns_port`用于设置可信任的DNS服务器，“可信任”意味着真实无污染的原始解析结果。如果你配合PaoPaoDNS使用，可以把`dns_ip`设置成PaoPaoDNS的IP，把`dns_port`设置成映射的5304端口，详情可参见PaoPaoDNS的可映射端口说明。该DNS服务在代理出站的时候实际上不会被用到，流量还是会以域名发送到远端，更多的是用于其他模式的节点解析、规则匹配。
 - 5 `clash_web_port`和`clash_web_password`是clash web仪表板的设置，分别设置web的端口和访问密码，默认值为`80`和`clashpass`。网页登录地址为`http://网关IP:端口/ui`。你可以在web端查看流量和日志，以及选择节点等。不要忘了登录地址是`/ui`。`clash_web_password`选项兼容除特殊字符外所有字符串（比如可以设置clash_web_password="一去二三里烟村四五家"）。  
-- 6 `openport`设置是否向局域网开启一个1080端口的socks5+http代理，默认值为`no`，需要开启可以设置为`yes`。如果你想为代理增加额外的用户密码验证，可以设置`openport_auth="username:password"`，格式为`"用户名:密码"`。
+- 6 `openport`设置是否向局域网开启代理端口，默认值为`no`，需要开启可以设置为`yes`。
+    - 当`openport=yes`且**没有**配置`openport_auth`时，外部可以直接通过`1080`端口免认证访问。
+    - 当配置了`openport_auth="username:password"`时，需使用`1088`认证端口，格式为`"用户名:密码"`。**注意：认证功能依赖 mihomo 内核。**
 - 7 `udp_enable`: 是否允许UDP流量通过网关，默认值为no，设置为no则禁止UDP流量进入网关。（此选项只影响路由，不影响`openport`选项）注意：如果你的节点不支持UDP或者不稳定不建议开启，开启UDP将会导致QUIC失败导致网站有时候上不去的现象。   
 - 8 `sleeptime`是拉取配置检测更新的时间间隔，默认值是30，单位是秒。`sleeptime`在第一次成功获取到配置后生效，如果配置的值发生变化，将会重载网关配置。如果设置sleeptime低于30会被赋值为30。   
 - 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。如果socks5有用户验证，可以指定`socks5_username`和`socks5_password`。

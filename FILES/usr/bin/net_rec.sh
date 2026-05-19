@@ -27,34 +27,68 @@ getsha256() {
 }
 safe_kill() {
     target_path="$1"
-        if [ -z "$target_path" ]; then return 1; fi
-    pids=$(pgrep -f "$target_path" | grep -v "$$")
+    if [ -z "$target_path" ]; then return 1; fi
+    self_pid="$$"
+    parent_pid="$PPID"
+    pids=""
+    for pid in $(pgrep -f "$target_path"); do
+        if [ "$pid" = "$self_pid" ] || [ "$pid" = "$parent_pid" ]; then
+            continue
+        fi
+        if [ ! -r "/proc/$pid/cmdline" ]; then
+            continue
+        fi
+        exe_link=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        cmd0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
+        if [ "$exe_link" = "$target_path" ] || [ "$cmd0" = "$target_path" ]; then
+            pids="$pids $pid"
+        fi
+    done
+    pids=$(echo $pids)
     if [ -z "$pids" ]; then
         return 0
     fi
-    kill "$pids" 2>/dev/null
+    # SIGTERM (graceful)
+    for pid in $pids; do
+        kill -TERM "$pid" 2>/dev/null
+    done
+    # wait up to 10s, re-send TERM at 5s in case the process was not ready
+    i=0
+    while [ "$i" -lt 10 ]; do
+        all_dead=1
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                all_dead=0
+                break
+            fi
+        done
+        if [ "$all_dead" -eq 1 ]; then
+            log "$target_path stopped." succ
+            return 0
+        fi
+        if [ "$i" -eq 5 ]; then
+            for pid in $pids; do
+                kill -TERM "$pid" 2>/dev/null
+            done
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    # SIGKILL fallback
     for pid in $pids; do
         if kill -0 "$pid" 2>/dev/null; then
-            sleep 1
-            break
+            kill -KILL "$pid" 2>/dev/null
         fi
     done
+    sleep 1
     for pid in $pids; do
         if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null
+            log "$target_path kill FAILED pid=$pid" warn
+            return 1
         fi
     done
-    still_alive=0
-    for pid in $pids; do
-        if kill -0 "$pid" 2>/dev/null; then
-            still_alive=1
-            break
-        fi
-    done
-
-    if [ "$still_alive" -eq 0 ]; then
-        log "$target_path Killed." warn
-    fi
+    log "$target_path force killed." warn
+    return 0
 }
 home="/etc/config/clash/clash-dashboard/rec_data"
 reckey=""
