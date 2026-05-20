@@ -2728,6 +2728,18 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 		allProxies = append([]map[string]interface{}{expireNode, trafficNode}, allProxies...)
 	}
 
+	// Move @subdns nodes to the front of the proxy list
+	var subdnsProxies []map[string]interface{}
+	var otherProxies []map[string]interface{}
+	for _, p := range allProxies {
+		if name, ok := p["name"].(string); ok && strings.Contains(name, "@subdns") {
+			subdnsProxies = append(subdnsProxies, p)
+		} else {
+			otherProxies = append(otherProxies, p)
+		}
+	}
+	allProxies = append(subdnsProxies, otherProxies...)
+
 	return allProxies, nil
 }
 
