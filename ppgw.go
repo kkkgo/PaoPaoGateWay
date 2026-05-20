@@ -2375,6 +2375,9 @@ func startExDNSForSubAsync(subName string, result *SubDownloadResult, index int)
 		}
 	}
 
+	// Force redir-host so the temporary DNS server returns real IPs instead of fake IPs
+	dnsMap["enhanced-mode"] = "redir-host"
+
 	// remove geosite/geoip/rule-set dependent keys from policy maps
 	for _, policyKey := range []string{"nameserver-policy", "proxy-server-nameserver-policy"} {
 		if policyRaw, ok := dnsMap[policyKey]; ok {
@@ -2428,25 +2431,53 @@ func startExDNSForSubAsync(subName string, result *SubDownloadResult, index int)
 	}
 
 	go func() {
-		time.Sleep(2 * time.Second)
+		// Wait a moment for clash to start
+		time.Sleep(1 * time.Second)
 
-		if cmd.Process == nil {
-			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: clash process not running\n")
-			os.Remove(tmpConfig)
-			ch <- nil
-			return
+		deadline := time.Now().Add(10 * time.Second)
+		ready := false
+		testDomain := "google.com"
+
+		for time.Now().Before(deadline) {
+			if cmd.Process == nil {
+				fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: clash process not running\n")
+				os.Remove(tmpConfig)
+				ch <- nil
+				return
+			}
+
+			// Check if the process has already exited
+			if cmd.ProcessState != nil {
+				fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: clash process exited\n")
+				os.Remove(tmpConfig)
+				ch <- nil
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ips, err := QueryDNSIPs(ctx, &testDomain, listenAddr)
+			cancel()
+
+			if err == nil && len(ips) > 0 {
+				hasRealIP := false
+				for _, ip := range ips {
+					if !ip.IsLoopback() {
+						hasRealIP = true
+						break
+					}
+				}
+				if hasRealIP {
+					ready = true
+					break
+				}
+			}
+
+			time.Sleep(1 * time.Second)
 		}
 
-		conn, err := net.DialTimeout("udp", listenAddr, 1*time.Second)
-		if err != nil {
-			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: cannot reach %s, stopping temp clash\n", listenAddr)
-			cmd.Process.Kill()
-			cmd.Wait()
-			os.Remove(tmpConfig)
-			ch <- nil
-			return
+		if !ready {
+			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"ExDNS: DNS probe failed after 10s, forcing ready for %s\n", listenAddr)
 		}
-		conn.Close()
 
 		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"ExDNS: temp clash [%s] ready at %s\n", subName, listenAddr)
 		ch <- &exDNSResult{
@@ -2611,7 +2642,7 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 		subDNS := []string{exResult.addr}
 		fmt.Printf(green+"[PaoPaoGW PPSub]"+reset+"SubDNS [%s]: resolving with %s\n", pending.subName, exResult.addr)
 
-		resolvedIPs := make(map[string]map[string]bool)
+		resolvedIPs := make(map[string][]string)
 
 		for _, proxy := range pending.proxies {
 			server, ok := proxy["server"].(string)
@@ -2619,35 +2650,36 @@ func processProxies(subResults map[string]*SubDownloadResult, dnsBurn bool, exDN
 				continue
 			}
 
-			if resolvedIPs[server] != nil {
-				continue
-			}
-			resolvedIPs[server] = make(map[string]bool)
+			newIPs, cached := resolvedIPs[server]
+			if !cached {
+				ips := resolveDomainIPs(server, subDNS)
+				if len(ips) == 0 {
+					resolvedIPs[server] = nil
+					continue
+				}
 
-			ips := resolveDomainIPs(server, subDNS)
-			if len(ips) == 0 {
-				continue
-			}
-
-			var newIPs []string
-			for _, ip := range ips {
-				alreadyKnown := false
-				for _, p := range allProxies {
-					if s, ok := p["server"].(string); ok && s == ip {
-						alreadyKnown = true
-						break
+				for _, ip := range ips {
+					alreadyKnown := false
+					for _, p := range allProxies {
+						if s, ok := p["server"].(string); ok && s == ip {
+							alreadyKnown = true
+							break
+						}
+					}
+					if !alreadyKnown {
+						newIPs = append(newIPs, ip)
 					}
 				}
-				if !alreadyKnown {
-					newIPs = append(newIPs, ip)
+
+				resolvedIPs[server] = newIPs
+				if len(newIPs) > 0 {
+					fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"SubDNS Burn [%s]: %s -> %v (new)\n", pending.subName, server, newIPs)
 				}
 			}
 
 			if len(newIPs) == 0 {
 				continue
 			}
-
-			fmt.Printf(orange+"[PaoPaoGW PPSub]"+reset+"SubDNS Burn [%s]: %s -> %v (new)\n", pending.subName, server, newIPs)
 
 			originalName := ""
 			if name, ok := proxy["name"].(string); ok {
