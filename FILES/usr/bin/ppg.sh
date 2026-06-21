@@ -54,6 +54,43 @@ sync_ntp() {
     ntpd -n -q -p 111.230.189.174 -p 47.96.149.233 -p 106.55.184.199 -p 203.107.6.88 >/dev/tty0
 }
 
+kill_ntpd() {
+    pids=""
+    for pid in $(pgrep -f "ntpd"); do
+        if [ -r "/proc/$pid/cmdline" ]; then
+            if ! tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "^\-q$"; then
+                pids="$pids $pid"
+            fi
+        fi
+    done
+    pids=$(echo $pids)
+    if [ -n "$pids" ]; then
+        for pid in $pids; do
+            kill -TERM "$pid" 2>/dev/null
+        done
+        sleep 1
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        done
+        log "NTPD daemon stopped." warn
+    fi
+}
+
+load_ntpd() {
+    if [ "$ntp_sync" = "yes" ]; then
+        if ps | grep -v "grep" | grep "ntpd" | grep -v "\-q" >/dev/null 2>&1; then
+            log "NTPD Running OK." succ
+        else
+            ntpd -p 111.230.189.174 -p 47.96.149.233 -p 106.55.184.199 -p 203.107.6.88 >/dev/null 2>&1
+            log "NTPD daemon started." succ
+        fi
+    else
+        kill_ntpd
+    fi
+}
+
 getsha256() {
     echo -n "$1" | sha256sum | cut -d" " -f1
 }
@@ -169,6 +206,7 @@ kill_clash() {
             safe_kill "/usr/bin/sing-box"
         fi
     fi
+    kill_ntpd
     nft flush ruleset
 }
 kill_netrec() {
@@ -206,7 +244,11 @@ load_clash() {
         fi
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
+            if [ -z "$ntp_sync" ]; then
+                ntp_sync="yes"
+            fi
         fi
+        load_ntpd
         if [ -z "$test_node_url" ]; then
             test_node_url="https://www.youtube.com/generate_204"
         fi
@@ -408,7 +450,10 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$cpudelay""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday"
+        if [ -z "$ntp_sync" ]; then
+            ntp_sync="yes"
+        fi
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$cpudelay""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday""$ntp_sync"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -729,6 +774,9 @@ reload_gw() {
     if [ -z "$udp_enable" ]; then
         udp_enable="no"
     fi
+    if [ -z "$ntp_sync" ]; then
+        ntp_sync="yes"
+    fi
 
     if [ -n "$mode" ]; then
         log "[MODE] : ""$mode" succ
@@ -945,6 +993,9 @@ last_ovpn_hash="empty"
 while true; do
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
+        if [ -z "$ntp_sync" ]; then
+            ntp_sync="yes"
+        fi
         old_fake_cidr=$fake_cidr
         old_openport=$openport
         old_clash_web_port=$clash_web_port
@@ -952,6 +1003,7 @@ while true; do
         old_net_rec=$net_rec
         old_max_rec=$max_rec
         old_net_cleanday=$net_cleanday
+        old_ntp_sync=$ntp_sync
     fi
     try_conf "ppgw.ini" "ini"
     hash=$(gen_hash)
@@ -962,6 +1014,9 @@ while true; do
             log "The hash has changed, reload gateway." warn
             if [ -f /tmp/ppgw.ini ]; then
                 . /tmp/ppgw.ini 2>/dev/tty0
+                if [ -z "$ntp_sync" ]; then
+                    ntp_sync="yes"
+                fi
             fi
             if [ "$old_fake_cidr" != "$fake_cidr" ]; then
                 kill_clash
@@ -987,6 +1042,9 @@ while true; do
             if [ "$old_net_cleanday" != "$net_cleanday" ]; then
                 kill_netrec
             fi
+            if [ "$old_ntp_sync" != "$ntp_sync" ]; then
+                kill_ntpd
+            fi
             if [ "$mode" = "suburl" ]; then
                 get_conf "$suburl" "yaml"
             fi
@@ -1004,6 +1062,9 @@ while true; do
     fi
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
+        if [ -z "$ntp_sync" ]; then
+            ntp_sync="yes"
+        fi
     fi
     if [ "$mode" = "yaml" ]; then
         try_conf "$yamlfile" "yaml"
@@ -1044,6 +1105,7 @@ while true; do
     if ps | grep -v "grep" | grep "d /etc/config/clash"; then
         log "Clash Running OK." succ
         load_singbox
+        load_ntpd
         if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
             ppgw -healthcheck "/tmp/ppsub.json" -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" >/dev/tty0 2>&1
             if [ $? -eq 0 ]; then
@@ -1110,6 +1172,9 @@ while true; do
     if [ "$mode" = "suburl" ]; then
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
+            if [ -z "$ntp_sync" ]; then
+                ntp_sync="yes"
+            fi
         fi
         if [ -z "$subtime" ]; then
             subtime="1d"
