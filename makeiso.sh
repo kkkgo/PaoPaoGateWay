@@ -12,6 +12,7 @@ fi
 rm -f "$builddir"/FILES/usr/bin/sniffbox
 docker pull rust:alpine
 docker run --rm --name rustbuilder \
+    -e SNIFFBOX_VERSION="$ppgwver" \
     -v "$builddir"/FILES/usr/bin/:/app/ \
     -v "$builddir"/buildbox.sh:/sh/buildbox.sh \
     -v "$builddir"/sniffbox:/box \
