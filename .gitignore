@@ -1,13 +1,16 @@
 iso/
 ppgw/
 ppgw
-FILES/usr/bin/ppgw
+FILES/usr/bin/sniffbox
 renote.txt
 go.mod
 go.sum
 ppgw.exe
 *.iso
 /clash
+.*c*/
 *.ini
 /*.txt
 /ppsub.json
+FILES/etc/dropbear/
+sniffbox/target/

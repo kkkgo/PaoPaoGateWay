@@ -1,15 +1,16 @@
 port: 0
-socks-port: 0
+socks-port: 1080
 redir-port: 0
-tproxy-port: 1082
-mixed-port: 1080
-allow-lan: {openport}
-bind-address: '{bind_address}'
+tproxy-port: 0
+mixed-port: 0
+allow-lan: false
+bind-address: 127.0.0.1
 mode: {clashmode}
-external-controller: 0.0.0.0:{clash_web_port}
+external-controller:
+external-controller-unix: /tmp/clash.sock
 #interface-name: tun114
-external-ui: /etc/config/clash/clash-dashboard
-secret: {clash_web_password}
+external-ui:
+secret:
 log-level: info
 ipv6: false
 profile:
@@ -21,10 +22,9 @@ dns:
   enable: true
   use-hosts: false
   use-system-hosts: false
-  listen: 0.0.0.0:53
+  listen: 
   ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: {fake_cidr}
+  enhanced-mode: normal
   nameserver:
     - {dns_ip}:{dns_port}#eth0
 
@@ -39,14 +39,9 @@ ebpf:
 iptables:
 sniffer:
   enable: false
-listeners:
-#auth  - name: public-auth
-#auth    type: mixed
-#auth    listen: 0.0.0.0
-#auth    port: 1088
-#auth    udp: true
-#auth    #users:
-#auth    #  - username: username
-#auth    #    password: password
 find-process-mode:
 geo-auto-update: true
+geodata-mode: true
+geodata-loader: standard
+geosite-matcher: mph
+geox-url:

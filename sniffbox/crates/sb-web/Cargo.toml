@@ -1,0 +1,24 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+
+[package]
+name          = "sb-web"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+
+[dependencies]
+tokio     = { workspace = true, features = ["process"] }
+tracing   = { workspace = true }
+thiserror = { workspace = true }
+httparse   = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+ipnet      = { workspace = true }
+serde_json = { workspace = true }
+arc-swap   = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

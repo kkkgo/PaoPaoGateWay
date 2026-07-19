@@ -1,6 +1,42 @@
 #!/bin/sh
 IPREX4='([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])'
 PUBIPREX6="2[0-9a-fA-F]{3}:[0-9a-fA-F:]+"
+NTP_SERVERS="-p 111.230.189.174 -p 47.96.149.233 -p 106.55.184.199 -p 203.107.6.88"
+
+ppgw() { /usr/bin/sniffbox ppgw "$@"; }
+
+set_default() {
+    eval "case \${$1} in '') $1=\"$2\" ;; esac"
+}
+
+apply_defaults() {
+    set_default test_node_url "http://cp.cloudflare.com/generate_204"
+    set_default fall_direct "no"
+    set_default ext_node "Traffic|Expire| GB|Days|Date"
+    set_default down_url "download_url_not_found"
+    set_default dns_ip "223.5.5.5"
+    set_default dns_port "53"
+    set_default udp_enable "no"
+    set_default fake_cidr "7.0.0.0/8"
+    set_default openport "no"
+    set_default mode "free"
+    set_default socks5_ip "$gw"
+    set_default socks5_port "7890"
+    set_default yamlfile "custom.yaml"
+    set_default ovpnfile "custom.ovpn"
+    set_default dns_burn "yes"
+    set_default ex_dns "223.5.5.5:53,1.0.0.1:53"
+    set_default subtime "1d"
+    set_default tomorrow "tomorrow"
+}
+
+require_ini() {
+    if [ ! -f /tmp/ppgw.ini ]; then
+        log "ppgw.ini not available, skip $1" warn
+        return 1
+    fi
+    return 0
+}
 
 log() {
     log_msg=$1
@@ -47,15 +83,19 @@ net_ready() {
         else
             log "eth0 IPv6 not found." warn
         fi
+        eth0ula=$(ip -6 addr show dev eth0 scope global | grep -E "inet6 (fd|fc)" | head -1 | sed -n 's/.*inet6 \([^ ]*\).*/\1/p')
+        if [ -n "$eth0ula" ]; then
+            log "eth0 ULA ready:[""$eth0ula""]" succ
+        fi
+    fi
+    if ! pidof ntpd >/dev/null 2>&1; then
+        ntpd $NTP_SERVERS >/dev/null 2>&1 &
     fi
 }
 
-sync_ntp() {
-    ntpd -n -q -p 111.230.189.174 -p 47.96.149.233 -p 106.55.184.199 -p 203.107.6.88 >/dev/tty0
-}
 
-getsha256() {
-    echo -n "$1" | sha256sum | cut -d" " -f1
+sync_ntp() {
+    ntpd -n -q $NTP_SERVERS >/dev/tty0 2>&1
 }
 
 safe_kill() {
@@ -124,75 +164,55 @@ safe_kill() {
     return 0
 }
 
-fast_node_sel() {
-    wait_delay=$1
-    try_count=$2
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
-    fi
-    if [ "$mode" = "ovpn" ]; then
-        return 0
-    fi
-    if [ -z "$clash_web_port" ]; then
-        clash_web_port="80"
-    fi
-    if [ -z "$clash_web_password" ]; then
-        clash_web_password="clashpass"
-    fi
-    if [ -z "$test_node_url" ]; then
-        test_node_url="https://www.youtube.com/generate_204"
-    fi
-    if [ -z "$ext_node" ]; then
-        ext_node="Traffic|Expire| GB|Days|Date"
-    fi
-    if [ -z "$cpudelay" ]; then
-        cpudelay="3000"
-    fi
-    cpudelay=$(echo $cpudelay | grep -Eo "[0-9]+" | head -1)
-    log "Try to test node...[""$try_count""]" warn
-    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -test_node_url="$test_node_url" -ext_node="$ext_node" -waitdelay="$wait_delay" -cpudelay="$cpudelay" >/dev/tty0
-    if [ "$?" = "1" ]; then
-        touch /tmp/allnode.failed
-    fi
-}
-kill_clash_cache() {
-    if [ -f /etc/config/clash/cache.db ]; then
-        rm -f /etc/config/clash/cache.db
-    fi
-}
-kill_clash() {
-    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-        safe_kill "/usr/bin/clash"
-    fi
-    if [ -f /usr/bin/sing-box ]; then
-        if ps | grep -v "grep" | grep "/etc/config/sing-box"; then
-            safe_kill "/usr/bin/sing-box"
+load_box() {
+    require_ini "load_box" || return 1
+    force_reload="$1"
+    if nft list ruleset | grep -q "ppgw_tproxy"; then
+        if [ "$force_reload" = "force" ]; then
+            log "[RELOAD] Reload nft rule..." warn
+            /usr/bin/nft.sh
         fi
+    else
+        log "[ADD] Add nft rule..." warn
+        /usr/bin/nft.sh
     fi
+    if pidof sniffbox >/dev/null 2>&1; then
+        log "sniffbox Running OK." succ
+    else
+    /usr/bin/sniffbox >/dev/tty0 2>&1 &
+    fi
+}
+kill_box(){
+    safe_kill "/usr/bin/sniffbox"
     nft flush ruleset
 }
-kill_netrec() {
-    touch /etc/kill_netrec
-    rm -rf "/etc/config/clash/clash-dashboard/rec_data"
-    if ps | grep -v "grep" | grep "/usr/bin/ppgw" | grep "wsPort"; then
-        safe_kill "/usr/bin/ppgw"
-        log "NET REC SHUTDOWN." warn
-    fi
-    if [ -f /etc/kill_netrec ]; then
-        rm /etc/kill_netrec
-    fi
-}
-load_netrec() {
-    /usr/bin/net_rec.sh &
-}
-load_singbox() {
-    if ps | grep -v grep | grep "config/sing"; then
-        log "SNIFF Running OK." succ
+hot_reload_box(){
+    pid=$(pidof sniffbox)
+    if [ -n "$pid" ]; then
+        kill -HUP "$pid"
     else
-        if [ -f /usr/bin/sing-box ]; then
-            /usr/bin/sing-box run -c /etc/config/sing-box/sniff.json >/dev/tty0 2>&1 &
-        fi
+        load_box
     fi
+}
+cold_reload_box(){
+    kill_box
+    load_box
+}
+box_hot_changed(){
+    if [ "$old_box" != "$box" ]; then return 0; fi
+    if [ "$old_clash_web_password" != "$clash_web_password" ]; then return 0; fi
+    if [ "$old_dns_ip" != "$dns_ip" ] || [ "$old_dns_port" != "$dns_port" ]; then return 0; fi
+    if [ "$old_openport_auth" != "$openport_auth" ]; then return 0; fi
+    if [ "$old_admin_cidr" != "$admin_cidr" ]; then return 0; fi
+    if [ "$old_proxy_cidr" != "$proxy_cidr" ]; then return 0; fi
+    if [ "$old_max_rec" != "$max_rec" ]; then return 0; fi
+    if [ "$old_net_cleanday" != "$net_cleanday" ]; then return 0; fi
+    return 1
+}
+
+
+kill_clash() {
+    safe_kill "/usr/bin/clash"
 }
 load_clash() {
     if [ -f /tmp/clash.yaml ]; then
@@ -207,97 +227,71 @@ load_clash() {
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
         fi
-        if [ -z "$test_node_url" ]; then
-            test_node_url="https://www.youtube.com/generate_204"
-        fi
-        if [ -z "$clash_web_port" ]; then
-            clash_web_port="80"
-        fi
-        if [ -z "$clash_web_password" ]; then
-            clash_web_password="clashpass"
-        fi
-        if [ -z "$fall_direct" ]; then
-            fall_direct="no"
-        fi
-        sed "s|https://www.youtube.com/generate_204|$test_node_url|g" /etc/config/clash/clash-dashboard/index_base.html >/etc/config/clash/clash-dashboard/index.html
-        closeall_flag="yes"
+        apply_defaults
+        closeall_flag="no"
+        is_reload=0
         log "[MODE]:""$mode"" [VERSION] :""$(clash -v)" succ
         echo "127.0.0.1 localhost" >/etc/hosts
-        grep -Eo '[https]+://[a-zA-Z0-9.-]+' "/tmp/clash.yaml" | while read -r down_url; do
-            genHost=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url")
-            echo "$genHost" >>/etc/hosts
-        done
-        if ps | grep -v "grep" | grep "d /etc/config/clash"; then
+        ppgw -genhost /tmp/clash.yaml -server "$dns_ip" -port "$dns_port" >>/etc/hosts
+        if pidof clash >/dev/null 2>&1; then
             log "Clash already running, just reload yaml config." succ
-            now_node_before=$(ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node)
-            ppgw -reload -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" >/dev/tty0 2>&1
-            now_node_after=$(ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node)
-            if [ "$now_node_before" = "$now_node_after" ]; then
-                closeall_flag="no"
-                proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
-                if [ $? -eq 0 ]; then
-                    log "$proxytest" succ
-                else
-                    closeall_flag="yes"
-                fi
+            is_reload=1
+            old_node=$(ppgw -now_node 2>/dev/tty0)
+            old_node_hash=$(ppgw -nodehash "$old_node" -yaml /tmp/clash.yaml.last 2>/dev/null)
+            old_rule_hash=""
+            old_ppsub_hash=""
+            if [ -f /tmp/ppgw_state.last ]; then
+                . /tmp/ppgw_state.last
             fi
-            if [ "$closeall_flag" = "yes" ]; then
-                if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
-                    echo "skip closeall."
-                else
-                    ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -closeall >/dev/tty0
-                fi
-            fi
+            ppgw -reload >/dev/tty0 2>&1
         else
             sync_ntp
-            export SAFE_PATHS="/tmp/"
-            /usr/bin/nft_dns.sh
-            /usr/bin/clash -d /etc/config/clash -f /tmp/clash.yaml >/dev/tty0 2>&1 &
+            ppgw -clash-up
         fi
     else
         log "The clash.yaml generation failed." warn
         return 1
     fi
-    clash_start_time=$(date +%s)
-    while true; do
-        ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -now_node
-        if [ $? -eq 0 ]; then
-            echo "clash api ok."
-            break
+    if ppgw -clash-ready -timeout 10; then
+        echo "clash api ok."
+    else
+        echo "clash api timeout."
+    fi
+    if pidof clash >/dev/null 2>&1 && [ "$is_reload" = "1" ]; then
+        new_node=$(ppgw -now_node 2>/dev/tty0)
+        if [ "$PPGW_FORCE_CLOSEALL" = "1" ]; then
+            closeall_flag="yes"
+        elif [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
+            new_ppsub_hash=$(md5sum /etc/config/clash/clash-dashboard/data/ppsub.json 2>/dev/null | cut -d' ' -f1)
+            if [ "$old_ppsub_hash" != "$new_ppsub_hash" ]; then
+                closeall_flag="yes"
+            fi
+        elif [ "$fast_node" = "yes" ]; then
+            if [ "$old_node" != "$new_node" ]; then
+                closeall_flag="yes"
+            else
+                new_node_hash=$(ppgw -nodehash "$new_node" -yaml /tmp/clash.yaml 2>/dev/null)
+                if [ "$old_node_hash" != "$new_node_hash" ]; then
+                    closeall_flag="yes"
+                fi
+            fi
+        else
+            new_rule_hash=$(ppgw -rulehash -yaml /tmp/clash.yaml 2>/dev/null)
+            if [ "$old_rule_hash" != "$new_rule_hash" ]; then
+                closeall_flag="yes"
+            fi
         fi
-        clash_current_time=$(date +%s)
-        if [ $((clash_current_time - clash_start_time)) -ge 10 ]; then
-            echo "clash api timeout."
-            break
+        if [ "$closeall_flag" = "yes" ]; then
+            ppgw -closeall >/dev/tty0
         fi
-        sleep 1
-    done
-    if ps | grep -v "grep" | grep "d /etc/config/clash" && [ "$1" = "yes" ]; then
-        fast_node_sel 1500 1
-        if [ -f /tmp/allnode.failed ]; then
-            sleep 3
-            rm /tmp/allnode.failed
-            fast_node_sel 2000 2
-        fi
-        if [ -f /tmp/allnode.failed ]; then
-            sleep 6
-            rm /tmp/allnode.failed
-            fast_node_sel 2000 3
-        fi
-        if [ -f /tmp/allnode.failed ]; then
-            sleep 9
-            rm /tmp/allnode.failed
-            fast_node_sel 2000 4
-        fi
-        if [ -f /tmp/allnode.failed ]; then
-            sleep 12
-            rm /tmp/allnode.failed
-            fast_node_sel 2000 5
-        fi
-        if [ -f /tmp/allnode.failed ]; then
+    fi
+    unset PPGW_FORCE_CLOSEALL
+    if pidof clash >/dev/null 2>&1 && [ "$1" = "yes" ]; then
+        ppgw -fastnode -test_node_url="$test_node_url" -ext_node="$ext_node" >/dev/tty0
+        if [ $? -ne 0 ]; then
             if [ "$fall_direct" = "yes" ]; then
-                ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -spec_node="DIRECT" >/dev/tty0
-                www_test=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "http://120.53.53.53")
+                ppgw -spec_node="DIRECT" >/dev/tty0
+                www_test=$(ppgw -testProxy -test_node_url "http://120.53.53.53")
                 if [ $? -eq 0 ]; then
                     log "[fall_direct] Switch to DIRECT." succ
                 else
@@ -308,49 +302,16 @@ load_clash() {
             fi
             return 3
         fi
-    else
-        if ps | grep -v "grep" | grep "d /etc/config/clash" && [ "$mode" = "socks5" ]; then
-            ppgw -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" -spec_node="ppgwsocks" >/dev/tty0
-        fi
     fi
-    if ps | grep -v "grep" | grep "d /etc/config/clash" && [ "$2" = "no" ]; then
-        if nft list ruleset | grep "clashtcp"; then
-            log "[OK] nft rule TCP OK." succ
-
-        else
-            if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-                log "[ADD] Add nft rule TCP..." warn
-                /usr/bin/nft_tcp.sh
-            fi
-        fi
-    else
-        if nft list ruleset | grep -q "clashboth"; then
-            log "[OK] nft rule TCP/UDP OK." succ
-        else
-            if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-                log "[ADD] Add nft rule TCP/UDP..." warn
-                /usr/bin/nft.sh
-            fi
-        fi
+    if [ -f /tmp/clash.yaml ]; then
+        cp /tmp/clash.yaml /tmp/clash.yaml.last
+        last_rule_hash=$(ppgw -rulehash -yaml /tmp/clash.yaml 2>/dev/null)
+        echo "last_rule_hash=$last_rule_hash" >/tmp/ppgw_state.last
     fi
-    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-        load_singbox
+    if [ -f /etc/config/clash/clash-dashboard/data/ppsub.json ]; then
+        last_ppsub_hash=$(md5sum /etc/config/clash/clash-dashboard/data/ppsub.json 2>/dev/null | cut -d' ' -f1)
+        echo "last_ppsub_hash=$last_ppsub_hash" >>/tmp/ppgw_state.last
     fi
-    if [ ! -f /etc/watch ]; then
-        /usr/bin/watch.sh &
-    fi
-}
-
-kill_ovpn() {
-    if ps | grep -v "grep" | grep "/tmp/paopao.ovpn"; then
-        safe_kill "/usr/sbin/openvpn"
-    fi
-    ovpn_tun="tun114"
-    if ip a | grep -q $ovpn_tun; then
-        ip link set $ovpn_tun down >/dev/tty0
-        ip link delete $ovpn_tun >/dev/tty0
-    fi
-
 }
 
 load_ovpn() {
@@ -376,6 +337,7 @@ load_ovpn() {
         sed -r "/^dev /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
+            apply_defaults
         fi
         if [ -n "$ovpn_username" ]; then
             sed -r "/^auth-user-pass /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
@@ -390,16 +352,7 @@ load_ovpn() {
         if ! grep -q route-nopull /tmp/paopao.ovpn; then
             echo "route-nopull" >>/tmp/paopao.ovpn
         fi
-        /usr/sbin/openvpn --config /tmp/paopao.ovpn >/dev/tty0 2>&1 &
-        while ! ip a | grep -q 'tun114 '; do
-            touch /tmp/ovpn_wait.txt
-            log "Waiting for openvpn tun to be ready." warn
-            sleep 1
-            echo "1" >>/tmp/ovpn_wait.txt
-            if [ "$(cat /tmp/ovpn_wait.txt | wc -l)" -gt 10 ]; then
-                break
-            fi
-        done
+        log "paopao.ovpn generated; openvpn managed by sniffbox." succ
     else
         log "The paopao.ovpn generation failed." warn
     fi
@@ -408,7 +361,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$sleeptime""$clash_web_port""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$cpudelay""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday""$pplog""$pplog_uuid""$admin_cidr""$proxy_cidr"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -438,7 +391,10 @@ get_conf() {
     sleep 1
     down_url=$1
     down_type=$2
-    submode_flag=$(cat "/tmp/ppgw.ini" | grep -E "^mode" | tail -1)
+    submode_flag=""
+    if [ -f /tmp/ppgw.ini ]; then
+        submode_flag=$(grep -E "^mode" /tmp/ppgw.ini | tail -1)
+    fi
     if echo "$down_url" | grep -qEo "^ppsub@"; then
         down_url=$(echo "$down_url" | sed "s/^ppsub@//g")
         down_type=ppsub
@@ -446,9 +402,7 @@ get_conf() {
     if echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && [ -f /www/ppsub.json ]; then
         down_type="ppsub"
     fi
-    if [ -z "$down_url" ]; then
-        down_url="download_url_not_found"
-    fi
+    apply_defaults
     if [ "$down_type" = "ini" ]; then
         if [ -f /www/ppgw.ini ]; then
             if [ -f /tmp/ppgw.ini ]; then
@@ -478,7 +432,8 @@ get_conf() {
     fi
     file_down_tmp="$file_down"".tmp"
     if [ "$down_type" = "ppsub" ]; then
-        file_down_tmp="/tmp/ppsub.json"
+        file_down_tmp="/etc/config/clash/clash-dashboard/data/ppsub.json"
+        mkdir -p "/etc/config/clash/clash-dashboard/data"
     fi
     if [ -f "$file_down_tmp" ]; then
         rm "$file_down_tmp"
@@ -489,22 +444,17 @@ get_conf() {
     else
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
-            if [ -z "$dns_ip" ]; then
-                dns_ip="223.5.5.5"
-            fi
-            if [ -z "$dns_port" ]; then
-                dns_port="53"
-            fi
+            apply_defaults
         fi
         echo "127.0.0.1 localhost" >/etc/hosts
-        if [ "$down_url" = "http://paopao.dns" ]; then
+        if echo "$down_url" | grep -qE "^http://paopao\.dns([:/]|$)"; then
             dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
             dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
             genHost_p1=$(ppgw -server "$dns1" -port "53" -rawURL "$down_url" | cut -d" " -f1)
             genHost_p2=$(ppgw -server "$dns2" -port "53" -rawURL "$down_url" | cut -d" " -f1)
             genHost_p3=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url" | cut -d" " -f1)
             paopaohost_list="$genHost_p1 $genHost_p2 $genHost_p3"
-            paopaohost=$(echo "$paopaohost_list" | grep "$IPREX4" | head -1)
+            paopaohost=$(echo "$paopaohost_list" | grep -E "$IPREX4" | head -1)
             if [ -z "$paopaohost" ]; then
                 log "Nslookup DNS failed: ""$down_url" warn
                 return 1
@@ -566,11 +516,7 @@ get_conf() {
                     sed 's/\r/\n/g' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/proxy-groups:/proxy-disable-groups:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
                 fi
             else
-                if [ -f /www/clash_core ]; then
-                    sed 's/\r/\n/g' "$file_down" >"/tmp/paopao_custom.yaml"
-                else
-                    sed 's/\r/\n/g' "$file_down" | grep -v "\- RULE-SET" >"/tmp/paopao_custom.yaml"
-                fi
+                sed 's/\r/\n/g' "$file_down" >"/tmp/paopao_custom.yaml"
             fi
             log "[Succ] Get ""$down_url" succ
             return 0
@@ -595,36 +541,23 @@ get_conf() {
                 rm "$ppsub_cpy"
             fi
             . /tmp/ppgw.ini 2>/dev/tty0
+            apply_defaults
             if [ "$dns_burn" != "no" ]; then
                 export dns_burn="yes"
-                if [ -n "$ex_dns" ]; then
-                    export ex_dns="$ex_dns"
-                else
-                    export ex_dns="223.5.5.5:53,1.0.0.1:53"
-                fi
-            fi
-            if [ -z "$dns_ip" ]; then
-                dns_ip="223.6.6.6"
-            fi
-            if [ -z "$dns_port" ]; then
-                dns_port="53"
+                export ex_dns="$ex_dns"
             fi
             export dns_ip="$dns_ip"
             export dns_port="$dns_port"
             ppgw -ppsub "$file_down_tmp" -output "$ppsub_output" >/dev/tty0 2>&1
+            if pidof clash >/dev/null 2>&1; then
+                rm -f /tmp/ppsub_reload_pending
+            elif [ ! -f /tmp/ppsub_reload_pending ]; then
+                : >/tmp/ppsub_reload_pending
+                log "Clash not up during ppsub; reload in 30s to complete subdns via proxy." warn
+                (sleep 30; pidof clash >/dev/null 2>&1 && /usr/bin/ppg.sh reload >/dev/tty0 2>&1) </dev/null >/dev/null 2>&1 &
+            fi
             if grep -q "proxies:" "$ppsub_output"; then
                 cp "$ppsub_output" "$ppsub_cpy"
-                ppsub_home="/etc/config/clash/clash-dashboard/ppsub_readonly/"
-                rm -rf "$ppsub_home"
-                mkdir -p "$ppsub_home"
-                if [ -z "$clash_web_password" ]; then
-                    clash_web_password="clashpass"
-                fi
-                ppsub_readkey_stamp=$(date +%s)$(cat /dev/urandom | tr -cd 'a-zA-Z0-9' | head -c 64)
-                echo "{\"ppsub_readkey\": \"$ppsub_readkey_stamp\"}" >"$ppsub_home"ppsub_readkey.json
-                ppsub_readkey=$(getsha256 "$ppsub_readkey_stamp""$(getsha256 "$clash_web_password")")
-                mkdir -p "$ppsub_home""$ppsub_readkey"
-                cp "$file_down_tmp" "$ppsub_home""$ppsub_readkey"/ppsub.json
                 return 0
             fi
         fi
@@ -678,6 +611,12 @@ try_conf() {
         return 0
     fi
 
+    if echo "$conf_name" | grep -qiE "^https?://"; then
+        log "Get ""$conf_name"" from remote URL"
+        get_conf "$conf_name" "$down_type"
+        return $?
+    fi
+
     if [ -n "$try_succ_host" ]; then
         log "Try[0] to get ""$conf_name"" from last succ way: ""http://""$try_succ_host":"$conf_port""/""$conf_name"
         get_conf "http://""$try_succ_host":"$conf_port""/""$conf_name" "$down_type"
@@ -709,7 +648,10 @@ try_conf() {
 }
 
 reload_gw() {
+    require_ini "reload_gw" || return 1
+    force_nft="$1"
     . /etc/profile
+    sync_ntp
     # ip_forward
     if sysctl -a 2>&1 | grep -qE "net\.ipv4\.ip_forward[ =]+1"; then
         log "[SYSCTL] Turn off net.ipv4.ip_forward..." warn
@@ -726,9 +668,7 @@ reload_gw() {
         sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1
     fi
     . /tmp/ppgw.ini 2>/dev/tty0
-    if [ -z "$udp_enable" ]; then
-        udp_enable="no"
-    fi
+    apply_defaults
 
     if [ -n "$mode" ]; then
         log "[MODE] : ""$mode" succ
@@ -749,131 +689,47 @@ reload_gw() {
         ip rule add fwmark 1 table 100
     fi
 
-    if [ -z "$fake_cidr" ]; then
-        fake_cidr="7.0.0.0/8"
-    fi
-
-    if [ -z "$dns_ip" ]; then
-        dns_ip="223.5.5.5"
-    fi
-
-    if [ -z "$dns_port" ]; then
-        dns_port="53"
-    fi
-    if [ -z "$openport" ]; then
-        openport="false"
-    else
-        if [ "$openport" = "yes" ]; then
-            openport="true"
-        else
-            openport="false"
-        fi
-    fi
-
-    if [ -z "$clash_web_port" ]; then
-        clash_web_port="80"
-    fi
-
-    if [ -z "$clash_web_password" ]; then
-        clash_web_password="clashpass"
-    fi
-
-    if [ -z "$mode" ]; then
-        mode="free"
-    fi
-
-    if [ -z "$socks5_ip" ]; then
-        socks5_ip=$gw
-    fi
-
-    if [ -z "$socks5_port" ]; then
-        socks5_port="7890"
-    fi
-
-    if [ -z "$yamlfile" ]; then
-        yamlfile="custom.yaml"
-    fi
-
-    if [ -z "$ovpnfile" ]; then
-        ovpnfile="custom.ovpn"
-    fi
-
-    if [ -z "$dns_burn" ]; then
-        dns_burn="no"
-    fi
-
-    if [ -z "$ex_dns" ]; then
-        ex_dns="223.5.5.5:53"
-    fi
-
-    fake_cidr_escaped=$(echo "$fake_cidr" | sed 's/\//\\\//g')
-    sed 's/\r/\n/g' /etc/config/clash/base.yaml >/tmp/clash_base.yaml
-    sed -i "s/{fake_cidr}/$fake_cidr_escaped/g" /tmp/clash_base.yaml
-    sed -i "s/{clash_web_port}/$clash_web_port/g" /tmp/clash_base.yaml
-    sed -i "s/{dns_ip}/$dns_ip/g" /tmp/clash_base.yaml
-    sed -i "s/{dns_port}/$dns_port/g" /tmp/clash_base.yaml
-    sed -i "s/{clash_web_password}/$(getsha256 "$clash_web_password")/g" /tmp/clash_base.yaml
-    if [ -n "$openport_auth" ]; then
-        sed -i "s/{openport}/false/g" /tmp/clash_base.yaml
-        sed -i "s/{bind_address}/127.0.0.1/g" /tmp/clash_base.yaml
-        sed -i 's/#auth//g' /tmp/clash_base.yaml
-        sed -i 's/#users:/users:/' /tmp/clash_base.yaml
-        auth_user=$(echo "$openport_auth" | cut -d: -f1)
-        auth_pass=$(echo "$openport_auth" | cut -d: -f2-)
-        sed -i "s|#  - username: username|  - username: $auth_user|" /tmp/clash_base.yaml
-        sed -i "s|#    password: password|    password: $auth_pass|" /tmp/clash_base.yaml
-    else
-        sed -i "s/{openport}/$openport/g" /tmp/clash_base.yaml
-        if [ "$openport" = "true" ]; then
-            sed -i "s/{bind_address}/0.0.0.0/g" /tmp/clash_base.yaml
-        else
-            sed -i "s/{bind_address}/127.0.0.1/g" /tmp/clash_base.yaml
-        fi
-    fi
+    # IPv6 TPROXY policy routing - only when this box runs IPv6 — same eth06 probe
     if grep -q -r eth06 /etc/config/network; then
-        sed -i 's/^ipv6: false$/ipv6: true/' /tmp/clash_base.yaml
-    fi
-    if [ -e "/tmp/clash.yaml" ]; then
-        rm "/tmp/clash.yaml"
-    fi
-    if [ "$mode" = "socks5" ]; then
-        sed -i "s/{clashmode}/global/g" /tmp/clash_base.yaml
-        sed 's/\r/\n/g' /etc/config/clash/socks5.yaml >/tmp/clash_socks5.yaml
-        sed -i "s/{socks5_ip}/$socks5_ip/g" /tmp/clash_socks5.yaml
-        sed -i "s/{socks5_port}/$socks5_port/g" /tmp/clash_socks5.yaml
-        if [ -n "$socks5_username" ] && [ -n "$socks5_password" ]; then
-            sed -i "s/#username: \"username\"/username: \"$socks5_username\"/" /tmp/clash_socks5.yaml
-            sed -i "s/#password: \"password\"/password: \"$socks5_password\"/" /tmp/clash_socks5.yaml
-        fi
-        ppgw -input /tmp/clash_socks5.yaml -input /tmp/clash_base.yaml -output /tmp/clash.yaml
-    fi
-    if [ "$mode" = "yaml" ]; then
-        try_conf "$yamlfile" "yaml"
-    fi
-    if [ "$mode" = "ovpn" ]; then
-        try_conf "$ovpnfile" "ovpn"
-        sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
-        sed -i "s/#interface-name/interface-name/g" /tmp/clash_base.yaml
-        cat /tmp/clash_base.yaml >/tmp/clash.yaml
-        kill_ovpn
-        load_ovpn
-    fi
-    if [ "$mode" = "suburl" ]; then
-        if echo "$suburl" | grep -q "//"; then
-            if [ -z "$subtime" ]; then
-                subtime="1d"
-            fi
-            if grep -q "proxies:" "/tmp/ppgw.yaml.down"; then
-                log "Sub yaml OK, skip get."
-            else
-                get_conf "$suburl" "yaml"
-            fi
+        if ip -6 route list table 100 2>&1 | grep -q local; then
+            log "[OK] table100 v6 OK." succ
         else
-            log "Bad suburl" warn
+            log "[ADD] Add v6 route table 100" warn
+            ip -6 route add local default dev lo table 100
+        fi
+        if ip -6 rule | grep -q "fwmark 0x1 lookup 100"; then
+            log "[OK] fwmark0x1 v6 OK." succ
+        else
+            log "[ADD] Add v6 fwmark lookup 100" warn
+            ip -6 rule add fwmark 1 table 100
         fi
     fi
 
     if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
+        sed 's/\r/\n/g' /etc/config/clash/base.yaml >/tmp/clash_base.yaml
+        sed -i "s/{dns_ip}/$dns_ip/g" /tmp/clash_base.yaml
+        sed -i "s/{dns_port}/$dns_port/g" /tmp/clash_base.yaml
+        if grep -q -r eth06 /etc/config/network; then
+            sed -i 's/^ipv6: false$/ipv6: true/' /tmp/clash_base.yaml
+        fi
+        if [ -e "/tmp/clash.yaml" ]; then
+            rm "/tmp/clash.yaml"
+        fi
+        if [ "$mode" = "yaml" ]; then
+            try_conf "$yamlfile" "yaml"
+        fi
+        if [ "$mode" = "suburl" ]; then
+            if echo "$suburl" | grep -q "//"; then
+                if grep -q "proxies:" "/tmp/ppgw.yaml.down"; then
+                    log "Sub yaml OK, skip get."
+                else
+                    get_conf "$suburl" "yaml"
+                fi
+            else
+                log "Bad suburl" warn
+            fi
+        fi
+
         if [ "$fast_node" = "yes" ]; then
             export clashmode=global
         else
@@ -887,22 +743,16 @@ reload_gw() {
             sed -i "s/{clashmode}/$clashmode/g" /tmp/clash_base.yaml
             ppgw -input /tmp/paopao_custom.yaml -input /tmp/clash_base.yaml -output /tmp/clash.yaml
         fi
-    fi
 
-    if [ "$mode" = "free" ]; then
-        sed -i "s/{clashmode}/direct/g" /tmp/clash_base.yaml
-        cat /tmp/clash_base.yaml >/tmp/clash.yaml
-    fi
-    log "Load clash config..." warn
-    if [ -z "$fast_node" ]; then
-        if [ "$clashmode" = "global" ]; then
-            fast_node=yes
-        else
-            fast_node=no
+        log "Load clash config..." warn
+        if [ -z "$fast_node" ]; then
+            if [ "$clashmode" = "global" ]; then
+                fast_node=yes
+            else
+                fast_node=no
+            fi
         fi
-    fi
-    # burn dns
-    if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
+        # burn dns
         if [ "$fast_node" = "yes" ]; then
             if [ "$dns_burn" = "yes" ]; then
                 ppgw -dnslist "$dns_ip"":""$dns_port"",""$ex_dns" -dnsinput /tmp/clash.yaml -output /tmp/clash_dnsburn.yaml >/dev/tty0
@@ -911,17 +761,129 @@ reload_gw() {
                 fi
             fi
         fi
+        if [ "$force_nft" = "force" ]; then
+            load_box force
+        else
+            load_box
+        fi
+        load_clash "$fast_node"
+    else
+        if pidof clash >/dev/null 2>&1; then
+            log "[KILL] Clash not needed in ""$mode"" mode, stop it." warn
+            kill_clash
+        fi
+        if [ "$mode" = "ovpn" ]; then
+            try_conf "$ovpnfile" "ovpn"
+            load_ovpn
+        fi
+        if [ "$force_nft" = "force" ]; then
+            load_box force
+        else
+            load_box
+        fi
     fi
-    load_clash "$fast_node" "$udp_enable"
 
 }
 
 if [ "$1" = "reload" ]; then
     log "Force reload gateway..." warn
-    try_conf "ppgw.ini" "ini"
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
+        apply_defaults
     fi
+    old_fake_cidr=$fake_cidr
+    old_udp_enable=$udp_enable
+    old_net_rec=$net_rec
+    old_pplog=$pplog
+    old_pplog_uuid=$pplog_uuid
+    old_mode=$mode
+    old_socks5_ip=$socks5_ip
+    old_socks5_port=$socks5_port
+    old_socks5_username=$socks5_username
+    old_socks5_password=$socks5_password
+    old_box=$box
+    old_clash_web_password=$clash_web_password
+    old_dns_ip=$dns_ip
+    old_dns_port=$dns_port
+    old_openport_auth=$openport_auth
+    old_admin_cidr=$admin_cidr
+    old_proxy_cidr=$proxy_cidr
+    old_max_rec=$max_rec
+    old_net_cleanday=$net_cleanday
+
+    if [ -f /tmp/sniffbox_running.ini ]; then
+        . /tmp/sniffbox_running.ini 2>/dev/tty0
+        apply_defaults
+        old_fake_cidr=$fake_cidr
+        old_udp_enable=$udp_enable
+        old_net_rec=$net_rec
+        old_pplog=$pplog
+        old_pplog_uuid=$pplog_uuid
+        old_mode=$mode
+        old_socks5_ip=$socks5_ip
+        old_socks5_port=$socks5_port
+        old_socks5_username=$socks5_username
+        old_socks5_password=$socks5_password
+        if [ -f /tmp/ppgw.ini ]; then . /tmp/ppgw.ini 2>/dev/tty0; apply_defaults; fi
+    fi
+
+    if ! try_conf "ppgw.ini" "ini"; then
+        log "Cannot get ppgw.ini, abort reload." warn
+        exit 1
+    fi
+    . /tmp/ppgw.ini 2>/dev/tty0
+    apply_defaults
+
+    # Detect sniffbox changes and reload.
+    need_cold_reload=0
+    if [ "$old_fake_cidr" != "$fake_cidr" ]; then
+        need_cold_reload=1
+        log "fake_cidr changed, cold reload box." warn
+    fi
+    if [ "$old_udp_enable" != "$udp_enable" ]; then
+        need_cold_reload=1
+        log "udp_enable changed, cold reload box." warn
+    fi
+    if [ "$old_net_rec" != "$net_rec" ]; then
+        need_cold_reload=1
+        log "net_rec changed, cold reload box." warn
+    fi
+    if [ "$old_pplog" != "$pplog" ] || [ "$old_pplog_uuid" != "$pplog_uuid" ]; then
+        need_cold_reload=1
+        log "pplog config changed, cold reload box." warn
+    fi
+    if [ "$old_mode" != "$mode" ]; then
+        mode_engine_changed=0
+        if [ "$old_mode" = "yaml" ] || [ "$old_mode" = "suburl" ]; then
+            if [ "$mode" != "yaml" ] && [ "$mode" != "suburl" ]; then
+                mode_engine_changed=1
+            fi
+        elif [ "$old_mode" = "ovpn" ]; then
+            if [ "$mode" != "ovpn" ]; then
+                mode_engine_changed=1
+            fi
+        else
+            mode_engine_changed=1
+        fi
+        if [ "$mode_engine_changed" = "1" ]; then
+            need_cold_reload=1
+            log "Mode engine changed from [""$old_mode""] to [""$mode""], cold reload box." warn
+        fi
+    fi
+    if [ "$mode" = "socks5" ]; then
+        if [ "$old_socks5_ip" != "$socks5_ip" ] || [ "$old_socks5_port" != "$socks5_port" ] || [ "$old_socks5_username" != "$socks5_username" ] || [ "$old_socks5_password" != "$socks5_password" ]; then
+            need_cold_reload=1
+            log "socks5 upstream/auth changed, cold reload box." warn
+        fi
+    fi
+
+    if [ "$need_cold_reload" = "1" ]; then
+        cold_reload_box
+    elif box_hot_changed; then
+        log "The box config has changed, hot reload box." warn
+        hot_reload_box
+    fi
+
     if [ "$mode" = "yaml" ]; then
         try_conf "$yamlfile" "yaml"
     fi
@@ -931,7 +893,8 @@ if [ "$1" = "reload" ]; then
     if [ "$mode" = "ovpn" ]; then
         try_conf "$ovpnfile" "ovpn"
     fi
-    reload_gw
+    export PPGW_FORCE_CLOSEALL=1
+    reload_gw force
     log "Force reload gateway finsished." warn
     exit
 fi
@@ -945,15 +908,49 @@ last_ovpn_hash="empty"
 while true; do
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
+        apply_defaults
         old_fake_cidr=$fake_cidr
         old_openport=$openport
-        old_clash_web_port=$clash_web_port
+        old_openport_auth=$openport_auth
         old_clash_web_password=$clash_web_password
         old_net_rec=$net_rec
         old_max_rec=$max_rec
         old_net_cleanday=$net_cleanday
+        old_box=$box
+        old_udp_enable=$udp_enable
+        old_dns_ip=$dns_ip
+        old_dns_port=$dns_port
+        old_pplog=$pplog
+        old_pplog_uuid=$pplog_uuid
+        old_admin_cidr=$admin_cidr
+        old_proxy_cidr=$proxy_cidr
+        old_socks5_ip=$socks5_ip
+        old_socks5_port=$socks5_port
+        old_socks5_username=$socks5_username
+        old_socks5_password=$socks5_password
+        old_mode=$mode
+        if [ -f /tmp/sniffbox_running.ini ]; then
+            . /tmp/sniffbox_running.ini 2>/dev/tty0
+            apply_defaults
+            old_fake_cidr=$fake_cidr
+            old_udp_enable=$udp_enable
+            old_net_rec=$net_rec
+            old_pplog=$pplog
+            old_pplog_uuid=$pplog_uuid
+            old_mode=$mode
+            old_socks5_ip=$socks5_ip
+            old_socks5_port=$socks5_port
+            old_socks5_username=$socks5_username
+            old_socks5_password=$socks5_password
+            . /tmp/ppgw.ini 2>/dev/tty0
+            apply_defaults
+        fi
     fi
-    try_conf "ppgw.ini" "ini"
+    if ! try_conf "ppgw.ini" "ini"; then
+        log "Failed to get ppgw.ini, retry later." warn
+        sleep 30
+        continue
+    fi
     hash=$(gen_hash)
     log "[OLD PPGW HASH]: ""$last_hash"
     log "[NEW PPGW HASH]: ""$hash"
@@ -962,35 +959,75 @@ while true; do
             log "The hash has changed, reload gateway." warn
             if [ -f /tmp/ppgw.ini ]; then
                 . /tmp/ppgw.ini 2>/dev/tty0
+                apply_defaults
             fi
+            need_kill_clash=0
+            need_cold_reload=0
+            cold_reload_done=0
             if [ "$old_fake_cidr" != "$fake_cidr" ]; then
-                kill_clash
-                kill_clash_cache
+                need_cold_reload=1
             fi
-            if [ "$old_openport" != "$openport" ]; then
-                kill_clash
-            fi
-            if [ "$old_clash_web_port" != "$clash_web_port" ]; then
-                kill_clash
-                kill_netrec
-            fi
-            if [ "$old_clash_web_password" != "$clash_web_password" ]; then
-                kill_clash
-                kill_netrec
+            if [ "$old_udp_enable" != "$udp_enable" ]; then
+                need_cold_reload=1
             fi
             if [ "$old_net_rec" != "$net_rec" ]; then
-                kill_netrec
+                need_cold_reload=1
             fi
-            if [ "$old_max_rec" != "$max_rec" ]; then
-                kill_netrec
+            if [ "$old_pplog" != "$pplog" ] || [ "$old_pplog_uuid" != "$pplog_uuid" ]; then
+                need_cold_reload=1
             fi
-            if [ "$old_net_cleanday" != "$net_cleanday" ]; then
-                kill_netrec
+            if [ "$old_mode" != "$mode" ]; then
+                mode_engine_changed=0
+                if [ "$old_mode" = "yaml" ] || [ "$old_mode" = "suburl" ]; then
+                    if [ "$mode" != "yaml" ] && [ "$mode" != "suburl" ]; then
+                        mode_engine_changed=1
+                        log "Leaving clash mode, stop clash." warn
+                        kill_clash
+                    fi
+                elif [ "$old_mode" = "ovpn" ]; then
+                    if [ "$mode" != "ovpn" ]; then
+                        mode_engine_changed=1
+                        log "Leaving ovpn mode; sniffbox will stop openvpn on cold reload." warn
+                    fi
+                else
+                    mode_engine_changed=1
+                fi
+                if [ "$mode_engine_changed" = "1" ]; then
+                    need_cold_reload=1
+                    log "Mode engine changed from [""$old_mode""] to [""$mode""], cold reload box." warn
+                else
+                    log "Mode changed within clash engine [""$old_mode""] -> [""$mode""], skip cold reload box." warn
+                fi
+            fi
+            if [ "$mode" = "socks5" ]; then
+                if [ "$old_socks5_ip" != "$socks5_ip" ] || [ "$old_socks5_port" != "$socks5_port" ] || [ "$old_socks5_username" != "$socks5_username" ] || [ "$old_socks5_password" != "$socks5_password" ]; then
+                    need_cold_reload=1
+                    log "socks5 upstream/auth changed, cold reload box." warn
+                fi
+            fi
+            if [ "$need_kill_clash" = "1" ]; then
+                kill_clash
+            fi
+            if [ "$need_cold_reload" = "1" ]; then
+                cold_reload_box
+                cold_reload_done=1
             fi
             if [ "$mode" = "suburl" ]; then
                 get_conf "$suburl" "yaml"
             fi
-            reload_gw
+            if box_hot_changed && [ "$cold_reload_done" != "1" ]; then
+                log "The box config has changed, hot reload box." warn
+                hot_reload_box
+            fi
+            nft_changed=0
+            if [ "$old_dns_ip" != "$dns_ip" ] || [ "$old_dns_port" != "$dns_port" ] || [ "$old_udp_enable" != "$udp_enable" ] || [ "$old_openport" != "$openport" ] || [ "$old_box" != "$box" ]; then
+                nft_changed=1
+            fi
+            if [ "$nft_changed" = "1" ]; then
+                reload_gw force
+            else
+                reload_gw
+            fi
             if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
                 if [ -f "/tmp/ppgw.yaml.down" ]; then
                     last_yaml_hash=$(gen_yaml_hash "/tmp/ppgw.yaml.down")
@@ -1004,6 +1041,11 @@ while true; do
     fi
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>/dev/tty0
+        apply_defaults
+        if box_hot_changed; then
+            log "The box config has changed, hot reload box." warn
+            hot_reload_box
+        fi
     fi
     if [ "$mode" = "yaml" ]; then
         try_conf "$yamlfile" "yaml"
@@ -1041,78 +1083,77 @@ while true; do
             fast_node=no
         fi
     fi
-    if ps | grep -v "grep" | grep "d /etc/config/clash"; then
-        log "Clash Running OK." succ
-        load_singbox
-        if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
-            ppgw -healthcheck "/tmp/ppsub.json" -apiurl="http://127.0.0.1:""$clash_web_port" -secret="$(getsha256 "$clash_web_password")" >/dev/tty0 2>&1
-            if [ $? -eq 0 ]; then
-                echo PPsub health check succ
-            else
-                log "PPsub: Try to update and reload..." warn
-                get_conf "$suburl" "yaml"
-                reload_gw
-            fi
-        fi
-        if [ "$fast_node" = "yes" ] || [ "$fast_node" = "check" ]; then
-            if [ -z "$test_node_url" ]; then
-                test_node_url="https://www.youtube.com/generate_204"
-            fi
-            proxytest=$(ppgw -testProxy http://127.0.0.1:1080 -test_node_url "$test_node_url")
-            if echo "$proxytest" | grep -q "success"; then
-                log "$proxytest" succ
-            else
-                log "Node Check Fail:""$proxytest" warn
-                log "Try to update and reload..." warn
-                if [ "$mode" = "ovpn" ]; then
-                    try_conf "$ovpnfile" "ovpn"
+    if [ "$mode" = "yaml" ] || [ "$mode" = "suburl" ]; then
+        load_box
+        if pidof clash >/dev/null 2>&1; then
+            log "Clash Running OK." succ
+            if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
+                ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >/dev/tty0 2>&1
+                if [ $? -eq 0 ]; then
+                    echo PPsub health check succ
+                else
+                    log "PPsub health check failed, close all connections." warn
+                    ppgw -closeall >/dev/tty0 2>&1
+                    log "PPsub: Try to update and reload..." warn
+                    get_conf "$suburl" "yaml" || log "Failed to update suburl, keep current config." warn
+                    reload_gw
+                    ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >/dev/tty0 2>&1
+                    if [ $? -ne 0 ]; then
+                        log "PPsub health check still failed after reload, try kill clash and reload." warn
+                        kill_clash
+                        load_clash no
+                    fi
                 fi
+            fi
+            do_proxytest=0
+            if [ "$fast_node" = "yes" ]; then
+                do_proxytest=1
+            elif [ "$fast_node" = "check" ]; then
+                # ppsub has its own global health check, skip fast_node=check proxy test
                 if [ "$mode" = "suburl" ]; then
-                    get_conf "$suburl" "yaml"
+                    if ! echo "$suburl" | grep -qEo "^ppsub@"; then
+                        do_proxytest=1
+                    fi
+                else
+                    do_proxytest=1
                 fi
-                reload_gw
             fi
+            if [ "$do_proxytest" -eq 1 ]; then
+                proxytest=$(ppgw -testProxy -test_node_url "$test_node_url")
+                if echo "$proxytest" | grep -q "success"; then
+                    log "$proxytest" succ
+                else
+                    log "Node Check Fail:""$proxytest" warn
+                    log "Try to update and reload..." warn
+                    if [ "$mode" = "suburl" ]; then
+                        get_conf "$suburl" "yaml" || log "Failed to update suburl, keep current config." warn
+                    fi
+                    reload_gw
+                fi
+            fi
+        else
+            log "Try to run Clash again..." warn
+            if [ "$mode" = "suburl" ]; then
+                get_conf "$suburl" "yaml" || log "Failed to update suburl, keep current config." warn
+            fi
+            if [ "$mode" = "yaml" ]; then
+                try_conf "$yamlfile" "yaml"
+            fi
+            load_clash $fast_node
         fi
     else
-        log "Try to run Clash again..." warn
-        if [ "$mode" = "ovpn" ]; then
-            try_conf "$ovpnfile" "ovpn"
-        fi
-        if [ "$mode" = "suburl" ]; then
-            get_conf "$suburl" "yaml"
-        fi
-        if [ "$mode" = "yaml" ]; then
-            try_conf "$yamlfile" "yaml"
-        fi
-        load_clash $fast_node $udp_enable
-    fi
-    if [ "$net_rec" = "yes" ]; then
-        load_netrec
-        need_clean_rec=$(ppgw -input_cleanday "$net_cleanday")
-        if [ "$need_clean_rec" = "1" ]; then
-            log "$(date +%Y-%m-%d) is the day to clean network records." warn
-            log "Clean all network records now." warn
-            rm -rf /etc/config/clash/clash-dashboard/rec_data/*
-        fi
-    fi
-    if [ -z "$sleeptime" ] || [ "$sleeptime" -lt 30 ] || ! echo "$sleeptime" | grep -Eq '^[0-9]+$'; then
-        sleeptime=30
+        log "Box mode ""$mode"", ensure box running." succ
+        load_box
     fi
     if [ -f /tmp/ppgw.ini ]; then
-        if [ -f /tmp/allnode.failed ] && [ "$fast_node" = "yes" ]; then
-            rm /tmp/allnode.failed
-        else
-            log "Same hash. Sleep ""$sleeptime""s."
-            sleep "$sleeptime"
-            sleep_count=$((sleep_count + 1))
-        fi
+        log "Same hash. Sleep 30s."
+        sleep 30
+        sleep_count=$((sleep_count + 1))
     fi
     if [ "$mode" = "suburl" ]; then
         if [ -f /tmp/ppgw.ini ]; then
             . /tmp/ppgw.ini 2>/dev/tty0
-        fi
-        if [ -z "$subtime" ]; then
-            subtime="1d"
+            apply_defaults
         fi
         # ppgw apply subtime/subcron
         current_hour=$(date +%H)
@@ -1123,7 +1164,7 @@ while true; do
             if [ "$current_hour" -lt "$subcron" ]; then
                 next_run=$(date +"%Y-%m-%d ${subcron}:XX")
             else
-                tomorrow=$(date +%Y-%m-%d -d @$(($(date +%s) + 86400)) 2>/dev/null || date -v+1d +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+                tomorrow=$(date +%Y-%m-%d -d @$(($(date +%s) + 86400)) 2>/dev/null || date -v+1d +%Y-%m-%d 2>/dev/null)
                 next_run="${tomorrow} ${subcron}:XX"
             fi
             log "[SUBCRON][NEXT SUB-TIME] ""$next_run""" warn
@@ -1135,7 +1176,7 @@ while true; do
             fi
         else
             subcron=""
-            ppgw_subtime=$(ppgw -interval "$subtime" -sleeptime "$sleeptime")
+            ppgw_subtime=$(ppgw -interval "$subtime" -sleeptime 30)
             log "[SUBTIME][NEXT SUB-TIME] ""$sleep_count""/""$ppgw_subtime"""
         fi
         if [ "$sleep_count" -ge "$ppgw_subtime" ]; then
@@ -1144,7 +1185,11 @@ while true; do
             log "Apply suburl to get new subscription..." warn
             old_sub_yaml_hash=$(gen_yaml_hash "/tmp/ppgw.yaml.down")
             log "[OLD SUB YAML HASH]: ""$old_sub_yaml_hash"
-            get_conf "$suburl" "yaml"
+            if ! get_conf "$suburl" "yaml"; then
+                log "Failed to get subscription, retry later." warn
+                sleep_count=$((ppgw_subtime / 2))
+                continue
+            fi
             new_sub_yaml_hash=$(gen_yaml_hash "/tmp/ppgw.yaml.down")
             log "[NEW SUB YAML HASH]: ""$new_sub_yaml_hash"
             if [ "$old_sub_yaml_hash" != "$new_sub_yaml_hash" ]; then

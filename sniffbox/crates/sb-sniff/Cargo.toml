@@ -1,0 +1,26 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+
+[package]
+name          = "sb-sniff"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+
+[dependencies]
+bytes       = { workspace = true }
+httparse    = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+parking_lot = { workspace = true }
+dashmap     = { workspace = true }
+
+aes         = "0.8"
+aes-gcm     = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf        = "0.12"
+sha2        = { workspace = true }
+
+[dev-dependencies]
+hex       = { workspace = true }
+criterion = { workspace = true }

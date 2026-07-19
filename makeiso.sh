@@ -9,23 +9,25 @@ if [ -f "$builddir""/sha.txt" ]; then
     sed -i '/.*psmisc.*/s/.*/-psmisc/' "$builddir"/pkg.conf
 fi
 
-# build ppgw
-if [ -f "$builddir"/FILES/usr/bin/ppgw ]; then
-    rm "$builddir"/FILES/usr/bin/ppgw
-fi
-docker pull golang:alpine
-docker run --rm --name gobuilder \
-    -v "$builddir"/ppgw.go:/go/main.go \
-    -v "$builddir"/FILES/usr/bin/:/go/ppgw/ \
-    -v "$builddir"/buildppgw.sh:/go/build/buildppgw.sh \
-    golang:alpine sh /go/build/buildppgw.sh
-
-if [ -f "$builddir""/FILES/usr/bin/ppgw" ]; then
-    echo "ppgw compilation OK."
+rm -f "$builddir"/FILES/usr/bin/sniffbox
+docker pull rust:alpine
+docker run --rm --name rustbuilder \
+    -v "$builddir"/FILES/usr/bin/:/app/ \
+    -v "$builddir"/buildbox.sh:/sh/buildbox.sh \
+    -v "$builddir"/sniffbox:/box \
+    rust:alpine sh /sh/buildbox.sh
+if [ -f "$builddir""/FILES/usr/bin/sniffbox" ]; then
+    echo "sniffbox compilation OK."
 else
-    echo "ppgw compilation failed."
+    echo "sniffbox compilation failed."
     exit
 fi
+cat >"$builddir"/FILES/usr/bin/ppgw <<'PPGWEOF'
+#!/bin/sh
+exec /usr/bin/sniffbox ppgw "$@"
+PPGWEOF
+chmod +x "$builddir"/FILES/usr/bin/ppgw
+echo "ppgw -> sniffbox wrapper created."
 
 echo "make iso files..."
 docker pull sliamb/opbuilder
@@ -48,23 +50,31 @@ docker run --rm --name opbuilder \
 echo "make docker files..."
 rootsha=$(head -1 "$builddir""/iso/rootsha.txt")
 echo "docker rootsha: ""$rootsha"
+rm -f "$builddir"/iso/paopao-gateway-x86-64.iso
 sed "s/rootsha/$rootsha/g" "$builddir"/Dockerfile >"$builddir"/iso/Dockerfile
 cp "$builddir"/remakeiso.sh "$builddir"/iso/
 sed -i "s/PPGW_version/$ppgwver/g" "$builddir"/iso/remakeiso.sh
-if [ -f "$builddir""/sha.txt" ]; then
-    ls -lah "$builddir"/iso/
-else
-    cd "$builddir"/iso || exit
-    docker build -t ppgwiso .
-fi
+cd "$builddir"/iso || exit
+docker build -t ppgwiso .
+
+echo "generate final iso via docker..."
+docker run --rm --name ppgwiso_final \
+    -e MI=y \
+    -e GEO=yes \
+    -v "$builddir"/iso:/data \
+    ppgwiso
 
 echo "make sha256hashsum.txt ..."
-isofilename=paopao-gateway-x86-64"$sha".iso
-mv "$builddir"/iso/*.iso "$builddir"/iso/"$isofilename"
+isofile=$(ls "$builddir"/iso/ppgw-r*.iso 2>/dev/null | head -1)
+if [ -z "$isofile" ]; then
+    echo "Final ISO not found."
+    exit 1
+fi
+isofilename=$(basename "$isofile")
 beijing_time=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
 sha256hashsumfile="$builddir"/iso/sha256hashsum.txt
 echo "$beijing_time" >"$sha256hashsumfile"
-ls -lah "$builddir"/iso/paopao-gateway*.iso | grep iso >>"$sha256hashsumfile"
+ls -lah "$builddir"/iso/ppgw-r*.iso | grep iso >>"$sha256hashsumfile"
 echo "   " >>"$sha256hashsumfile"
 echo "Linux shell:" >>"$sha256hashsumfile"
 echo "   sha256sum ""$isofilename" >>"$sha256hashsumfile"
@@ -72,7 +82,7 @@ echo "Windows Powershell: " >>"$sha256hashsumfile"
 echo "  Get-FileHash ""$isofilename" >>"$sha256hashsumfile"
 echo "SHA256SUM:   " >>"$sha256hashsumfile"
 cd "$builddir"/iso || exit
-sha256sum paopao-gateway*.iso >>"$sha256hashsumfile"
+sha256sum "$isofilename" >>"$sha256hashsumfile"
 ls -lah "$sha256hashsumfile"
 
 if [ -f "$builddir""/sha.txt" ]; then

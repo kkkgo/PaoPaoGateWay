@@ -1,0 +1,46 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+
+[package]
+name          = "sniffbox"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+
+[[bin]]
+name = "sniffbox"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror          = { workspace = true }
+time               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true, features = ["raw_value"] }
+chacha20poly1305   = { workspace = true }
+sha2               = { workspace = true }
+hex                = { workspace = true }
+arc-swap           = { workspace = true }
+dashmap            = { workspace = true }
+libc               = { workspace = true }
+parking_lot        = { workspace = true }
+ipnet              = { workspace = true }
+nix                = { workspace = true }
+httparse           = { workspace = true }
+
+sb-tproxy   = { workspace = true }
+sb-sniff    = { workspace = true }
+sb-outbound = { workspace = true }
+sb-stats    = { workspace = true }
+sb-dns      = { workspace = true }
+sb-web      = { workspace = true }
+sb-ppgw     = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+serde_json = { workspace = true }
+sb-dns     = { workspace = true }

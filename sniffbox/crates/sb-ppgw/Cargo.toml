@@ -1,0 +1,27 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+
+[package]
+name          = "sb-ppgw"
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+
+[dependencies]
+thiserror  = { workspace = true }
+libc       = { workspace = true }
+httparse   = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+yaml-rust2 = { workspace = true }
+sb-dns     = { workspace = true }
+ureq       = { workspace = true }
+regex-lite = { workspace = true }
+time       = { workspace = true }
+rustls     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

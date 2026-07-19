@@ -1,8 +1,0 @@
-proxies:
-  - name: "ppgwsocks"
-    type: socks5
-    server: "{socks5_ip}"
-    port: {socks5_port}
-    udp: true
-    #username: "username"
-    #password: "password"

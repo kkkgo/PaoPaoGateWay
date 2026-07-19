@@ -4,62 +4,6 @@ IPREX6="^[0-9a-fA-F]{4}:[0-9a-fA-F:]+"
 
 echo iso builder version: PPGW_version
 echo run docker pull to fetch the latest image.
-json='
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "experimental": {
-    "clash_api": {
-      "external_controller": "127.0.0.1:82",
-      "external_ui": "/etc/config/clash/clash-dashboard",
-      "secret": "paopaogateway",
-      "default_mode": "rule"
-    }
-  },
-  "inbounds": [
-    {
-      "type": "tproxy",
-      "tag": "sniff",
-      "listen": "127.0.0.1",
-      "listen_port": 1081,
-      "sniff": true,
-      "sniff_override_destination": true,
-      "sniff_timeout": "300ms"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "socks",
-      "tag": "clash",
-      "server": "127.0.0.1",
-      "server_port": 1080,
-      "version": "5",
-      "domain_strategy": ""
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "protocol": "bittorrent",
-        "outbound": "block"
-      },
-      {
-        "outbound": "clash"
-      }
-    ],
-    "final": "clash"
-  }
-}'
 patch() {
   echo -e "\e[32m[Patch]\e[0m $*"
 }
@@ -88,39 +32,24 @@ gunzip -c initrd.gz | cpio -idmv >/dev/null 2>&1
 rm initrd.gz
 root=$cdroot/rootfs
 
-if [ "$SNIFF" = "yes" ] || [ "$SNIFF" = "dns" ] || [ "$sniff" = "yes" ] || [ "$sniff" = "dns" ]; then
-  patch sniff=yes ...
-  mkdir -p $root"/etc/config/sing-box"
-  echo "$json" >$root"/etc/config/sing-box/sniff.json"
-  sed -i 's/1082/1081/g' $root"/usr/bin/nft.sh"
-  sed -i 's/1082/1081/g' $root"/usr/bin/nft_tcp.sh"
-  cp /sing-box $root"/usr/bin/"
-  # drop udp 443 for quic sniffing
-  sed -i 's/#forsniff//g' $root"/usr/bin/nft.sh"
-fi
-
 patchclash=0
 if [ -f /data/clash ]; then
   ls /data/clash -lah
   patch clash ...
-  touch $root"/www/clash_core"
   cp /data/clash $root"/usr/bin/"
   chmod +x $root"/usr/bin/clash"
   patchclash=1
   $root"/usr/bin/clash" -v
 else
-  if [ -n "$MI" ]; then
-    ver=mihomo_compatible
-    if [ "$MI" = "3" ]; then
-      ver=mihomo_v3
-    fi
-    patch Use the embedded Mihomo ..."$ver"
-    touch $root"/www/clash_core"
-    cp /clash/$ver $root"/usr/bin/clash"
-    chmod +x $root"/usr/bin/clash"
-    patchclash=1
-    $root"/usr/bin/clash" -v
+  ver=mihomo_compatible
+  if [ "$MI" = "3" ]; then
+    ver=mihomo_v3
   fi
+  patch Use the embedded Mihomo ..."$ver"
+  cp /clash/$ver $root"/usr/bin/clash"
+  chmod +x $root"/usr/bin/clash"
+  patchclash=1
+  $root"/usr/bin/clash" -v
 fi
 if [ -f /data/network.ini ]; then
   ls -lah /data/network.ini
@@ -153,6 +82,8 @@ if [ -f /data/network.ini ]; then
   elif checkv6 "$ip6" && checkv6 "$gw6"; then
     ipv6_mode="static"
     patch "IPv6 static : ip6=$ip6 gw6=$gw6"
+  elif [ -n "$ula" ]; then
+    patch "WARNING: ULA is set but no IPv6 (ip6/gw6) configured. ULA alone usually needs an upstream IPv6, suggest setting ip6=auto."
   else
     patch "No IPv6 configuration, IPv6 will be disabled."
   fi
@@ -182,7 +113,7 @@ config interface 'eth0'
 	option proto 'dhcp'
 EOF
   fi
-  if [ -z "$ipv6_mode" ]; then
+  if [ -z "$ipv6_mode" ] && [ -z "$ula" ]; then
     echo "	option ipv6 '0'" >>"$network_config"
     rm -rf "$root"/etc/odhcp6c.user
     rm -rf "$root"/etc/odhcp6c.user.d
@@ -211,20 +142,35 @@ config interface 'eth06'
 	option ip6gw '$gw6'
 EOF
   fi
+  if [ -n "$ula" ]; then
+    patch "Custom ULA configuration detected: $ula"
+    cat >>"$network_config" <<EOF
+
+config interface 'eth06u'
+	option device 'eth0'
+	option proto 'static'
+	option ip6addr '$ula'
+EOF
+  fi
   if [ -n "$localnet" ]; then
     patch "Custom localnet configuration detected: $localnet"
     reserved_ips="0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4, 240.0.0.0-255.255.255.255"
     full_localnet="$reserved_ips, $localnet"
     # Patch nft.sh
-    sed -i '/set localnetwork/,/}/ {
+    sed -i '/set localnetwork {/,/}/ {
       /elements = {/,/}/c\
                 elements = { '"$full_localnet"' }
     }' "$root/usr/bin/nft.sh"
-    # Patch nft_tcp.sh
-    sed -i '/set localnetwork/,/}/ {
+  fi
+  if [ -n "$localnet6" ]; then
+    patch "Custom localnet6 configuration detected: $localnet6"
+    reserved_ips6="::1/128, ::/128, fe80::/10, fc00::/7, ff00::/8"
+    full_localnet6="$reserved_ips6, $localnet6"
+    # Patch nft.sh
+    sed -i '/set localnetwork6/,/}/ {
       /elements = {/,/}/c\
-                elements = { '"$full_localnet"' }
-    }' "$root/usr/bin/nft_tcp.sh"
+                elements = { '"$full_localnet6"' }
+    }' "$root/usr/bin/nft.sh"
   fi
 fi
 
@@ -251,7 +197,7 @@ fi
 if [ -f /data/custom.ovpn ]; then
   ls -lah /data/custom.ovpn
   patch custom.ovpn ...
-  cp /data/custom.ovpn $root"/www/custom.ovpn"
+  sed 's/\r$//' /data/custom.ovpn >$root"/www/custom.ovpn"
 fi
 if [ -f /data/ppsub.json ]; then
   ls -lah /data/ppsub.json
@@ -263,15 +209,6 @@ if ls /data/*.dat 1>/dev/null 2>&1; then
   removegeoip
   patchgeo=1
   for f in /data/*.dat; do
-    ls -lah "$f"
-    cp "$f" "$root/etc/config/clash/$(basename "$f")"
-  done
-fi
-
-if ls /data/*.metadb 1>/dev/null 2>&1; then
-  removegeoip
-  patchgeo=1
-  for f in /data/*.metadb; do
     ls -lah "$f"
     cp "$f" "$root/etc/config/clash/$(basename "$f")"
   done
@@ -295,7 +232,7 @@ else
       cp /geodata/GeoSite.dat $root"/etc/config/clash/GeoSite.dat"
       cp /geodata/GeoIP.dat $root"/etc/config/clash/GeoIP.dat"
       cp /geodata/ASN.mmdb $root"/etc/config/clash/ASN.mmdb"
-      cp /geodata/geoip.metadb $root"/etc/config/clash/geoip.metadb"
+      cp /geodata/update.log $root"/etc/config/clash/update.log"
       removegeoip
     fi
   fi

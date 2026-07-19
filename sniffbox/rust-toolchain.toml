@@ -1,0 +1,6 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+
+[toolchain]
+channel    = "stable"
+components = ["rustfmt", "clippy"]
+targets    = ["x86_64-unknown-linux-musl"]
