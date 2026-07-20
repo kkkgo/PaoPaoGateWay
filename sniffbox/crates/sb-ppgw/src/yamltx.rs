@@ -64,7 +64,8 @@ pub fn dns_burn(
 
     let sub_specs = crate::dohdot::extract_dns_servers(&doc["dns"]);
     let sub_resolved = if !sub_specs.is_empty() {
-        resolve_subdns_batch(&domains, &sub_specs, ipv6_enabled)
+        let got = resolve_subdns_batch(&domains, &sub_specs, ipv6_enabled);
+        crate::ppsub::proxies::subtract_known(got, &ex_resolved, "subdns")
     } else {
         std::collections::HashMap::new()
     };

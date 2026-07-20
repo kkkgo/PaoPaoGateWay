@@ -64,7 +64,7 @@ pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) 
 
     if dns_burn {
         for r in sub_results.iter().filter(|r| r.success) {
-            sub_subdns_burn(r, ipv6, &mut used, &mut all);
+            sub_subdns_burn(r, ipv6, &resolved, &mut used, &mut all);
         }
     }
 
@@ -140,7 +140,13 @@ fn burn_proxy(
     }
 }
 
-fn sub_subdns_burn(r: &SubResult, ipv6: bool, used: &mut HashSet<String>, all: &mut Vec<Yaml>) {
+fn sub_subdns_burn(
+    r: &SubResult,
+    ipv6: bool,
+    burn: &HashMap<String, Vec<IpAddr>>,
+    used: &mut HashSet<String>,
+    all: &mut Vec<Yaml>,
+) {
     let specs = sub_dns_servers(&r.raw_yaml);
     if specs.is_empty() {
         return;
@@ -167,11 +173,13 @@ fn sub_subdns_burn(r: &SubResult, ipv6: bool, used: &mut HashSet<String>, all: &
     let resolved = resolve_domains_concurrent(&domains, &specs, ipv6);
     log_resolved(&format!("[{}] subdns", r.name), &domains, &resolved);
 
+    let unique = subtract_known(resolved, burn, &format!("[{}] subdns", r.name));
+
     for p in &r.proxies {
         let Some(server) = p["server"].as_str() else {
             continue;
         };
-        let Some(ips) = resolved.get(server) else {
+        let Some(ips) = unique.get(server) else {
             continue;
         };
         let Some(ph) = p.as_hash() else {
@@ -188,6 +196,36 @@ fn sub_subdns_burn(r: &SubResult, ipv6: bool, used: &mut HashSet<String>, all: &
             all.push(Yaml::Hash(np));
         }
     }
+}
+
+pub(crate) fn subtract_known(
+    resolved: HashMap<String, Vec<IpAddr>>,
+    known: &HashMap<String, Vec<IpAddr>>,
+    tag: &str,
+) -> HashMap<String, Vec<IpAddr>> {
+    let mut out = HashMap::new();
+    for (domain, ips) in resolved {
+        let total = ips.len();
+        let empty: Vec<IpAddr> = Vec::new();
+        let already = known.get(&domain).unwrap_or(&empty);
+        let uniq: Vec<IpAddr> = ips.into_iter().filter(|ip| !already.contains(ip)).collect();
+        if uniq.is_empty() {
+            if total > 0 {
+                pp_log(&format!(
+                    "{tag}: {domain} -> all {total} IP already covered by dns_burn, no @subdns node"
+                ));
+            }
+            continue;
+        }
+        if uniq.len() < total {
+            pp_log(&format!(
+                "{tag}: {domain} -> {} of {total} IP unique to sub's own DNS",
+                uniq.len()
+            ));
+        }
+        out.insert(domain, uniq);
+    }
+    out
 }
 
 fn sub_dns_servers(raw_yaml: &str) -> Vec<String> {
@@ -319,6 +357,27 @@ mod tests {
     }
 
     #[test]
+    fn subtract_known_keeps_only_unique_ips() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "a.com".to_string(),
+            vec![ip("1.1.1.1"), ip("2.2.2.2"), ip("3.3.3.3")],
+        );
+        resolved.insert("b.com".to_string(), vec![ip("4.4.4.4")]);
+        resolved.insert("c.com".to_string(), vec![ip("5.5.5.5")]);
+
+        let mut known = HashMap::new();
+        known.insert("a.com".to_string(), vec![ip("1.1.1.1"), ip("3.3.3.3")]);
+        known.insert("b.com".to_string(), vec![ip("4.4.4.4")]);
+
+        let out = subtract_known(resolved, &known, "test");
+        assert_eq!(out.get("a.com"), Some(&vec![ip("2.2.2.2")]), "{out:?}");
+        assert_eq!(out.get("b.com"), None, "fully covered domain is dropped");
+        assert_eq!(out.get("c.com"), Some(&vec![ip("5.5.5.5")]), "{out:?}");
+    }
+
+    #[test]
     fn subdns_node_name() {
         let used = HashSet::new();
         assert_eq!(
@@ -393,7 +452,7 @@ mod tests {
         used.insert("S_HK".to_string());
         let mut all = vec![node("S_HK", "hk.example.com")];
 
-        sub_subdns_burn(&r, false, &mut used, &mut all);
+        sub_subdns_burn(&r, false, &HashMap::new(), &mut used, &mut all);
         stop.store(true, Ordering::Relaxed);
         let _ = h.join();
 
@@ -459,7 +518,7 @@ mod tests {
             node("HK02", "hk.example.com"),
         ];
 
-        sub_subdns_burn(&r, false, &mut used, &mut all);
+        sub_subdns_burn(&r, false, &HashMap::new(), &mut used, &mut all);
         stop.store(true, Ordering::Relaxed);
         let _ = h.join();
 
