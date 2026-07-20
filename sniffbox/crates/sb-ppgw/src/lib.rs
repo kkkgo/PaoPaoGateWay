@@ -5,6 +5,7 @@ pub mod clashup;
 pub mod dnsutil;
 pub mod dohdot;
 pub mod download;
+pub mod fallback;
 pub mod geo;
 pub mod goflag;
 pub mod hashutil;

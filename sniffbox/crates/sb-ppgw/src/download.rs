@@ -89,6 +89,14 @@ impl Downloader {
             }
         }
 
+        let mut configured = crate::fallback::configured_servers();
+        configured.extend(primary_dns_server());
+        for server in crate::fallback::servers(&configured) {
+            if let Some(info) = self.resolve_and_race("fallback", &host, server, ipv6) {
+                return Ok(info);
+            }
+        }
+
         log_get("Trying Socks5 Proxy 127.0.0.1:1080...");
         match self.attempt("socks5h://127.0.0.1:1080") {
             Ok(info) => {

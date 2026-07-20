@@ -106,7 +106,7 @@ pub fn agent_with_dns(server: SocketAddr, ua: &str, timeout: Duration, ipv6: boo
 
 #[derive(Debug)]
 struct StaticResolver {
-    ip: IpAddr,
+    ips: Vec<IpAddr>,
 }
 
 impl Resolver for StaticResolver {
@@ -124,12 +124,22 @@ impl Resolver for StaticResolver {
                 80
             });
         let mut result = self.empty();
-        result.push(SocketAddr::new(self.ip, port));
-        Ok(result)
+        for ip in &self.ips {
+            result.push(SocketAddr::new(*ip, port));
+        }
+        if result.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(result)
+        }
     }
 }
 
 pub fn agent_with_ip(ip: IpAddr, ua: &str, timeout: Duration) -> Agent {
+    agent_with_ips(vec![ip], ua, timeout)
+}
+
+pub fn agent_with_ips(ips: Vec<IpAddr>, ua: &str, timeout: Duration) -> Agent {
     let config = Config::builder()
         .tls_config(TlsConfig::builder().disable_verification(true).build())
         .http_status_as_error(false)
@@ -137,7 +147,7 @@ pub fn agent_with_ip(ip: IpAddr, ua: &str, timeout: Duration) -> Agent {
         .timeout_global(Some(timeout))
         .user_agent(ua.to_string())
         .build();
-    Agent::with_parts(config, DefaultConnector::default(), StaticResolver { ip })
+    Agent::with_parts(config, DefaultConnector::default(), StaticResolver { ips })
 }
 
 pub fn status_ok(code: u16, expected: &str) -> bool {

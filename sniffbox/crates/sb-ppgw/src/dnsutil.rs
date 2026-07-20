@@ -3,6 +3,7 @@
 use regex_lite::Regex;
 use sb_dns::message::{self, TYPE_A, TYPE_AAAA};
 use std::collections::{BTreeSet, HashSet};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -66,7 +67,20 @@ pub fn nslookup(host: &str, server: &str, port: i64, ipv6_enabled: bool) -> Opti
         }
     }
 
-    system_resolve(host, ipv6_enabled)
+    if let Some(ip) = system_resolve(host, ipv6_enabled) {
+        return Some(ip);
+    }
+
+    let mut configured = crate::fallback::configured_servers();
+    if let Some(addr) = server_addr(server, port) {
+        configured.push(addr);
+    }
+    for addr in crate::fallback::servers(&configured) {
+        if let Some(ip) = query_one(host, addr, ipv6_enabled) {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 fn query_one(host: &str, addr: SocketAddr, ipv6_enabled: bool) -> Option<IpAddr> {
@@ -137,7 +151,7 @@ fn lookup_hosts_in(content: &str, host: &str, ipv6_enabled: bool) -> Option<IpAd
 pub fn resolve_domain_ips(domain: &str, dns_servers: &[String], ipv6_enabled: bool) -> Vec<IpAddr> {
     let mut set = query_servers(domain, dns_servers, ipv6_enabled);
     if set.is_empty() {
-        let fallback = ["223.5.5.5".to_string(), "1.0.0.1".to_string()];
+        let fallback = crate::fallback::server_strings(dns_servers);
         set = query_servers(domain, &fallback, ipv6_enabled);
     }
     set.into_iter().collect()
@@ -176,22 +190,30 @@ fn query_servers(domain: &str, servers: &[String], ipv6_enabled: bool) -> BTreeS
         };
         if let Some(resp) = query(domain, addr, TYPE_A) {
             for ip in resp.v4 {
-                if !ip.is_loopback() {
-                    set.insert(IpAddr::V4(ip));
-                }
+                keep_usable(domain, IpAddr::V4(ip), &mut set);
             }
         }
         if ipv6_enabled {
             if let Some(resp) = query(domain, addr, TYPE_AAAA) {
                 for ip in resp.v6 {
-                    if !ip.is_loopback() {
-                        set.insert(IpAddr::V6(ip));
-                    }
+                    keep_usable(domain, IpAddr::V6(ip), &mut set);
                 }
             }
         }
     }
     set
+}
+
+fn keep_usable(domain: &str, ip: IpAddr, set: &mut BTreeSet<IpAddr>) {
+    if crate::fallback::is_usable_node_ip(ip) {
+        set.insert(ip);
+    } else {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}{domain} -> {ip} discarded (fakeip/reserved)",
+            crate::term::orange("[PaoPaoGW DNS]")
+        );
+    }
 }
 
 pub fn resolve_host_via(host: &str, server: SocketAddr, ipv6_enabled: bool) -> Vec<IpAddr> {
