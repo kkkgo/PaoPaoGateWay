@@ -204,37 +204,14 @@ if [ -f /data/ppsub.json ]; then
   patch ppsub.json ...
   cp /data/ppsub.json $root"/www/ppsub.json"
 fi
-patchgeo=0
-if ls /data/*.dat 1>/dev/null 2>&1; then
-  removegeoip
-  patchgeo=1
-  for f in /data/*.dat; do
-    ls -lah "$f"
-    cp "$f" "$root/etc/config/clash/$(basename "$f")"
-  done
-fi
-
-if ls /data/*.mmdb 1>/dev/null 2>&1; then
-  removegeoip
-  patchgeo=1
-  for f in /data/*.mmdb; do
-    ls -lah "$f"
-    cp "$f" "$root/etc/config/clash/$(basename "$f")"
-  done
-fi
-
-if [ $patchgeo -eq 1 ]; then
-  touch $root"/www/clash_geo"
-else
-  if [ $patchclash -eq 1 ]; then
-    if [ "$GEO" = "yes" ] || [ "$geo" = "yes" ]; then
-      patch Add geo data ...
-      cp /geodata/GeoSite.dat $root"/etc/config/clash/GeoSite.dat"
-      cp /geodata/GeoIP.dat $root"/etc/config/clash/GeoIP.dat"
-      cp /geodata/ASN.mmdb $root"/etc/config/clash/ASN.mmdb"
-      cp /geodata/update.log $root"/etc/config/clash/update.log"
-      removegeoip
-    fi
+if [ $patchclash -eq 1 ]; then
+  if [ "$GEO" = "yes" ] || [ "$geo" = "yes" ]; then
+    patch Add geo data ...
+    cp /geodata/GeoSite.dat $root"/etc/config/clash/GeoSite.dat"
+    cp /geodata/GeoIP.dat $root"/etc/config/clash/GeoIP.dat"
+    cp /geodata/ASN.mmdb $root"/etc/config/clash/ASN.mmdb"
+    cp /geodata/update.log $root"/etc/config/clash/update.log"
+    removegeoip
   fi
 fi
 

@@ -20,7 +20,7 @@ PaoPao GateWay是一个体积小巧、稳定强大的FakeIP网关，核心由Rus
 *注意：如果节点数量很多或者连接数很多或者你的配置文件比较复杂的话，建议适当增加内存和CPU核心数*
   
 #### 方式一：使用docker内嵌配置
-你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash/mihomo核心、替换Geo数据文件、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
+你可以使用Docker一键定制ISO镜像，其中包括为ISO**配置静态IP**、替换Clash/mihomo核心、内嵌ppgw.ini等功能，**详情见使用Docker定制ISO镜像一节**。   
 
 #### 方式二：使用DHCP下发配置
 PaoPao GateWay是一个iso镜像，为虚拟机运行优化设计，你只需要添加一个网络接口和一个虚拟光驱塞iso即可。虚拟机启动之后，会自动使用DHCP初始化eth0接口，因此你需要在路由器里为这个虚拟机**绑定静态的IP地址**，如果你在路由器里面找不到哪个是PaoPao GateWay的话，他的主机名是PaoPaoGW，虚拟机也会滚动显示获取到的eth0接口的IP地址和MAC信息。  
@@ -288,10 +288,8 @@ ppgwurl="http://...."
 如果你的虚拟机平台不支持v3 CPU（比如PVE，默认类型不支持，你需要把CPU类别设置为host）或者不确定你应该下载什么，那么你应该下载类似mihomo-linux-amd64-compatible-xxx.gz的文件并解压重命名为clash   
 
 *内置核心*：如果当前目录没有放入自定义核心，将默认使用镜像内置的mihomo内核（compatible版本，不一定是最新版本）。如果你的CPU和虚拟机平台支持v3（比如PVE需要把CPU类别设置为host），可以使用`-e MI=3`使用内置的mihomo v3版本。
-#### 替换Geo数据文件
-默认情况下镜像会附带完整的Geo数据文件（GeoSite.dat/GeoIP.dat/ASN.mmdb，并附`update.log`记录上游数据的更新日期），`GEOSITE`/`GEOIP`规则开箱可用。    
+#### Geo数据文件
 如果规则不含或者不需要Geo数据，可以设置`-e GEO=no`以减小镜像体积。默认为yes。      
-支持引入自定义Geo数据文件，当目录下存在`mmdb`或`dat`格式文件的时候会自动复制进镜像。当复制了任意Geo数据文件时，将会删除所有自带的数据文件。  
 
 #### 最后一步：一键生成ISO
 你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  
