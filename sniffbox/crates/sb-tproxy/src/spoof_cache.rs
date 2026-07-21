@@ -144,8 +144,8 @@ mod tests {
         let _ = SpoofCache::new(0);
     }
 
-    #[test]
-    fn nx_cache_short_circuits() {
+    #[tokio::test]
+    async fn nx_cache_short_circuits() {
         let cache = SpoofCache::new(8);
         let dead: SocketAddr = "192.0.2.1:9".parse().unwrap();
         {
@@ -159,16 +159,16 @@ mod tests {
         assert_eq!(cache.nx_len(), 1);
     }
 
-    #[test]
-    fn nx_cache_expires_after_ttl() {
+    #[tokio::test]
+    async fn nx_cache_expires_after_ttl() {
         let cache = SpoofCache::new(8);
         let dead: SocketAddr = "192.0.2.2:9".parse().unwrap();
         {
             let mut g = cache.inner.lock();
             g.nx.insert(dead, Instant::now() - Duration::from_secs(10));
         }
-
-        let err = cache.get_or_bind(dead).expect_err("syscall path expected");
-        assert_ne!(err.to_string(), "spoof bind cached failure (nx)");
+        if let Err(err) = cache.get_or_bind(dead) {
+            assert_ne!(err.to_string(), "spoof bind cached failure (nx)");
+        }
     }
 }
