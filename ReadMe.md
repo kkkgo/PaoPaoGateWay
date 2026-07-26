@@ -319,6 +319,7 @@ docker pull sliamb/ppgwiso:arm64
 docker run --rm -v .:/data sliamb/ppgwiso:arm64
 ```
 生成的arm镜像可用于arm64平台的虚拟机运行。如果你使用的是armbian发行版，可以使用仓库目录下的`ppgwVM-arm64.sh`脚本一键部署。
+参考：https://github.com/kkkgo/PaoPaoGateWay/discussions/214
 
 ## 与DNS服务器配合完成分流
 PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   
