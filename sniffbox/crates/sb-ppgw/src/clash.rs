@@ -18,6 +18,8 @@ pub enum ClashErr {
     Json(String),
     #[error("ping: {0}")]
     Ping(String),
+    #[error("clash api not up")]
+    NotUp,
 }
 
 enum Target {
@@ -71,6 +73,20 @@ impl ClashClient {
         self.requires_secret
     }
 
+    pub fn is_up(&self) -> bool {
+        match &self.target {
+            Target::Unix(p) => std::path::Path::new(p).exists(),
+            Target::Tcp(hp) => {
+                let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(hp) else {
+                    return false;
+                };
+                addrs.any(|a| {
+                    std::net::TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok()
+                })
+            }
+        }
+    }
+
     pub fn set_timeout(&mut self, d: Duration) {
         self.timeout = d;
     }
@@ -81,6 +97,10 @@ impl ClashClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), ClashErr> {
+
+        if !self.is_up() {
+            return Err(ClashErr::NotUp);
+        }
         let mut req: Vec<u8> = Vec::new();
         let _ = write!(req, "{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
 

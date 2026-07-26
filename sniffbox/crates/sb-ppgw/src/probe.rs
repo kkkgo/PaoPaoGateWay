@@ -760,7 +760,10 @@ mod tests {
             echo.contains("sec-fetch-mode: navigate"),
             "missing default headers: {echo}"
         );
-        assert!(echo.contains("accept: text/html"), "missing default accept: {echo}");
+        assert!(
+            echo.contains("accept: text/html"),
+            "missing default accept: {echo}"
+        );
 
         assert!(echo.contains("accept-language: ja-jp"), "{echo}");
         assert_eq!(
@@ -779,7 +782,10 @@ mod tests {
         );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], false);
-        assert!(v.get("denied").is_none(), "network error is not sandbox denial: {out}");
+        assert!(
+            v.get("denied").is_none(),
+            "network error is not sandbox denial: {out}"
+        );
         assert!(v["ms"].is_number(), "{out}");
         assert!(v["error"].is_string(), "{out}");
     }

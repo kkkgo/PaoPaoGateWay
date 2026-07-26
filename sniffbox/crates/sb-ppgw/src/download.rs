@@ -40,6 +40,8 @@ pub struct SubInfo {
 pub struct Downloader {
     pub url: String,
     pub output: String,
+    timeout: Duration,
+    best_effort: bool,
 }
 
 impl Downloader {
@@ -47,7 +49,15 @@ impl Downloader {
         Self {
             url: url.to_string(),
             output: output.to_string(),
+            timeout: TIMEOUT,
+            best_effort: false,
         }
+    }
+
+    pub fn best_effort(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.best_effort = true;
+        self
     }
 
     pub fn download(&self) -> Result<SubInfo, HttpErr> {
@@ -67,34 +77,26 @@ impl Downloader {
             }
         }
 
-        if let Some(server) = primary_dns_server() {
-            if let Some(info) = self.resolve_and_race("dns_ip", &host, server, ipv6) {
-                return Ok(info);
+        let mut servers = configured_dns_servers();
+        if self.best_effort && !servers.is_empty() && servers.iter().all(|s| is_lan(s.ip())) {
+
+            for s in crate::fallback::servers(&servers) {
+                servers.push(s);
             }
         }
-
-        for server in crate::dnsutil::ex_dns_env_servers() {
-            if let Some(info) = self.resolve_and_race("ex_dns", &host, server, ipv6) {
-                return Ok(info);
-            }
+        if let Some(info) = self.resolve_and_race(&host, &servers, ipv6, "dns") {
+            return Ok(info);
+        }
+        if self.best_effort {
+            log_get_warn("best effort: giving up, no fallback dns and no socks5");
+            return Err(HttpErr::Request("best effort: unreachable".into()));
         }
 
-        let sys_ips = system_resolve_all(&host, ipv6);
-        if sys_ips.is_empty() {
-            log_get_warn("System DNS: no answer");
-        } else {
-            log_get(&format!("System DNS -> [{}]", fmt_ips(&sys_ips)));
-            if let Some(info) = self.race_download(&sys_ips) {
-                return Ok(info);
-            }
-        }
-
-        let mut configured = crate::fallback::configured_servers();
-        configured.extend(primary_dns_server());
-        for server in crate::fallback::servers(&configured) {
-            if let Some(info) = self.resolve_and_race("fallback", &host, server, ipv6) {
-                return Ok(info);
-            }
+        let fb = crate::fallback::servers(&servers);
+        if !fb.is_empty()
+            && let Some(info) = self.resolve_and_race(&host, &fb, ipv6, "fallback dns")
+        {
+            return Ok(info);
         }
 
         log_get("Trying Socks5 Proxy 127.0.0.1:1080...");
@@ -112,20 +114,27 @@ impl Downloader {
 
     fn resolve_and_race(
         &self,
-        tag: &str,
         host: &str,
-        server: SocketAddr,
+        servers: &[SocketAddr],
         ipv6: bool,
+        tag: &str,
     ) -> Option<SubInfo> {
-        let ips: Vec<IpAddr> = crate::dnsutil::resolve_host_via(host, server, ipv6)
-            .into_iter()
-            .take(MAX_RACE_IPS)
-            .collect();
-        if ips.is_empty() {
-            log_get_warn(&format!("{tag} {server}: no answer"));
+        if servers.is_empty() {
             return None;
         }
-        log_get(&format!("{tag} {server} -> [{}]", fmt_ips(&ips)));
+        let ips = resolve_concurrent(host, servers, ipv6);
+        if ips.is_empty() {
+            log_get_warn(&format!(
+                "{tag}: no answer from {} server(s)",
+                servers.len()
+            ));
+            return None;
+        }
+        log_get(&format!(
+            "{tag}: {} server(s) -> [{}]",
+            servers.len(),
+            fmt_ips(&ips)
+        ));
         self.race_download(&ips)
     }
 
@@ -134,7 +143,7 @@ impl Downloader {
         use std::sync::{Arc, mpsc};
 
         if let [ip] = ips {
-            return match fetch(&self.url, agent_with_ip(*ip, UA_DOWNLOAD, TIMEOUT)) {
+            return match fetch(&self.url, agent_with_ip(*ip, UA_DOWNLOAD, self.timeout)) {
                 Ok((body, userinfo)) => self.finish(*ip, &body, userinfo, 1),
                 Err(e) => {
                     log_get_warn(&format!("{ip} failed: {e}"));
@@ -150,12 +159,13 @@ impl Downloader {
             let tx = tx.clone();
             let done = Arc::clone(&done);
             let url = self.url.clone();
+            let timeout = self.timeout;
             std::thread::spawn(move || {
                 if done.load(Ordering::Relaxed) {
                     return;
                 }
                 let res =
-                    fetch(&url, agent_with_ip(ip, UA_DOWNLOAD, TIMEOUT)).map_err(|e| e.to_string());
+                    fetch(&url, agent_with_ip(ip, UA_DOWNLOAD, timeout)).map_err(|e| e.to_string());
                 let _ = tx.send((ip, res));
             });
         }
@@ -203,7 +213,7 @@ impl Downloader {
     }
 
     fn attempt(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
-        let agent = agent(proxy, UA_DOWNLOAD, TIMEOUT)?;
+        let agent = agent(proxy, UA_DOWNLOAD, self.timeout)?;
         let (body, userinfo) = fetch(&self.url, agent)?;
         std::fs::write(&self.output, &body)?;
         Ok(SubInfo { userinfo })
@@ -254,6 +264,87 @@ fn paopao_host_override(url: &str) -> bool {
     };
     let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("");
     host.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn configured_dns_servers() -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let push = |s: SocketAddr, out: &mut Vec<SocketAddr>| {
+        if !out.iter().any(|x| x.ip() == s.ip()) {
+            out.push(s);
+        }
+    };
+    if let Some(s) = primary_dns_server() {
+        push(s, &mut out);
+    }
+    for s in crate::dnsutil::ex_dns_env_servers() {
+        push(s, &mut out);
+    }
+    for s in resolv_conf_servers() {
+        push(s, &mut out);
+    }
+    out
+}
+
+fn resolv_conf_servers() -> Vec<SocketAddr> {
+    let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            it.next().filter(|k| *k == "nameserver").and(it.next())
+        })
+        .filter_map(crate::dnsutil::parse_dns_server)
+        .collect()
+}
+
+fn is_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn resolve_concurrent(host: &str, servers: &[SocketAddr], ipv6: bool) -> Vec<IpAddr> {
+    let answers: std::sync::Mutex<Vec<(usize, Vec<IpAddr>)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|sc| {
+        for (i, srv) in servers.iter().enumerate() {
+            let answers = &answers;
+            sc.spawn(move || {
+                let ips = crate::dnsutil::resolve_host_via(host, *srv, ipv6);
+                if !ips.is_empty() {
+                    answers.lock().unwrap().push((i, ips));
+                }
+            });
+        }
+
+        let answers = &answers;
+        sc.spawn(move || {
+            let ips = system_resolve_all(host, ipv6);
+            if !ips.is_empty() {
+                answers.lock().unwrap().push((usize::MAX, ips));
+            }
+        });
+    });
+    let mut answers = answers.into_inner().unwrap();
+    answers.sort_by_key(|(i, _)| *i);
+    let mut out: Vec<IpAddr> = Vec::new();
+    for (_, ips) in answers {
+        for ip in ips {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out.truncate(MAX_RACE_IPS);
+    out
 }
 
 fn primary_dns_server() -> Option<SocketAddr> {
@@ -324,7 +415,11 @@ mod tests {
         let _ = srv.join();
 
         assert!(info.is_some(), "should race to a usable IP");
-        assert_eq!(std::fs::read(&out).unwrap(), b"abc", "winner should write correct content to disk");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"abc",
+            "winner should write correct content to disk"
+        );
         let _ = std::fs::remove_file(&out);
     }
 }

@@ -43,6 +43,8 @@ fn build(p: &PpgwIni) -> Config {
         tcp_workers: workers,
         spoof_cache_cap: auto_spoof_cache_cap(),
         tune_sysctl: true,
+
+        tune_nic: p.bool("tune_nic").unwrap_or(true),
     };
 
     let socks5 = SocksCfg {

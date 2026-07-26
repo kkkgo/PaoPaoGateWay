@@ -1149,7 +1149,10 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
-        assert_eq!(v["ok"], true, "probe should get response through proxy chain: {out}");
+        assert_eq!(
+            v["ok"], true,
+            "probe should get response through proxy chain: {out}"
+        );
         assert_eq!(v["status"], 200, "{out}");
         assert_eq!(v["body"], "region=JP", "{out}");
         assert_eq!(v["headers"]["content-type"], "text/plain", "{out}");

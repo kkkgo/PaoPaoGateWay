@@ -15,6 +15,8 @@ pub mod nodes;
 pub mod ppsub;
 pub mod privsep;
 pub mod probe;
+pub mod procinfo;
+pub mod resolvepool;
 pub mod ruleset;
 pub mod subtime;
 pub mod term;
@@ -32,10 +34,9 @@ pub fn invoked_as_ppgw(argv0: &str) -> bool {
 }
 
 pub fn cli_main(args: Vec<String>) -> ExitCode {
-    let stdout = std::io::stdout();
-    let stderr = std::io::stderr();
-    let mut out = stdout.lock();
-    let mut err = stderr.lock();
+
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
     let mut io = Io {
         out: &mut out,
         err: &mut err,
@@ -255,6 +256,8 @@ fn cmd_reload(f: &PpgwFlags, io: &mut Io) -> i32 {
     let client = clash_client(f);
     match client.reload_yaml() {
         Ok(()) => {
+
+            procinfo::touch_ready_marker();
             let _ = writeln!(
                 io.out,
                 "{}Yaml reload OK.",
@@ -480,6 +483,10 @@ fn cmd_download(f: &PpgwFlags, io: &mut Io) -> i32 {
     }
 }
 
+const HEALTHCHECK_GRACE_SECS: u64 = 120;
+
+const HC_NOT_READY: i32 = 3;
+
 fn cmd_healthcheck(f: &PpgwFlags, io: &mut Io) -> i32 {
     let content = match std::fs::read_to_string(&f.healthcheck) {
         Ok(c) => c,
@@ -493,7 +500,46 @@ fn cmd_healthcheck(f: &PpgwFlags, io: &mut Io) -> i32 {
         }
     };
     let client = clash_client(f);
-    health::run(&content, &client, io)
+
+    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+        return health::run(&content, &client, io);
+    }
+
+    if client.is_up() {
+        let rc = health::run(&content, &client, io);
+
+        if rc != 0
+            && let Some(age) = procinfo::readiness_age_secs()
+            && age < HEALTHCHECK_GRACE_SECS
+        {
+            let _ = writeln!(
+                io.out,
+                "{}unhealthy but within {HEALTHCHECK_GRACE_SECS}s grace since clash (re)start/reload (age {age}s), deferring teardown",
+                term::orange("[PaoPaoGW Health]")
+            );
+            return HC_NOT_READY;
+        }
+        return rc;
+    }
+
+    match procinfo::clash_uptime_secs() {
+        Some(uptime) => {
+            let _ = writeln!(
+                io.out,
+                "{}clash api not up yet (uptime {uptime}s), not-ready (no teardown)",
+                term::orange("[PaoPaoGW Health]")
+            );
+            HC_NOT_READY
+        }
+        None => {
+            let _ = writeln!(
+                io.out,
+                "{}clash process gone and api unreachable, unhealthy",
+                term::red("[PaoPaoGW Health]")
+            );
+            255
+        }
+    }
 }
 
 fn cmd_input(f: &PpgwFlags, io: &mut Io) -> i32 {
@@ -560,6 +606,15 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                 f.output
             );
 
+            if clash_client(f).is_up() {
+                let _ = writeln!(
+                    io.out,
+                    "{}clash already running, rule-set prefetch skipped (clash owns them now)",
+                    term::green("[PaoPaoGW RuleSet]")
+                );
+                return 0;
+            }
+
             let rep = ruleset::prefetch(&f.output, &ruleset::ruleset_dir());
             let _ = writeln!(
                 io.out,
@@ -584,16 +639,27 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
     }
 }
 
+const CLASH_READY_ABSENT_GIVEUP_SECS: u64 = 5;
+
 fn cmd_clash_ready(f: &PpgwFlags) -> i32 {
     let mut client = clash_client(f);
     client.set_timeout(std::time::Duration::from_secs(2));
     let timeout = if f.timeout > 0 { f.timeout as u64 } else { 10 };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(timeout);
+    let mut last_seen = start;
     loop {
         if client.get_mode().is_ok() {
             return 0;
         }
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        if procinfo::clash_pid().is_some() {
+            last_seen = now;
+        } else if now.duration_since(last_seen).as_secs() >= CLASH_READY_ABSENT_GIVEUP_SECS {
+
+            return 1;
+        }
+        if now >= deadline {
             return 1;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));

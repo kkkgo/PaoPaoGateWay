@@ -3,9 +3,9 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const OVPN_BIN: &str = "/usr/sbin/openvpn";
@@ -82,7 +82,10 @@ impl OvpnSupervisor {
             return Ok(false);
         }
         if !config_exists() {
-            tracing::warn!(config = OVPN_CONFIG, "openvpn config missing; skip spawn (awaiting ppg.sh)");
+            tracing::warn!(
+                config = OVPN_CONFIG,
+                "openvpn config missing; skip spawn (awaiting ppg.sh)"
+            );
             return Ok(false);
         }
         let pid = spawn_ovpn()?;
@@ -100,8 +103,14 @@ impl OvpnSupervisor {
 
         delete_tun();
         if !config_exists() {
-            tracing::warn!(config = OVPN_CONFIG, "openvpn config missing; cannot cold-restart");
-            return Err(io::Error::new(io::ErrorKind::NotFound, "openvpn config missing"));
+            tracing::warn!(
+                config = OVPN_CONFIG,
+                "openvpn config missing; cannot cold-restart"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "openvpn config missing",
+            ));
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pid = spawn_ovpn()?;
@@ -158,8 +167,9 @@ fn spawn_ovpn() -> io::Result<u32> {
     let mut cmd = Command::new(OVPN_BIN);
     cmd.args(["--config", OVPN_CONFIG])
         .stdin(Stdio::null())
-        .stdout(tty_or_null())
-        .stderr(tty_or_null());
+
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     unsafe {
         cmd.pre_exec(|| {
@@ -202,14 +212,6 @@ fn wait_gone(pid: u32, timeout: Duration) {
     }
 }
 
-fn tty_or_null() -> Stdio {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty0")
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
-}
-
 fn proc_is_ovpn(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|c| c.trim() == "openvpn")
@@ -235,7 +237,9 @@ fn config_exists() -> bool {
 }
 
 fn config_mtime() -> Option<SystemTime> {
-    std::fs::metadata(OVPN_CONFIG).and_then(|m| m.modified()).ok()
+    std::fs::metadata(OVPN_CONFIG)
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 pub fn spawn_monitor(
@@ -292,8 +296,11 @@ fn monitor_tick(sup: &OvpnSupervisor) {
     }
 
     for attempt in 1..=MAX_RESTARTS_PER_CYCLE {
-        tracing::warn!(attempt, max = MAX_RESTARTS_PER_CYCLE,
-            "openvpn unhealthy (tun114/process missing); cold-restart");
+        tracing::warn!(
+            attempt,
+            max = MAX_RESTARTS_PER_CYCLE,
+            "openvpn unhealthy (tun114/process missing); cold-restart"
+        );
         match sup.cold_restart() {
             Ok(()) => {
                 if wait_tun_up(TUN_UP_WAIT) && sup.is_healthy() {
@@ -304,8 +311,10 @@ fn monitor_tick(sup: &OvpnSupervisor) {
             Err(e) => tracing::warn!(attempt, ?e, "openvpn cold-restart failed"),
         }
     }
-    tracing::error!(max = MAX_RESTARTS_PER_CYCLE,
-        "openvpn still unhealthy after retries; will retry next cycle");
+    tracing::error!(
+        max = MAX_RESTARTS_PER_CYCLE,
+        "openvpn still unhealthy after retries; will retry next cycle"
+    );
 }
 
 fn wait_tun_up(timeout: Duration) -> bool {

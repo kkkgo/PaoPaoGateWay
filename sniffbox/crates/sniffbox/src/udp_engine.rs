@@ -1581,7 +1581,10 @@ mod tests {
                 .expect("pending packets must be flushed after session opens")
                 .unwrap();
             let (src, off) = decode_udp_reply(&buf[..n]).unwrap();
-            assert_eq!(src, dst, "no SNI/fakeip → IP-style encapsulation should carry original destination");
+            assert_eq!(
+                src, dst,
+                "no SNI/fakeip → IP-style encapsulation should carry original destination"
+            );
             assert_eq!(&buf[off..n], &pkt[..]);
             got += 1;
         }
@@ -1629,7 +1632,10 @@ mod tests {
         let mut tx = Vec::new();
         let res = dispatch_packet(&engine, &shared, peer, dst, &quic_initial_pkt(), &mut tx).await;
         assert!(res.is_ok());
-        assert!(engine.flow_path.is_empty(), "blocked QUIC should not enter diversion");
+        assert!(
+            engine.flow_path.is_empty(),
+            "blocked QUIC should not enter diversion"
+        );
         assert!(engine.symmetric.is_empty() && engine.fullcone.is_empty());
     }
 

@@ -306,12 +306,19 @@ docker run --rm -v .:/data sliamb/ppgwiso
 只需等待十几秒，你就可以在当前目录看到你定制的`ppgw-version-[hash].iso`。  
 
 #### 可选：物理网卡直通
-镜像因为是虚拟机专用默认仅包含虚拟网卡驱动，如果有物理网卡直通需求，你可以把定制的docker镜像切换成`fullmod`版本，增加驱动(还包含qemu-ga/open-vm-tools)：  
+镜像因为是虚拟机专用默认仅包含虚拟网卡驱动，如果有物理网卡直通需求，你可以把定制的docker镜像切换成`fullmod`版本，增加驱动(还包含qemu-ga)：  
 ```shell
 docker pull sliamb/ppgwiso:fullmod
 docker run --rm -v .:/data sliamb/ppgwiso:fullmod
 ```
 *注：`fullmod`附带了所有可能支持的网卡驱动和相关模块，生成的镜像会大20M左右，可适当增加运行内存。*
+
+#### 实验性：Arm64版本镜像
+```shell
+docker pull sliamb/ppgwiso:arm64
+docker run --rm -v .:/data sliamb/ppgwiso:arm64
+```
+生成的arm镜像可用于arm64平台的虚拟机运行。如果你使用的是armbian发行版，可以使用仓库目录下的`ppgwVM-arm64.sh`脚本一键部署。
 
 ## 与DNS服务器配合完成分流
 PaoPao GateWay启动后会监听53端口作为FAKEIP的DNS服务器，所有域名的查询到达的话这里都会解析成`fake_cidr`内的IP。当你在主路由添加`fake_cidr`段到PaoPao GateWay的静态路由后，你只需要把需要走网关的域名解析转发到PaoPao GateWay的53端口即可，能实现这个功能的DNS软件很多，比如有些系统自带的dnsmasq就可以指定某个域名使用某个DNS服务器。   

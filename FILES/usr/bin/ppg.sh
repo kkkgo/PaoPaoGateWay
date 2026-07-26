@@ -2,6 +2,38 @@
 IPREX4='([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,2}|1[0-9][0-9]|2[0-4][0-9]|25[0-5])'
 PUBIPREX6="2[0-9a-fA-F]{3}:[0-9a-fA-F:]+"
 NTP_SERVERS="-p 111.230.189.174 -p 47.96.149.233 -p 106.55.184.199 -p 203.107.6.88"
+PPGWTTYS=/dev/console
+PPGWTTY=/dev/console
+if [ -c /dev/tty0 ]; then
+    PPGWTTYS="/dev/tty0 $PPGWTTYS"
+    case "$(awk -F'[()]' '$2 ~ /C/ {split($1,a," "); print a[1]}' /proc/consoles 2>/dev/null)" in
+    tty0)
+        # /dev/console is the VT itself, writing to both would print twice
+        PPGWTTYS=/dev/tty0
+        PPGWTTY=/dev/tty0
+        ;;
+    esac
+    for ppgwdir in /sys/class/vtconsole/vtcon*; do
+        [ "$(cat "$ppgwdir/bind" 2>/dev/null)" = "1" ] || continue
+        if grep -q "dummy device" "$ppgwdir/name" 2>/dev/null; then
+            PPGWTTY=/dev/console
+        else
+            PPGWTTY=/dev/tty0
+            break
+        fi
+    done
+fi
+export PPGWTTY
+# a line to every console
+ppgwecho() {
+    for ppgwtty in $PPGWTTYS; do
+        echo -e "$1" >"$ppgwtty" 2>/dev/null
+    done
+}
+# stdin to every console
+ppgwout() {
+    tee $PPGWTTYS >/dev/null 2>&1
+}
 
 ppgw() { /usr/bin/sniffbox ppgw "$@"; }
 
@@ -42,14 +74,14 @@ log() {
     log_msg=$1
     log_type=$2
     if [ "$log_type" = "warn" ]; then
-        echo -e "\033[31m[PaoPaoGW $(date +%H%M%S)]\033[0m ""$log_msg" >/dev/tty0
+        ppgwecho "\033[31m[PaoPaoGW $(date +%H%M%S)]\033[0m ""$log_msg"
         return 0
     fi
     if [ "$log_type" = "succ" ]; then
-        echo -e "\033[32m[PaoPaoGW $(date +%H%M%S)]\033[0m ""$log_msg" >/dev/tty0
+        ppgwecho "\033[32m[PaoPaoGW $(date +%H%M%S)]\033[0m ""$log_msg"
         return 0
     fi
-    echo -e "[PaoPaoGW $(date +%H%M%S)] ""$1" >/dev/tty0
+    ppgwecho "[PaoPaoGW $(date +%H%M%S)] ""$1"
 }
 
 net_ready() {
@@ -95,7 +127,7 @@ net_ready() {
 
 
 sync_ntp() {
-    ntpd -n -q $NTP_SERVERS >/dev/tty0 2>&1
+    ntpd -n -q $NTP_SERVERS >"$PPGWTTY" 2>&1
 }
 
 safe_kill() {
@@ -179,7 +211,7 @@ load_box() {
     if pidof sniffbox >/dev/null 2>&1; then
         log "sniffbox Running OK." succ
     else
-    /usr/bin/sniffbox >/dev/tty0 2>&1 &
+    /usr/bin/sniffbox 2>&1 | ppgwout &
     fi
 }
 kill_box(){
@@ -225,7 +257,7 @@ load_clash() {
             log "ulimit:"$(ulimit -n)
         fi
         if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>/dev/tty0
+            . /tmp/ppgw.ini 2>"$PPGWTTY"
         fi
         apply_defaults
         closeall_flag="no"
@@ -236,14 +268,14 @@ load_clash() {
         if pidof clash >/dev/null 2>&1; then
             log "Clash already running, just reload yaml config." succ
             is_reload=1
-            old_node=$(ppgw -now_node 2>/dev/tty0)
+            old_node=$(ppgw -now_node 2>"$PPGWTTY")
             old_node_hash=$(ppgw -nodehash "$old_node" -yaml /tmp/clash.yaml.last 2>/dev/null)
             old_rule_hash=""
             old_ppsub_hash=""
             if [ -f /tmp/ppgw_state.last ]; then
                 . /tmp/ppgw_state.last
             fi
-            ppgw -reload >/dev/tty0 2>&1
+            ppgw -reload >"$PPGWTTY" 2>&1
         else
             sync_ntp
             ppgw -clash-up
@@ -252,13 +284,14 @@ load_clash() {
         log "The clash.yaml generation failed." warn
         return 1
     fi
-    if ppgw -clash-ready -timeout 10; then
+
+    if ppgw -clash-ready -timeout 60; then
         echo "clash api ok."
     else
         echo "clash api timeout."
     fi
     if pidof clash >/dev/null 2>&1 && [ "$is_reload" = "1" ]; then
-        new_node=$(ppgw -now_node 2>/dev/tty0)
+        new_node=$(ppgw -now_node 2>"$PPGWTTY")
         if [ "$PPGW_FORCE_CLOSEALL" = "1" ]; then
             closeall_flag="yes"
         elif [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
@@ -282,15 +315,15 @@ load_clash() {
             fi
         fi
         if [ "$closeall_flag" = "yes" ]; then
-            ppgw -closeall >/dev/tty0
+            ppgw -closeall >"$PPGWTTY"
         fi
     fi
     unset PPGW_FORCE_CLOSEALL
     if pidof clash >/dev/null 2>&1 && [ "$1" = "yes" ]; then
-        ppgw -fastnode -test_node_url="$test_node_url" -ext_node="$ext_node" >/dev/tty0
+        ppgw -fastnode -test_node_url="$test_node_url" -ext_node="$ext_node" >"$PPGWTTY"
         if [ $? -ne 0 ]; then
             if [ "$fall_direct" = "yes" ]; then
-                ppgw -spec_node="DIRECT" >/dev/tty0
+                ppgw -spec_node="DIRECT" >"$PPGWTTY"
                 www_test=$(ppgw -testProxy -test_node_url "http://120.53.53.53")
                 if [ $? -eq 0 ]; then
                     log "[fall_direct] Switch to DIRECT." succ
@@ -336,7 +369,7 @@ load_ovpn() {
 
         sed -r "/^dev /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
         if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>/dev/tty0
+            . /tmp/ppgw.ini 2>"$PPGWTTY"
             apply_defaults
         fi
         if [ -n "$ovpn_username" ]; then
@@ -360,7 +393,7 @@ load_ovpn() {
 
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
+        . /tmp/ppgw.ini 2>"$PPGWTTY"
         str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday""$pplog""$pplog_uuid""$admin_cidr""$proxy_cidr"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
@@ -443,7 +476,7 @@ get_conf() {
         log "Load local ppsub.json" succ
     else
         if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>/dev/tty0
+            . /tmp/ppgw.ini 2>"$PPGWTTY"
             apply_defaults
         fi
         echo "127.0.0.1 localhost" >/etc/hosts
@@ -471,16 +504,16 @@ get_conf() {
         if echo "$down_url" | grep https; then
             sync_ntp
         fi
-        ppgw -downURL "$down_url" -output "$file_down_tmp" >/dev/tty0 2>&1
+        ppgw -downURL "$down_url" -output "$file_down_tmp" >"$PPGWTTY" 2>&1
     fi
     echo "127.0.0.1 localhost" >/etc/hosts
     if [ "$down_type" = "ini" ]; then
         if head -1 "$file_down_tmp" | grep -q "#paopao-gateway"; then
             checkflag=0
-            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+="[^\"]+$' >/dev/tty0 2>&1; then
+            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+="[^\"]+$' >"$PPGWTTY" 2>&1; then
                 checkflag=1
             fi
-            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+=[^"]+"$' >/dev/tty0 2>&1; then
+            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+=[^"]+"$' >"$PPGWTTY" 2>&1; then
                 checkflag=1
             fi
             if [ "$checkflag" = "1" ]; then
@@ -540,7 +573,7 @@ get_conf() {
             if [ -f "$ppsub_cpy" ]; then
                 rm "$ppsub_cpy"
             fi
-            . /tmp/ppgw.ini 2>/dev/tty0
+            . /tmp/ppgw.ini 2>"$PPGWTTY"
             apply_defaults
             if [ "$dns_burn" != "no" ]; then
                 export dns_burn="yes"
@@ -548,13 +581,13 @@ get_conf() {
             fi
             export dns_ip="$dns_ip"
             export dns_port="$dns_port"
-            ppgw -ppsub "$file_down_tmp" -output "$ppsub_output" >/dev/tty0 2>&1
+            ppgw -ppsub "$file_down_tmp" -output "$ppsub_output" >"$PPGWTTY" 2>&1
             if pidof clash >/dev/null 2>&1; then
                 rm -f /tmp/ppsub_reload_pending
             elif [ ! -f /tmp/ppsub_reload_pending ]; then
                 : >/tmp/ppsub_reload_pending
                 log "Clash not up during ppsub; reload in 30s to complete subdns via proxy." warn
-                (sleep 30; pidof clash >/dev/null 2>&1 && /usr/bin/ppg.sh reload >/dev/tty0 2>&1) </dev/null >/dev/null 2>&1 &
+                (sleep 30; pidof clash >/dev/null 2>&1 && /usr/bin/ppg.sh reload >"$PPGWTTY" 2>&1) </dev/null >/dev/null 2>&1 &
             fi
             if grep -q "proxies:" "$ppsub_output"; then
                 cp "$ppsub_output" "$ppsub_cpy"
@@ -667,7 +700,7 @@ reload_gw() {
         log "[SYSCTL] Turn on net.ipv4.conf.all.route_localnet..." warn
         sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1
     fi
-    . /tmp/ppgw.ini 2>/dev/tty0
+    . /tmp/ppgw.ini 2>"$PPGWTTY"
     apply_defaults
 
     if [ -n "$mode" ]; then
@@ -755,7 +788,7 @@ reload_gw() {
         # burn dns
         if [ "$fast_node" = "yes" ]; then
             if [ "$dns_burn" = "yes" ]; then
-                ppgw -dnslist "$dns_ip"":""$dns_port"",""$ex_dns" -dnsinput /tmp/clash.yaml -output /tmp/clash_dnsburn.yaml >/dev/tty0
+                ppgw -dnslist "$dns_ip"":""$dns_port"",""$ex_dns" -dnsinput /tmp/clash.yaml -output /tmp/clash_dnsburn.yaml >"$PPGWTTY"
                 if grep -q tproxy-port /tmp/clash_dnsburn.yaml; then
                     cat /tmp/clash_dnsburn.yaml >/tmp/clash.yaml
                 fi
@@ -788,7 +821,7 @@ reload_gw() {
 if [ "$1" = "reload" ]; then
     log "Force reload gateway..." warn
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
+        . /tmp/ppgw.ini 2>"$PPGWTTY"
         apply_defaults
     fi
     old_fake_cidr=$fake_cidr
@@ -812,7 +845,7 @@ if [ "$1" = "reload" ]; then
     old_net_cleanday=$net_cleanday
 
     if [ -f /tmp/sniffbox_running.ini ]; then
-        . /tmp/sniffbox_running.ini 2>/dev/tty0
+        . /tmp/sniffbox_running.ini 2>"$PPGWTTY"
         apply_defaults
         old_fake_cidr=$fake_cidr
         old_udp_enable=$udp_enable
@@ -824,14 +857,14 @@ if [ "$1" = "reload" ]; then
         old_socks5_port=$socks5_port
         old_socks5_username=$socks5_username
         old_socks5_password=$socks5_password
-        if [ -f /tmp/ppgw.ini ]; then . /tmp/ppgw.ini 2>/dev/tty0; apply_defaults; fi
+        if [ -f /tmp/ppgw.ini ]; then . /tmp/ppgw.ini 2>"$PPGWTTY"; apply_defaults; fi
     fi
 
     if ! try_conf "ppgw.ini" "ini"; then
         log "Cannot get ppgw.ini, abort reload." warn
         exit 1
     fi
-    . /tmp/ppgw.ini 2>/dev/tty0
+    . /tmp/ppgw.ini 2>"$PPGWTTY"
     apply_defaults
 
     # Detect sniffbox changes and reload.
@@ -899,15 +932,16 @@ if [ "$1" = "reload" ]; then
     exit
 fi
 net_ready
-cat /etc/banner >/dev/tty0
-echo " " >/dev/tty0
+for ppgwtty in $PPGWTTYS; do cat /etc/banner >"$ppgwtty" 2>/dev/null; done
+ppgwecho " "
 sleep_count=0
 last_hash="empty"
 last_yaml_hash="empty"
 last_ovpn_hash="empty"
+hc_fail_streak=0
 while true; do
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
+        . /tmp/ppgw.ini 2>"$PPGWTTY"
         apply_defaults
         old_fake_cidr=$fake_cidr
         old_openport=$openport
@@ -930,7 +964,7 @@ while true; do
         old_socks5_password=$socks5_password
         old_mode=$mode
         if [ -f /tmp/sniffbox_running.ini ]; then
-            . /tmp/sniffbox_running.ini 2>/dev/tty0
+            . /tmp/sniffbox_running.ini 2>"$PPGWTTY"
             apply_defaults
             old_fake_cidr=$fake_cidr
             old_udp_enable=$udp_enable
@@ -942,7 +976,7 @@ while true; do
             old_socks5_port=$socks5_port
             old_socks5_username=$socks5_username
             old_socks5_password=$socks5_password
-            . /tmp/ppgw.ini 2>/dev/tty0
+            . /tmp/ppgw.ini 2>"$PPGWTTY"
             apply_defaults
         fi
     fi
@@ -958,7 +992,7 @@ while true; do
         if echo "$hash" | grep -Eqo "[a-z0-9]{32}"; then
             log "The hash has changed, reload gateway." warn
             if [ -f /tmp/ppgw.ini ]; then
-                . /tmp/ppgw.ini 2>/dev/tty0
+                . /tmp/ppgw.ini 2>"$PPGWTTY"
                 apply_defaults
             fi
             need_kill_clash=0
@@ -1040,7 +1074,7 @@ while true; do
         fi
     fi
     if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>/dev/tty0
+        . /tmp/ppgw.ini 2>"$PPGWTTY"
         apply_defaults
         if box_hot_changed; then
             log "The box config has changed, hot reload box." warn
@@ -1088,20 +1122,33 @@ while true; do
         if pidof clash >/dev/null 2>&1; then
             log "Clash Running OK." succ
             if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
-                ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >/dev/tty0 2>&1
-                if [ $? -eq 0 ]; then
+                ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >"$PPGWTTY" 2>&1
+                hc_rc=$?
+                if [ "$hc_rc" -eq 0 ]; then
                     echo PPsub health check succ
+                    hc_fail_streak=0
+                elif [ "$hc_rc" -eq 3 ]; then
+                    log "PPsub: clash not ready yet, backoff without teardown." warn
+                    hc_fail_streak=0
                 else
                     log "PPsub health check failed, close all connections." warn
-                    ppgw -closeall >/dev/tty0 2>&1
+                    ppgw -closeall >"$PPGWTTY" 2>&1
                     log "PPsub: Try to update and reload..." warn
                     get_conf "$suburl" "yaml" || log "Failed to update suburl, keep current config." warn
                     reload_gw
-                    ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >/dev/tty0 2>&1
-                    if [ $? -ne 0 ]; then
-                        log "PPsub health check still failed after reload, try kill clash and reload." warn
-                        kill_clash
-                        load_clash no
+                    ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >"$PPGWTTY" 2>&1
+                    hc_rc2=$?
+                    if [ "$hc_rc2" -eq 0 ] || [ "$hc_rc2" -eq 3 ]; then
+                        hc_fail_streak=0
+                    else
+                        hc_fail_streak=$((hc_fail_streak + 1))
+                        log "PPsub still unhealthy after reload (streak $hc_fail_streak)." warn
+                        if [ "$hc_fail_streak" -ge 2 ]; then
+                            log "PPsub unhealthy $hc_fail_streak rounds, kill clash and reload." warn
+                            kill_clash
+                            load_clash no
+                            hc_fail_streak=0
+                        fi
                     fi
                 fi
             fi
@@ -1152,7 +1199,7 @@ while true; do
     fi
     if [ "$mode" = "suburl" ]; then
         if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>/dev/tty0
+            . /tmp/ppgw.ini 2>"$PPGWTTY"
             apply_defaults
         fi
         # ppgw apply subtime/subcron

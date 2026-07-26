@@ -9,6 +9,7 @@ pub mod geo_cron;
 pub mod inbound_proxy;
 pub mod ip_rules;
 pub mod logging;
+pub mod nic;
 pub mod outbound;
 pub mod ovpn_ctl;
 pub mod pplog;
@@ -124,6 +125,9 @@ pub fn cli_main() -> ExitCode {
     raise_nofile();
     if cfg.inbound.tune_sysctl {
         tune_sysctls();
+    }
+    if cfg.inbound.tune_nic {
+        nic::tune_link_modes();
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -470,11 +474,11 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
 
     {
 
-        let clash_supervisor = cfg
-            .outbound
-            .mode
-            .via_clash()
-            .then(|| Arc::new(clash_ctl::ClashSupervisor::new()));
+        let clash_supervisor = cfg.outbound.mode.via_clash().then(|| {
+
+            let pool = shared.outbound.socks5_pool().cloned();
+            Arc::new(clash_ctl::ClashSupervisor::with_pool(pool))
+        });
 
         let web_geo = clash_supervisor
             .clone()
@@ -485,10 +489,8 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
         }
 
         let web_proxies = cfg.outbound.mode.via_clash().then(|| {
-            let wp = web_proxies::WebProxies::new(
-                cfg.web.clash_sock.clone(),
-                Arc::clone(&smart_stats),
-            );
+            let wp =
+                web_proxies::WebProxies::new(cfg.web.clash_sock.clone(), Arc::clone(&smart_stats));
             let wp2 = Arc::clone(&wp);
             let warm = wp.warm_signal();
             let mut sd = shutdown_rx.clone();

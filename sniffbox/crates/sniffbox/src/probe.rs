@@ -90,7 +90,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["denied"], true);
-        assert_eq!(p.inflight.load(Ordering::Acquire), 0, "permit should have been returned");
+        assert_eq!(
+            p.inflight.load(Ordering::Acquire),
+            0,
+            "permit should have been returned"
+        );
     }
 
     #[test]

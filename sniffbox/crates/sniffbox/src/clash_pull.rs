@@ -203,8 +203,8 @@ fn collect_types(s: &str, out: &mut BTreeSet<String>) {
     while let Some(rel) = s[i..].find("type:") {
         let start = i + rel;
         i = start + 5;
-        let boundary_ok = start == 0
-            || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'-');
+        let boundary_ok =
+            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'-');
         if !boundary_ok {
             continue;
         }
@@ -244,7 +244,9 @@ impl ListenersGate {
             self.checked = true;
             self.mtime = mt;
             let types = mt
-                .map(|_| config_listener_types(&std::fs::read_to_string(&self.path).unwrap_or_default()))
+                .map(|_| {
+                    config_listener_types(&std::fs::read_to_string(&self.path).unwrap_or_default())
+                })
                 .unwrap_or_default();
             if types != *self.types {
                 tracing::info!(?types, "clash listeners mirror gate changed");
@@ -638,12 +640,16 @@ mod tests {
     fn config_listener_types_detection() {
 
         assert_eq!(
-            types_of("port: 7890\nlisteners:\n  - name: ss-in-1\n    type: shadowsocks\n    port: 8080\n    listen: 0.0.0.0\nrules:\n  - MATCH,DIRECT\n"),
+            types_of(
+                "port: 7890\nlisteners:\n  - name: ss-in-1\n    type: shadowsocks\n    port: 8080\n    listen: 0.0.0.0\nrules:\n  - MATCH,DIRECT\n"
+            ),
             vec!["shadowsocks"]
         );
 
         assert_eq!(
-            types_of("listeners:\n  - name: a\n    type: shadowsocks\n  - name: b\n    type: Vless\n  - name: c\n    type: shadowsocks\n"),
+            types_of(
+                "listeners:\n  - name: a\n    type: shadowsocks\n  - name: b\n    type: Vless\n  - name: c\n    type: shadowsocks\n"
+            ),
             vec!["shadowsocks", "vless"]
         );
 
@@ -655,7 +661,10 @@ mod tests {
             "listeners: # comment\nrules: []\n",
             "",
         ] {
-            assert!(config_listener_types(y).is_empty(), "should be empty: {y:?}");
+            assert!(
+                config_listener_types(y).is_empty(),
+                "should be empty: {y:?}"
+            );
         }
 
         assert_eq!(
@@ -663,7 +672,10 @@ mod tests {
             vec!["mixed"]
         );
 
-        assert!(config_listener_types("x:\n  listeners:\n    - name: a\n    type: shadowsocks\n").is_empty());
+        assert!(
+            config_listener_types("x:\n  listeners:\n    - name: a\n    type: shadowsocks\n")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -746,7 +758,11 @@ mod tests {
         assert_eq!(shared.conn_table.len(), 1);
         shared.conn_table.clear();
         mirror_direct_inbounds(&shared, &mut mirror, &conns, &active);
-        assert_eq!(shared.conn_table.len(), 1, "still-active mirrored connection added back to table");
+        assert_eq!(
+            shared.conn_table.len(),
+            1,
+            "still-active mirrored connection added back to table"
+        );
     }
 
     #[test]
@@ -759,7 +775,12 @@ mod tests {
              "sourceIP":"10.0.0.8","sourcePort":"5555","destinationIP":"1.2.3.4","destinationPort":"443"},
              "chains":["N"],"upload":100,"download":200}
         ]}"#;
-        mirror_direct_inbounds(&shared, &mut mirror, &parse_connections(raw), &BTreeSet::new());
+        mirror_direct_inbounds(
+            &shared,
+            &mut mirror,
+            &parse_connections(raw),
+            &BTreeSet::new(),
+        );
         assert!(mirror.is_empty());
         assert_eq!(shared.conn_table.len(), 0);
     }

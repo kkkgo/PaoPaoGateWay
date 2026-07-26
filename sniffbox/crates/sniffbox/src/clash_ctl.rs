@@ -3,8 +3,10 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use sb_outbound::SocksPool;
 
 const CLASH_BIN: &str = "/usr/bin/clash";
 const CLASH_DIR: &str = "/etc/config/clash";
@@ -15,6 +17,8 @@ const CLASH_NOFILE: u64 = 1_048_576;
 pub struct ClashSupervisor {
 
     pid: Mutex<Option<u32>>,
+
+    pool: Option<Arc<SocksPool>>,
 }
 
 impl Default for ClashSupervisor {
@@ -26,12 +30,26 @@ impl Default for ClashSupervisor {
 impl ClashSupervisor {
 
     pub fn new() -> Self {
+        Self::with_pool(None)
+    }
+
+    pub fn with_pool(pool: Option<Arc<SocksPool>>) -> Self {
         let adopted = find_clash_pid();
         if let Some(pid) = adopted {
             tracing::info!(pid, "adopted running clash");
         }
         Self {
             pid: Mutex::new(adopted),
+            pool,
+        }
+    }
+
+    fn flush_pool_for_new_clash(&self) {
+        if let Some(pool) = &self.pool {
+            let dropped = pool.flush_idle();
+            if dropped > 0 {
+                tracing::info!(dropped, "flushed socks pool for freshly spawned clash");
+            }
         }
     }
 
@@ -51,6 +69,7 @@ impl ClashSupervisor {
 
         let pid = spawn_clash()?;
         *guard = Some(pid);
+        self.flush_pool_for_new_clash();
         tracing::info!(pid, "clash cold-restarted (geo reload)");
         Ok(())
     }
@@ -83,6 +102,7 @@ impl sb_web::ClashControl for ClashSupervisor {
 
         let pid = spawn_clash()?;
         *guard = Some(pid);
+        self.flush_pool_for_new_clash();
         tracing::info!(pid, "spawned clash");
         Ok(true)
     }
@@ -93,8 +113,9 @@ fn spawn_clash() -> io::Result<u32> {
     cmd.args(["-d", CLASH_DIR, "-f", CLASH_YAML])
         .env("SAFE_PATHS", "/tmp/")
         .stdin(Stdio::null())
-        .stdout(tty_or_null())
-        .stderr(tty_or_null());
+
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     unsafe {
         cmd.pre_exec(|| {
@@ -113,14 +134,6 @@ fn spawn_clash() -> io::Result<u32> {
         let _ = child.wait();
     });
     Ok(pid)
-}
-
-fn tty_or_null() -> Stdio {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty0")
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
 }
 
 fn proc_is_clash(pid: u32) -> bool {

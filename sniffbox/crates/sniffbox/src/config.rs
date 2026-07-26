@@ -59,6 +59,8 @@ pub struct InboundCfg {
     pub spoof_cache_cap: usize,
 
     pub tune_sysctl: bool,
+
+    pub tune_nic: bool,
 }
 impl Default for InboundCfg {
     fn default() -> Self {
@@ -74,6 +76,7 @@ impl Default for InboundCfg {
             tcp_workers: default_udp_workers(),
             spoof_cache_cap: 1024,
             tune_sysctl: true,
+            tune_nic: true,
         }
     }
 }
@@ -557,6 +560,9 @@ fn parse_inbound(sec: Option<&Section>) -> Result<InboundCfg, ConfigErr> {
     if let Some(v) = get(sec, "tune_sysctl") {
         c.tune_sysctl = parse_bool("inbound", "tune_sysctl", v)?;
     }
+    if let Some(v) = get(sec, "tune_nic") {
+        c.tune_nic = parse_bool("inbound", "tune_nic", v)?;
+    }
     Ok(c)
 }
 
@@ -851,6 +857,14 @@ mod tests {
         assert!(cfg.inbound.tune_sysctl);
         let off = Config::from_ini(parse_ini("[inbound]\ntune_sysctl = false\n").unwrap()).unwrap();
         assert!(!off.inbound.tune_sysctl);
+    }
+
+    #[test]
+    fn tune_nic_defaults_true_and_parses() {
+        let cfg = Config::from_ini(parse_ini("").unwrap()).unwrap();
+        assert!(cfg.inbound.tune_nic);
+        let off = Config::from_ini(parse_ini("[inbound]\ntune_nic = false\n").unwrap()).unwrap();
+        assert!(!off.inbound.tune_nic);
     }
 
     #[test]

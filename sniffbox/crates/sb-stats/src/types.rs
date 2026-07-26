@@ -322,7 +322,10 @@ mod tests {
 
         let (tail, _) = r.drain_delta();
         let total = drained.load(Ordering::Relaxed) + tail;
-        assert_eq!(total, ADDS, "concurrent drain must conserve exactly, no double-counting or loss");
+        assert_eq!(
+            total, ADDS,
+            "concurrent drain must conserve exactly, no double-counting or loss"
+        );
     }
 
     #[test]

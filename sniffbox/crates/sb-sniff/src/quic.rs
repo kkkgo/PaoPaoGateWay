@@ -546,9 +546,16 @@ mod tests {
         for len in 1..=2000usize {
             s.ingest_piece(0, vec![0u8; len])
                 .expect("must not hit limit");
-            assert_eq!(s.total_bytes, len, "total_bytes should equal current offset=0 segment length");
+            assert_eq!(
+                s.total_bytes, len,
+                "total_bytes should equal current offset=0 segment length"
+            );
             assert!(!s.done, "should not be misjudged as over-limit abandonment");
-            assert_eq!(s.pieces.len(), 1, "same offset should not increase piece count");
+            assert_eq!(
+                s.pieces.len(),
+                1,
+                "same offset should not increase piece count"
+            );
         }
     }
 

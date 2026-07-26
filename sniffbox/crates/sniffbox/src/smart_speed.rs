@@ -26,6 +26,8 @@ const SUPERVISOR_TICK: Duration = Duration::from_secs(30);
 
 const ERR_BACKOFF: Duration = Duration::from_secs(15);
 
+const WAIT_CLASH: Duration = Duration::from_secs(5);
+
 const JITTER_WEIGHT: f64 = 1.5;
 const LOSS_PENALTY_MS: f64 = 2000.0;
 
@@ -128,7 +130,10 @@ struct GroupState {
 
 impl GroupState {
     fn score(&self, node: &str) -> f64 {
-        self.hist.get(node).map(NodeHist::score).unwrap_or(f64::INFINITY)
+        self.hist
+            .get(node)
+            .map(NodeHist::score)
+            .unwrap_or(f64::INFINITY)
     }
 
     fn push(&mut self, node: &str, sample: Option<u32>) {
@@ -254,7 +259,11 @@ async fn supervise(sock: PathBuf, stats: Arc<SmartStats>, mut shutdown: watch::R
             if names.is_empty() {
                 st_log!("no smart group configured (ppsub.json), idle");
             } else {
-                st_log!("managing {} smart group(s): {}", names.len(), names.join(", "));
+                st_log!(
+                    "managing {} smart group(s): {}",
+                    names.len(),
+                    names.join(", ")
+                );
             }
             last_names = names;
         }
@@ -275,7 +284,10 @@ async fn supervise(sock: PathBuf, stats: Arc<SmartStats>, mut shutdown: watch::R
                 continue;
             }
             let (ctx, crx) = watch::channel(false);
-            st_log!("runner for `{url}` started, covering: {}", group_names(gs).join(", "));
+            st_log!(
+                "runner for `{url}` started, covering: {}",
+                group_names(gs).join(", ")
+            );
             tokio::spawn(runner(
                 sock.clone(),
                 url.clone(),
@@ -302,7 +314,10 @@ async fn supervise(sock: PathBuf, stats: Arc<SmartStats>, mut shutdown: watch::R
     st_log!("scheduler exited");
 }
 
-fn bucket_by_url(groups: &[SmartGroup], default_url: &str) -> std::collections::BTreeMap<String, Vec<SmartGroup>> {
+fn bucket_by_url(
+    groups: &[SmartGroup],
+    default_url: &str,
+) -> std::collections::BTreeMap<String, Vec<SmartGroup>> {
     let mut buckets: std::collections::BTreeMap<String, Vec<SmartGroup>> = Default::default();
     let mut seen = std::collections::HashSet::new();
     for g in groups {
@@ -332,6 +347,14 @@ async fn runner(
     mut cancel: watch::Receiver<bool>,
 ) {
     loop {
+
+        if !sock.exists() {
+            st_log!("clash api {} not up yet, idle", sock.display());
+            if sleep_or_shutdown(WAIT_CLASH, &mut cancel).await {
+                return;
+            }
+            continue;
+        }
         let mut any_err = false;
         for g in &groups {
             if *cancel.borrow() {
@@ -341,7 +364,11 @@ async fn runner(
             let r = run_group_pass(&sock, &g.name, &url, &mut st, &stats, &cancel).await;
             states.lock().unwrap().insert(g.name.clone(), st);
             if let Err(e) = r {
-                tracing::warn!("[PaoPaoGW Smart Test] {}: clash api error ({e}), retry in {}s", g.name, ERR_BACKOFF.as_secs());
+                tracing::warn!(
+                    "[PaoPaoGW Smart Test] {}: clash api error ({e}), retry in {}s",
+                    g.name,
+                    ERR_BACKOFF.as_secs()
+                );
                 any_err = true;
                 break;
             }
@@ -402,8 +429,11 @@ async fn run_group_pass(
     }
 
     if !no_data.is_empty() {
-        st_log!("{group}: testing {} node(s) without history (concurrent, {}ms timeout)",
-            no_data.len(), REGULAR_TIMEOUT_MS);
+        st_log!(
+            "{group}: testing {} node(s) without history (concurrent, {}ms timeout)",
+            no_data.len(),
+            REGULAR_TIMEOUT_MS
+        );
         for (m, d) in test_many(sock, &no_data, url, REGULAR_TIMEOUT_MS).await {
             st.push(&m.name, d);
             log_result(group, &m.name, d, st.score(&m.name));
@@ -418,13 +448,18 @@ async fn run_group_pass(
             .min_by(|a, b| st.score(&a.name).total_cmp(&st.score(&b.name)))
         {
             select_node(sock, group, &best.name).await?;
-            st_info!("{group}: current selection `{current}` invalid (clash reloaded?), reselected `{}`",
-                best.name);
+            st_info!(
+                "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{}`",
+                best.name
+            );
             current = best.name.clone();
         }
     }
 
-    st_log!("{group}: sequential sweep over {} node(s), current `{current}`", members.len());
+    st_log!(
+        "{group}: sequential sweep over {} node(s), current `{current}`",
+        members.len()
+    );
     if let Some(cur) = members.iter().find(|m| m.name == current) {
         let d = test_member(sock, cur, url, REGULAR_TIMEOUT_MS).await;
         st.push(&cur.name, d);
@@ -444,13 +479,19 @@ async fn run_group_pass(
         let (cand, cur) = (st.score(&m.name), st.score(&current));
         if cand < cur {
             select_node(sock, group, &m.name).await?;
-            st_info!("{group}: switch `{current}` -> `{}` (score {} < {})",
-                m.name, cand.round() as u64, cur.round() as u64);
+            st_info!(
+                "{group}: switch `{current}` -> `{}` (score {} < {})",
+                m.name,
+                cand.round() as u64,
+                cur.round() as u64
+            );
             current = m.name.clone();
         }
     }
-    st_log!("{group}: sweep done, selected `{current}` (score {})",
-        fmt_score(st.score(&current)));
+    st_log!(
+        "{group}: sweep done, selected `{current}` (score {})",
+        fmt_score(st.score(&current))
+    );
     Ok(())
 }
 
@@ -524,7 +565,10 @@ async fn ladder_pass(
     now: &str,
 ) -> std::io::Result<()> {
     let refs: Vec<&Member> = members.iter().collect();
-    st_log!("{group}: no history at all, laddered concurrent probe over {} node(s)", refs.len());
+    st_log!(
+        "{group}: no history at all, laddered concurrent probe over {} node(s)",
+        refs.len()
+    );
     for t in LADDER_MS {
         let results = test_many(sock, &refs, url, t).await;
         let mut best: Option<(&Member, u32)> = None;
@@ -606,14 +650,16 @@ async fn test_member(sock: &Path, m: &Member, url: &str, timeout_ms: u64) -> Opt
 }
 
 async fn select_node(sock: &Path, group: &str, name: &str) -> std::io::Result<()> {
-    let path = format!(
-        "/proxies/{}",
-        crate::web_proxies::pct_encode_segment(group)
-    );
+    let path = format!("/proxies/{}", crate::web_proxies::pct_encode_segment(group));
     let body = serde_json::json!({ "name": name }).to_string();
     let (status, _) = uds_request(sock, "PUT", &path, Some(&body)).await?;
     if !(200..300).contains(&status) {
-        tracing::warn!(group, name, status, "smart speedtest: select rejected by clash");
+        tracing::warn!(
+            group,
+            name,
+            status,
+            "smart speedtest: select rejected by clash"
+        );
     }
     Ok(())
 }
@@ -738,8 +784,14 @@ mod tests {
         assert_eq!(
             g,
             vec![
-                SmartGroup { name: "A".into(), url: "http://x".into() },
-                SmartGroup { name: "C".into(), url: "".into() },
+                SmartGroup {
+                    name: "A".into(),
+                    url: "http://x".into()
+                },
+                SmartGroup {
+                    name: "C".into(),
+                    url: "".into()
+                },
             ]
         );
         assert!(parse_smart_groups("not json").is_empty());
@@ -785,7 +837,11 @@ mod tests {
         }}));
         assert!(needs_providers(&px, "Grp"));
         let (m, _) = eligible_members(&px, Some(&pv), "Grp").unwrap();
-        assert_eq!(m.len(), 1, "Ghost not found on either side → skip; tag nodes skipped");
+        assert_eq!(
+            m.len(),
+            1,
+            "Ghost not found on either side → skip; tag nodes skipped"
+        );
         assert_eq!(m[0].name, "P1");
         assert_eq!(m[0].provider.as_deref(), Some("Grp=(Pre🔗Grp)"));
     }
@@ -796,18 +852,36 @@ mod tests {
             "Smart":{"all":["N1","smartspeedtest@hide"]},
             "N1":{"type":"Trojan"}
         }}));
-        assert!(!needs_providers(&px, "Smart"), "tag nodes should not trigger provider pulls");
+        assert!(
+            !needs_providers(&px, "Smart"),
+            "tag nodes should not trigger provider pulls"
+        );
         assert!(!needs_providers(&px, "Nope"));
     }
 
     #[test]
     fn bucket_groups_by_effective_url() {
         let gs = vec![
-            SmartGroup { name: "A".into(), url: "http://x".into() },
-            SmartGroup { name: "B".into(), url: "".into() },
-            SmartGroup { name: "C".into(), url: "http://x".into() },
-            SmartGroup { name: "D".into(), url: "http://def".into() },
-            SmartGroup { name: "A".into(), url: "http://dup".into() },
+            SmartGroup {
+                name: "A".into(),
+                url: "http://x".into(),
+            },
+            SmartGroup {
+                name: "B".into(),
+                url: "".into(),
+            },
+            SmartGroup {
+                name: "C".into(),
+                url: "http://x".into(),
+            },
+            SmartGroup {
+                name: "D".into(),
+                url: "http://def".into(),
+            },
+            SmartGroup {
+                name: "A".into(),
+                url: "http://dup".into(),
+            },
         ];
         let b = bucket_by_url(&gs, "http://def");
         assert_eq!(b.len(), 2, "{b:?}");
@@ -830,9 +904,18 @@ mod tests {
             "N3":{"type":"Vless","history":[]}
         }}));
         let members = vec![
-            Member { name: "N1".into(), provider: None },
-            Member { name: "N2".into(), provider: None },
-            Member { name: "N3".into(), provider: None },
+            Member {
+                name: "N1".into(),
+                provider: None,
+            },
+            Member {
+                name: "N2".into(),
+                provider: None,
+            },
+            Member {
+                name: "N3".into(),
+                provider: None,
+            },
         ];
         let mut st = GroupState::default();
         let n = seed_from_clash(&mut st, &members, &px, None, "http://t");
@@ -842,7 +925,11 @@ mod tests {
             vec![Some(100), None, Some(120)],
             "extra[url] bucket takes priority, delay=0 counted as failure"
         );
-        assert_eq!(st.hist["N2"].samples, vec![Some(300)], "top-level history fallback");
+        assert_eq!(
+            st.hist["N2"].samples,
+            vec![Some(300)],
+            "top-level history fallback"
+        );
         assert!(!st.hist.contains_key("N3"));
 
         let n2 = seed_from_clash(&mut st, &members, &px, None, "http://t");

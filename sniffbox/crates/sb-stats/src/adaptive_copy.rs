@@ -277,7 +277,11 @@ mod tests {
         drop(c);
         let _ = tokio::time::timeout(Duration::from_secs(5), proxy_h).await;
 
-        assert_eq!(up.load(Ordering::Relaxed), REQ as u64, "upload must equal REQ exactly");
+        assert_eq!(
+            up.load(Ordering::Relaxed),
+            REQ as u64,
+            "upload must equal REQ exactly"
+        );
         assert_eq!(
             down.load(Ordering::Relaxed),
             RESP as u64,

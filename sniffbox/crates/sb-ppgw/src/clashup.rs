@@ -27,6 +27,8 @@ pub fn cmd_clash_up(io: &mut Io) -> i32 {
             Ok(resp) => {
                 let code = resp.status().as_u16();
                 if (200..300).contains(&code) {
+
+                    crate::procinfo::touch_ready_marker();
                     let _ = writeln!(
                         io.out,
                         "{}clash up (HTTP {code})",

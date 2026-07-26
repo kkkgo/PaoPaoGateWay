@@ -464,6 +464,11 @@ impl WebInfo {
         let (mem_total, _) = sysinfo::meminfo();
         let (cpu_model, cpu_cores) = sysinfo::cpu_model_cores();
 
+        let (freq_min, freq_max) = match sysinfo::cpu_freq_range_khz() {
+            Some((lo, hi)) => (Some(lo / 1000), Some(hi / 1000)),
+            None => (None, None),
+        };
+
         let ifaces: Vec<serde_json::Value> = sysinfo::interfaces()
             .into_iter()
             .map(|i| {
@@ -473,6 +478,12 @@ impl WebInfo {
                     "ipv6": i.ipv6,
                     "mac": i.mac,
                     "gateway": i.gateway,
+                    "model": i.model,
+                    "driver": i.driver,
+                    "pci_id": i.pci_id,
+                    "speed": i.speed,
+                    "duplex": i.duplex,
+                    "link": i.link,
                 })
             })
             .collect();
@@ -516,7 +527,12 @@ impl WebInfo {
             "ppsub": self.is_ppsub(),
             "kernel": sysinfo::kernel_version(),
             "memory": { "total": mem_total },
-            "cpu": { "model": cpu_model, "cores": cpu_cores },
+            "cpu": {
+                "model": cpu_model,
+                "cores": cpu_cores,
+                "freq_min": freq_min,
+                "freq_max": freq_max,
+            },
             "interfaces": ifaces,
             "dns": {
                 "trusted": trusted,
@@ -633,6 +649,14 @@ impl WebInfo {
 
         let (_, mem_avail) = sysinfo::meminfo();
 
+        let freqs_mhz: Vec<u32> = sysinfo::cpu_freqs_khz()
+            .into_iter()
+            .map(|k| (k as f64 / 1000.0).round() as u32)
+            .collect();
+        let freq_avg = (!freqs_mhz.is_empty())
+            .then(|| freqs_mhz.iter().map(|&m| m as u64).sum::<u64>() / freqs_mhz.len() as u64);
+        let temp = sysinfo::cpu_temp();
+
         let all = self.shared.conn_table.snapshot();
         let (down_total, up_total) = live_totals(&self.shared, &all);
         let conns = self.conn_stats(&all);
@@ -659,6 +683,10 @@ impl WebInfo {
             "cpu": {
                 "usage": r1(cpu_pct),
                 "per_core": cpu_cores,
+                "freq": freq_avg,
+                "freq_per_core": freqs_mhz,
+                "temp": temp.as_ref().map(|t| r1(t.celsius)),
+                "temp_sensor": temp.as_ref().map(|t| t.sensor.clone()),
                 "sniffbox": r1(self_pct),
                 "clash": clash_pid.map(|_| r1(clash_pct)),
                 "ovpn": ovpn_pid.map(|_| r1(ovpn_pct)),
@@ -971,7 +999,11 @@ mod tests {
 
         rec.download.store(100_000_000, Ordering::Relaxed);
         rec.upload.store(2_000_000, Ordering::Relaxed);
-        assert_eq!(shared.traffic.totals(), (0, 0), "flush loop has not settled yet");
+        assert_eq!(
+            shared.traffic.totals(),
+            (0, 0),
+            "flush loop has not settled yet"
+        );
         assert_eq!(
             dyn_totals(),
             (100_000_000, 2_000_000),

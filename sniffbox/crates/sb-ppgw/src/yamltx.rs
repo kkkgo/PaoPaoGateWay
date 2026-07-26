@@ -124,25 +124,13 @@ fn resolve_subdns_batch(
     specs: &[String],
     ipv6_enabled: bool,
 ) -> std::collections::HashMap<String, Vec<IpAddr>> {
-    use std::sync::Mutex;
-    let out: Mutex<std::collections::HashMap<String, Vec<IpAddr>>> =
-        Mutex::new(std::collections::HashMap::new());
-    let out_ref = &out;
-    for chunk in domains.chunks(16) {
-        std::thread::scope(|s| {
-            for domain in chunk {
-                let domain = domain.clone();
-                let specs: Vec<String> = specs.to_vec();
-                s.spawn(move || {
-                    let ips = crate::dohdot::resolve_via_servers(&domain, &specs, ipv6_enabled);
-                    if !ips.is_empty() {
-                        out_ref.lock().unwrap().insert(domain, ips);
-                    }
-                });
-            }
-        });
-    }
-    out.into_inner().unwrap()
+    crate::resolvepool::resolve_batch(
+        crate::resolvepool::DNS_LOG,
+        "subdns",
+        domains,
+        crate::resolvepool::Budget::subdns(),
+        |domain, dl| crate::dohdot::resolve_via_servers_traced(domain, specs, ipv6_enabled, dl),
+    )
 }
 
 pub(crate) fn generate_node_name(base: &str, ip: &str, used: &HashSet<String>) -> String {
@@ -272,7 +260,11 @@ mod tests {
         ])
         .unwrap();
         let doc = &YamlLoader::load_from_str(&out).unwrap()[0];
-        assert_eq!(doc["mode"].as_str(), Some("global"), "latter overrides mode");
+        assert_eq!(
+            doc["mode"].as_str(),
+            Some("global"),
+            "latter overrides mode"
+        );
         assert_eq!(doc["tproxy-port"].as_i64(), Some(1081), "keep keys from b");
         assert!(doc["proxies"].as_vec().is_some(), "keep proxies from a");
     }

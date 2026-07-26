@@ -258,8 +258,7 @@ pub fn init(level: &str, timestamp: bool) {
             offset,
         })
         .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-            !(meta.target().starts_with("sniffbox::smart_speed")
-                && *meta.level() == Level::DEBUG)
+            !(meta.target().starts_with("sniffbox::smart_speed") && *meta.level() == Level::DEBUG)
         }));
 
     let (tx, _rx0) = tokio::sync::broadcast::channel::<Arc<LogEvent>>(1024);

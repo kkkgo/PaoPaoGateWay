@@ -1,9 +1,17 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use super::{SubResult, UserInfo, pp_log, pp_step, pp_warn, ystr};
+use super::{LOG, SubResult, UserInfo, pp_log, pp_step, pp_warn, ystr};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use yaml_rust2::Yaml;
+
+type Resolved = HashMap<String, Vec<IpAddr>>;
+
+struct SubdnsJob {
+    name: String,
+    specs: Vec<String>,
+    domains: Vec<String>,
+}
 
 pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) -> Vec<Yaml> {
     let dns_servers = collect_dns_servers(ex_dns);
@@ -12,34 +20,10 @@ pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) 
     let mut used: HashSet<String> = HashSet::new();
     let mut userinfo: Option<(UserInfo, String)> = None;
 
-    let resolved = if dns_burn {
-        let mut domains: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for r in sub_results.iter().filter(|r| r.success) {
-            for p in &r.proxies {
-                if let Some(server) = p["server"].as_str() {
-                    if server.parse::<IpAddr>().is_err() && seen.insert(server.to_string()) {
-                        domains.push(server.to_string());
-                    }
-                }
-            }
-        }
-        if dns_servers.is_empty() {
-            pp_warn(
-                "dns_burn: no DNS server configured (dns_ip/ex_dns empty), skipping domain resolution",
-            );
-        } else {
-            pp_step(&format!(
-                "dns_burn: resolving {} unique domain server(s) via [{}]",
-                domains.len(),
-                dns_servers.join(", ")
-            ));
-        }
-        let resolved = crate::dnsutil::resolve_domains_concurrent(&domains, &dns_servers, ipv6);
-        log_resolved("dns_burn", &domains, &resolved);
-        resolved
+    let (resolved, subdns) = if dns_burn {
+        resolve_all(sub_results, &dns_servers, ipv6)
     } else {
-        HashMap::new()
+        (HashMap::new(), HashMap::new())
     };
 
     for r in sub_results {
@@ -64,7 +48,9 @@ pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) 
 
     if dns_burn {
         for r in sub_results.iter().filter(|r| r.success) {
-            sub_subdns_burn(r, ipv6, &resolved, &mut used, &mut all);
+            if let Some(got) = subdns.get(&r.name) {
+                emit_subdns_nodes(r, got, &mut used, &mut all);
+            }
         }
     }
 
@@ -100,16 +86,102 @@ pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) 
     result
 }
 
-fn log_resolved(tag: &str, domains: &[String], resolved: &HashMap<String, Vec<IpAddr>>) {
-    for d in domains {
-        match resolved.get(d) {
-            Some(ips) if !ips.is_empty() => {
-                let list: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-                pp_log(&format!("{tag}: {d} -> {}", list.join(", ")));
+fn resolve_all(
+    sub_results: &[SubResult],
+    dns_servers: &[String],
+    ipv6: bool,
+) -> (Resolved, HashMap<String, Resolved>) {
+
+    let mut domains: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for r in sub_results.iter().filter(|r| r.success) {
+        for d in sub_domains(r) {
+            if seen.insert(d.clone()) {
+                domains.push(d);
             }
-            _ => pp_warn(&format!("{tag}: {d} -> FAILED (no answer)")),
         }
     }
+    if dns_servers.is_empty() {
+        pp_warn(
+            "dns_burn: no DNS server configured (dns_ip/ex_dns empty), skipping domain resolution",
+        );
+    } else {
+        pp_step(&format!(
+            "dns_burn: resolving {} unique domain server(s) via [{}]",
+            domains.len(),
+            dns_servers.join(", ")
+        ));
+    }
+
+    let jobs: Vec<SubdnsJob> = sub_results
+        .iter()
+        .filter(|r| r.success)
+        .filter_map(|r| {
+            let specs = sub_dns_servers(&r.raw_yaml);
+            let domains = sub_domains(r);
+            (!specs.is_empty() && !domains.is_empty()).then(|| SubdnsJob {
+                name: r.name.clone(),
+                specs,
+                domains,
+            })
+        })
+        .collect();
+    for j in &jobs {
+        pp_step(&format!(
+            "[{}] subdns: resolving {} domain(s) via sub's own DNS [{}]",
+            j.name,
+            j.domains.len(),
+            j.specs.join(", ")
+        ));
+    }
+
+    let subdns: std::sync::Mutex<HashMap<String, Resolved>> = std::sync::Mutex::new(HashMap::new());
+    let mut resolved = HashMap::new();
+    std::thread::scope(|s| {
+        let sub_ref = &subdns;
+        for j in &jobs {
+            s.spawn(move || {
+                let tag = format!("[{}] subdns", j.name);
+                let got = crate::resolvepool::resolve_batch(
+                    LOG,
+                    &tag,
+                    &j.domains,
+                    crate::resolvepool::Budget::subdns(),
+                    |domain, dl| {
+                        crate::dohdot::resolve_via_servers_traced(domain, &j.specs, ipv6, dl)
+                    },
+                );
+                sub_ref.lock().unwrap().insert(j.name.clone(), got);
+            });
+        }
+
+        resolved =
+            crate::dnsutil::resolve_domains_logged(LOG, "dns_burn", &domains, dns_servers, ipv6);
+    });
+
+    let subdns = subdns
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|(name, got)| {
+            let uniq = subtract_known(got, &resolved, &format!("[{name}] subdns"));
+            (name, uniq)
+        })
+        .collect();
+    (resolved, subdns)
+}
+
+fn sub_domains(r: &SubResult) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for p in &r.proxies {
+        if let Some(server) = p["server"].as_str() {
+            if server.parse::<IpAddr>().is_err() && seen.insert(server.to_string()) {
+                out.push(server.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn burn_proxy(
@@ -140,40 +212,12 @@ fn burn_proxy(
     }
 }
 
-fn sub_subdns_burn(
+fn emit_subdns_nodes(
     r: &SubResult,
-    ipv6: bool,
-    burn: &HashMap<String, Vec<IpAddr>>,
+    unique: &HashMap<String, Vec<IpAddr>>,
     used: &mut HashSet<String>,
     all: &mut Vec<Yaml>,
 ) {
-    let specs = sub_dns_servers(&r.raw_yaml);
-    if specs.is_empty() {
-        return;
-    }
-
-    let mut domains: Vec<String> = Vec::new();
-    let mut domain_seen: HashSet<String> = HashSet::new();
-    for p in &r.proxies {
-        if let Some(server) = p["server"].as_str() {
-            if server.parse::<IpAddr>().is_err() && domain_seen.insert(server.to_string()) {
-                domains.push(server.to_string());
-            }
-        }
-    }
-    if domains.is_empty() {
-        return;
-    }
-    pp_step(&format!(
-        "[{}] subdns: resolving {} domain(s) via sub's own DNS [{}]",
-        r.name,
-        domains.len(),
-        specs.join(", ")
-    ));
-    let resolved = resolve_domains_concurrent(&domains, &specs, ipv6);
-    log_resolved(&format!("[{}] subdns", r.name), &domains, &resolved);
-
-    let unique = subtract_known(resolved, burn, &format!("[{}] subdns", r.name));
 
     for p in &r.proxies {
         let Some(server) = p["server"].as_str() else {
@@ -238,29 +282,6 @@ fn sub_dns_servers(raw_yaml: &str) -> Vec<String> {
     crate::dohdot::extract_dns_servers(&doc["dns"])
 }
 
-fn resolve_domains_concurrent(
-    domains: &[String],
-    specs: &[String],
-    ipv6: bool,
-) -> HashMap<String, Vec<IpAddr>> {
-    use std::sync::Mutex;
-    let out: Mutex<HashMap<String, Vec<IpAddr>>> = Mutex::new(HashMap::new());
-    let out_ref = &out;
-    for chunk in domains.chunks(16) {
-        std::thread::scope(|s| {
-            for domain in chunk {
-                s.spawn(move || {
-                    let ips = crate::dohdot::resolve_via_servers(domain, specs, ipv6);
-                    if !ips.is_empty() {
-                        out_ref.lock().unwrap().insert(domain.clone(), ips);
-                    }
-                });
-            }
-        });
-    }
-    out.into_inner().unwrap()
-}
-
 fn generate_subdns_node_name(base: &str, ip: &str, used: &HashSet<String>) -> String {
     let suffix = if ip.contains(':') {
         let clean: String = ip.chars().filter(|c| *c != ':').collect();
@@ -317,6 +338,29 @@ fn format_expire(expire: i64) -> String {
 mod tests {
     use super::*;
 
+    fn subdns_burn_one(
+        r: &SubResult,
+        ipv6: bool,
+        burn: &HashMap<String, Vec<IpAddr>>,
+        used: &mut HashSet<String>,
+        all: &mut Vec<Yaml>,
+    ) {
+        let specs = sub_dns_servers(&r.raw_yaml);
+        let domains = sub_domains(r);
+        if specs.is_empty() || domains.is_empty() {
+            return;
+        }
+        let got = crate::resolvepool::resolve_batch(
+            LOG,
+            "subdns",
+            &domains,
+            crate::resolvepool::Budget::subdns(),
+            |domain, dl| crate::dohdot::resolve_via_servers_traced(domain, &specs, ipv6, dl),
+        );
+        let uniq = subtract_known(got, burn, "subdns");
+        emit_subdns_nodes(r, &uniq, used, all);
+    }
+
     #[test]
     fn expire_date_format() {
 
@@ -342,9 +386,18 @@ mod tests {
 
         assert_eq!(out.len(), 3);
         let info = out[0]["name"].as_str().unwrap();
-        assert!(info.starts_with("S_S: "), "merged node has <sub>_<sub> prefix: {info}");
-        assert!(info.contains("1.00G/2.00G"), "remaining/total traffic: {info}");
-        assert!(info.ends_with("@@2023-11-14"), "@@ separates expiry date: {info}");
+        assert!(
+            info.starts_with("S_S: "),
+            "merged node has <sub>_<sub> prefix: {info}"
+        );
+        assert!(
+            info.contains("1.00G/2.00G"),
+            "remaining/total traffic: {info}"
+        );
+        assert!(
+            info.ends_with("@@2023-11-14"),
+            "@@ separates expiry date: {info}"
+        );
         assert_eq!(out[1]["name"].as_str(), Some("S_A"));
     }
 
@@ -452,7 +505,7 @@ mod tests {
         used.insert("S_HK".to_string());
         let mut all = vec![node("S_HK", "hk.example.com")];
 
-        sub_subdns_burn(&r, false, &HashMap::new(), &mut used, &mut all);
+        subdns_burn_one(&r, false, &HashMap::new(), &mut used, &mut all);
         stop.store(true, Ordering::Relaxed);
         let _ = h.join();
 
@@ -518,7 +571,7 @@ mod tests {
             node("HK02", "hk.example.com"),
         ];
 
-        sub_subdns_burn(&r, false, &HashMap::new(), &mut used, &mut all);
+        subdns_burn_one(&r, false, &HashMap::new(), &mut used, &mut all);
         stop.store(true, Ordering::Relaxed);
         let _ = h.join();
 

@@ -233,7 +233,10 @@ mod tests {
         assert_eq!(dports[1], 443);
         assert_eq!(arr[0]["sniff"][0], "tls");
         assert_eq!(arr[0]["inbound"][0], "tproxy");
-        assert!(arr[0].get("chains").is_none(), "proxy chain removed from aggregate record");
+        assert!(
+            arr[0].get("chains").is_none(),
+            "proxy chain removed from aggregate record"
+        );
     }
 
     #[test]

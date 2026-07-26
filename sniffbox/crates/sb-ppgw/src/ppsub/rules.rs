@@ -154,7 +154,11 @@ fn download_rules(url: &str) -> Result<Vec<String>, String> {
     for _ in 0..3 {
         let tmp = std::env::temp_dir().join(format!("ppsub_rules_{}.yaml", std::process::id()));
         let tmp_s = tmp.to_string_lossy().into_owned();
-        match crate::download::Downloader::new(url, &tmp_s).download() {
+
+        match crate::download::Downloader::new(url, &tmp_s)
+            .best_effort(crate::ruleset::PREFETCH_TIMEOUT)
+            .download()
+        {
             Ok(_) => {
                 let data = std::fs::read_to_string(&tmp).map_err(|e| e.to_string())?;
                 let _ = std::fs::remove_file(&tmp);
@@ -260,7 +264,10 @@ mod tests {
         let (rules, providers) = process_rules(&sets, &groups).unwrap();
         assert!(rules.contains(&"RULE-SET,ad,REJECT".to_string()));
         assert!(rules.contains(&"DOMAIN,a.com,Proxy".to_string()));
-        assert!(!rules.iter().any(|r| r.contains("Ghost")), "invalid group rules removed");
+        assert!(
+            !rules.iter().any(|r| r.contains("Ghost")),
+            "invalid group rules removed"
+        );
         assert!(rules.contains(&"MATCH,DIRECT".to_string()));
 
         assert!(providers.contains_key(&ystr("ad")));
@@ -301,7 +308,11 @@ mod tests {
         let (_rules, providers) = process_rules(&sets, &groups).unwrap();
         let a = providers.get(&ystr("a")).unwrap();
         assert_eq!(a["interval"].as_i64(), Some(60), "interval<60 → 60");
-        assert_eq!(a["behavior"].as_str(), Some("classical"), "default classical");
+        assert_eq!(
+            a["behavior"].as_str(),
+            Some("classical"),
+            "default classical"
+        );
         assert_eq!(a["type"].as_str(), Some("http"));
     }
 }

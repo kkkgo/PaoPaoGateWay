@@ -1,0 +1,68 @@
+name: Build Docker ARM64
+
+on:
+  # schedule:
+  #   - cron: '35 23 * * *'
+  push:
+    paths-ignore:
+      - '*.md'
+      - '.github/**'
+      - 'LICENSE'
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  build_arm64:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@main
+    - name: remove full mod flag
+      run: sed -i '/usefullmod/d' makeiso-arm64.sh
+    - name: Set SHSHA
+      run: echo "SHSHA="$(echo "${{ github.sha }}"|grep -Eo "^[0-9a-z]{7}"|head -1) >> $GITHUB_ENV
+    - name: Gen sha.txt
+      run: echo "${{ env.SHSHA }}" >sha.txt
+    - name: Set TAG_NAME
+      run: echo "TAG_NAME=""$(date +%Y%m%d)"""-"${{ env.SHSHA }}" >> $GITHUB_ENV
+    - name: build iso
+      run: sh makeiso-arm64.sh
+    - name: Set variables
+      run:  echo "RE_NOTE=$(cat ./iso/renote.txt | tr -d '[:space:]')" >> $GITHUB_ENV
+    - name: show iso sha256sum
+      run: cat ./iso/renote.txt
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@master
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@master
+    - name: Login to Docker Hub
+      uses: docker/login-action@master
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    - name: Build and push
+      uses: docker/build-push-action@master
+      with:
+        context: "./iso"
+        push: true
+        platforms: linux/amd64
+        tags: sliamb/ppgwiso:arm64
+
+  push-ecr:
+    needs: build_arm64
+    runs-on: ubuntu-latest
+    container: alpine
+    steps:
+    - name: "Configure AWS Credentials"
+      uses: aws-actions/configure-aws-credentials@main
+      with:
+        aws-region: us-east-1
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    - name: install skopeo and aws-cli
+      run: apk update && apk add skopeo aws-cli
+    - name: login ecr
+      run: aws ecr-public get-login-password --region us-east-1 | skopeo login --username AWS --password-stdin public.ecr.aws
+    - name: push ecr
+      run: skopeo copy --all docker://sliamb/ppgwiso:arm64 docker://public.ecr.aws/sliamb/ppgwiso:arm64

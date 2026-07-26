@@ -173,6 +173,18 @@ impl SocksPool {
         Ok(s)
     }
 
+    pub fn flush_idle(&self) -> usize {
+        let n = {
+            let mut g = self.inner.idle.lock();
+            let n = g.len();
+            g.clear();
+            n
+        };
+
+        self.inner.warm_notify.notify_one();
+        n
+    }
+
     pub fn release_clean(&self, stream: TcpStream) {
         let cfg = self.cfg();
         let mut g = self.inner.idle.lock();

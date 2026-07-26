@@ -95,12 +95,26 @@ pub async fn handle(
     }
 }
 
-async fn probe(stream: &mut TcpStream, req: &ReqHead, cfg: &ServerConfig, ka: bool, body: &[u8]) -> io::Result<()> {
+async fn probe(
+    stream: &mut TcpStream,
+    req: &ReqHead,
+    cfg: &ServerConfig,
+    ka: bool,
+    body: &[u8],
+) -> io::Result<()> {
     let Some(src) = cfg.probe.as_ref() else {
         return respond::not_found(stream, ka).await;
     };
     if !req.method.eq_ignore_ascii_case("POST") {
-        return respond::send(stream, 405, "Method Not Allowed", &[JSON, ("Allow", "POST")], b"", ka).await;
+        return respond::send(
+            stream,
+            405,
+            "Method Not Allowed",
+            &[JSON, ("Allow", "POST")],
+            b"",
+            ka,
+        )
+        .await;
     }
     let Ok(body) = std::str::from_utf8(body) else {
         let msg = br#"{"ok":false,"denied":true,"error":"body must be utf-8"}"#;
@@ -113,7 +127,15 @@ async fn probe(stream: &mut TcpStream, req: &ReqHead, cfg: &ServerConfig, ka: bo
 
         Ok(Err(_busy)) => {
             let msg = br#"{"ok":false,"busy":true,"error":"too many concurrent probes"}"#;
-            respond::send(stream, 429, "Too Many Requests", &[JSON, ("Retry-After", "1")], msg, ka).await
+            respond::send(
+                stream,
+                429,
+                "Too Many Requests",
+                &[JSON, ("Retry-After", "1")],
+                msg,
+                ka,
+            )
+            .await
         }
         Err(e) => {
             tracing::warn!(%e, "probe task panicked");
@@ -137,7 +159,15 @@ async fn traffic_total(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> 
     };
     let (d, u) = src.totals();
     let body = format!(r#"{{"downloadTotal":{d},"uploadTotal":{u}}}"#);
-    respond::send(stream, 200, "OK", &[("Content-Type", "application/json")], body.as_bytes(), ka).await
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+        ka,
+    )
+    .await
 }
 
 async fn nodes_get(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::Result<()> {
@@ -145,28 +175,60 @@ async fn nodes_get(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::
         return respond::not_found(stream, ka).await;
     };
     let body = src.nodes_json();
-    respond::send(stream, 200, "OK", &[("Content-Type", "application/json")], body.as_bytes(), ka).await
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+        ka,
+    )
+    .await
 }
 
-async fn proxies_get(stream: &mut TcpStream, req: &ReqHead, cfg: &ServerConfig, ka: bool) -> io::Result<()> {
+async fn proxies_get(
+    stream: &mut TcpStream,
+    req: &ReqHead,
+    cfg: &ServerConfig,
+    ka: bool,
+) -> io::Result<()> {
     let Some(src) = cfg.proxies.as_ref() else {
         return respond::not_found(stream, ka).await;
     };
 
     let fresh = req.path.contains("fresh=1");
     let src = Arc::clone(src);
-    let body = tokio::task::spawn_blocking(move || if fresh { src.proxies_json_fresh() } else { src.proxies_json() })
-        .await
-        .unwrap_or_else(|_| "{}".to_string());
+    let body = tokio::task::spawn_blocking(move || {
+        if fresh {
+            src.proxies_json_fresh()
+        } else {
+            src.proxies_json()
+        }
+    })
+    .await
+    .unwrap_or_else(|_| "{}".to_string());
     respond::send(stream, 200, "OK", &[JSON], body.as_bytes(), ka).await
 }
 
-async fn proxy_detail_get(stream: &mut TcpStream, req: &ReqHead, cfg: &ServerConfig, ka: bool) -> io::Result<()> {
+async fn proxy_detail_get(
+    stream: &mut TcpStream,
+    req: &ReqHead,
+    cfg: &ServerConfig,
+    ka: bool,
+) -> io::Result<()> {
     let Some(src) = cfg.proxies.as_ref() else {
         return respond::not_found(stream, ka).await;
     };
     let Some(name) = query_param(&req.path, "name").filter(|n| !n.is_empty()) else {
-        return respond::send(stream, 400, "Bad Request", &[JSON], br#"{"message":"missing name"}"#, ka).await;
+        return respond::send(
+            stream,
+            400,
+            "Bad Request",
+            &[JSON],
+            br#"{"message":"missing name"}"#,
+            ka,
+        )
+        .await;
     };
     let src = Arc::clone(src);
     let (status, body) = tokio::task::spawn_blocking(move || src.proxy_detail(&name))
@@ -219,7 +281,15 @@ async fn nodes_clear(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io
         return respond::not_found(stream, ka).await;
     };
     src.clear();
-    respond::send(stream, 200, "OK", &[("Content-Type", "application/json")], br#"{"cleared":true}"#, ka).await
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json")],
+        br#"{"cleared":true}"#,
+        ka,
+    )
+    .await
 }
 
 async fn info_get(
@@ -242,7 +312,15 @@ async fn info_get(
     let body = tokio::task::spawn_blocking(move || src.info_json(scope))
         .await
         .unwrap_or_else(|_| "{}".to_string());
-    respond::send(stream, 200, "OK", &[("Content-Type", "application/json")], body.as_bytes(), ka).await
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+        ka,
+    )
+    .await
 }
 
 async fn reload(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::Result<()> {
@@ -320,9 +398,14 @@ async fn reload(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::Res
 async fn clash_up(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::Result<()> {
     let Some(ctl) = cfg.clash_control.clone() else {
         return respond::send(
-            stream, 503, "Service Unavailable", &[JSON],
-            br#"{"running":false,"error":"clash disabled in this mode"}"#, ka,
-        ).await;
+            stream,
+            503,
+            "Service Unavailable",
+            &[JSON],
+            br#"{"running":false,"error":"clash disabled in this mode"}"#,
+            ka,
+        )
+        .await;
     };
 
     match tokio::task::spawn_blocking(move || ctl.ensure_up()).await {
@@ -336,11 +419,27 @@ async fn clash_up(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::R
         }
         Ok(Err(e)) => {
             tracing::warn!(%e, "clash ensure_up failed");
-            respond::send(stream, 500, "Internal Server Error", &[JSON], br#"{"running":false,"error":"spawn failed"}"#, ka).await
+            respond::send(
+                stream,
+                500,
+                "Internal Server Error",
+                &[JSON],
+                br#"{"running":false,"error":"spawn failed"}"#,
+                ka,
+            )
+            .await
         }
         Err(e) => {
             tracing::warn!(%e, "clash ensure_up task join failed");
-            respond::send(stream, 500, "Internal Server Error", &[JSON], br#"{"running":false,"error":"internal"}"#, ka).await
+            respond::send(
+                stream,
+                500,
+                "Internal Server Error",
+                &[JSON],
+                br#"{"running":false,"error":"internal"}"#,
+                ka,
+            )
+            .await
         }
     }
 }
@@ -350,7 +449,15 @@ async fn traffic_clear(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> 
         return respond::not_found(stream, ka).await;
     };
     src.clear();
-    respond::send(stream, 200, "OK", &[("Content-Type", "application/json")], br#"{"cleared":true}"#, ka).await
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json")],
+        br#"{"cleared":true}"#,
+        ka,
+    )
+    .await
 }
 
 async fn traffic_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
@@ -392,7 +499,10 @@ async fn screen_snapshot(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -
             stream,
             200,
             "OK",
-            &[("Content-Type", "text/plain; charset=utf-8"), ("X-Screen-Status", "unavailable")],
+            &[
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("X-Screen-Status", "unavailable"),
+            ],
             b"",
             ka,
         )
@@ -400,7 +510,15 @@ async fn screen_snapshot(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -
     };
     let history = cfg.screen_history.snapshot_text();
     let body = if history.is_empty() { current } else { history };
-    respond::send(stream, 200, "OK", &[("Content-Type", "text/plain; charset=utf-8")], body.as_bytes(), ka).await
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        body.as_bytes(),
+        ka,
+    )
+    .await
 }
 
 async fn screen_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
@@ -421,7 +539,10 @@ async fn screen_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()
 }
 
 async fn read_screen_async(dev: PathBuf) -> Option<String> {
-    tokio::task::spawn_blocking(move || screen::read_screen(&dev).ok()).await.ok().flatten()
+    tokio::task::spawn_blocking(move || screen::read_screen(&dev).ok())
+        .await
+        .ok()
+        .flatten()
 }
 #[cfg(test)]
 mod tests {
@@ -432,19 +553,32 @@ mod tests {
         assert_eq!(pct_decode("a+b"), "a b");
         assert_eq!(pct_decode("%2Fx"), "/x");
 
-        assert_eq!(pct_decode("%55%6E%69%74%65%64%20%53%74%61%74%65%73"), "United States");
+        assert_eq!(
+            pct_decode("%55%6E%69%74%65%64%20%53%74%61%74%65%73"),
+            "United States"
+        );
 
         assert_eq!(pct_decode("%zz"), "%zz");
         assert_eq!(pct_decode("%4"), "%4");
     }
     #[test]
     fn query_param_extract() {
-        assert_eq!(query_param("/sniffbox/proxy?name=abc", "name").as_deref(), Some("abc"));
         assert_eq!(
-            query_param("/sniffbox/proxy?name=%55%6E%69%74%65%64%20%53%74%61%74%65%73", "name").as_deref(),
+            query_param("/sniffbox/proxy?name=abc", "name").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            query_param(
+                "/sniffbox/proxy?name=%55%6E%69%74%65%64%20%53%74%61%74%65%73",
+                "name"
+            )
+            .as_deref(),
             Some("United States")
         );
-        assert_eq!(query_param("/sniffbox/proxy?x=1&name=n", "name").as_deref(), Some("n"));
+        assert_eq!(
+            query_param("/sniffbox/proxy?x=1&name=n", "name").as_deref(),
+            Some("n")
+        );
         assert_eq!(query_param("/sniffbox/proxy", "name"), None);
         assert_eq!(query_param("/sniffbox/proxy?other=1", "name"), None);
     }

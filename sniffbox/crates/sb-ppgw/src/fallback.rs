@@ -221,8 +221,12 @@ mod tests {
 
     #[test]
     fn ini_value_parsing() {
-        let ini = "# comment\nudp_enable=true\nfake_cidr = \"28.0.0.0/8\"  # inline\nmax_rec=5000\n";
-        assert_eq!(ini_value_in(ini, "fake_cidr").as_deref(), Some("28.0.0.0/8"));
+        let ini =
+            "# comment\nudp_enable=true\nfake_cidr = \"28.0.0.0/8\"  # inline\nmax_rec=5000\n";
+        assert_eq!(
+            ini_value_in(ini, "fake_cidr").as_deref(),
+            Some("28.0.0.0/8")
+        );
         assert_eq!(ini_value_in(ini, "udp_enable").as_deref(), Some("true"));
         assert_eq!(ini_value_in(ini, "absent"), None);
 

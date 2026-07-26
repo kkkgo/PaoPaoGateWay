@@ -31,6 +31,14 @@ cd $cdroot/rootfs || exit
 gunzip -c initrd.gz | cpio -idmv >/dev/null 2>&1
 rm initrd.gz
 root=$cdroot/rootfs
+# arm64 payloads carry the UEFI boot tree, x86-64 ones only vmlinuz+isolinux.
+arm64=0
+isoname=paopao-gateway-x86-64-custom.iso
+if [ -f "$cdroot/efi/boot/bootaa64.efi" ]; then
+  arm64=1
+  isoname=paopao-gateway-armv8-custom.iso
+  patch "arm64 (armsr/armv8) image."
+fi
 
 patchclash=0
 if [ -f /data/clash ]; then
@@ -39,17 +47,24 @@ if [ -f /data/clash ]; then
   cp /data/clash $root"/usr/bin/"
   chmod +x $root"/usr/bin/clash"
   patchclash=1
-  $root"/usr/bin/clash" -v
+  if [ $arm64 -eq 0 ]; then
+    $root"/usr/bin/clash" -v
+  fi
 else
   ver=mihomo_compatible
   if [ "$MI" = "3" ]; then
     ver=mihomo_v3
   fi
+  if [ ! -f /clash/$ver ]; then
+    ver=$(ls /clash | head -1)
+  fi
   patch Use the embedded Mihomo ..."$ver"
   cp /clash/$ver $root"/usr/bin/clash"
   chmod +x $root"/usr/bin/clash"
   patchclash=1
-  $root"/usr/bin/clash" -v
+  if [ $arm64 -eq 0 ]; then
+    $root"/usr/bin/clash" -v
+  fi
 fi
 if [ -f /data/network.ini ]; then
   ls -lah /data/network.ini
@@ -217,18 +232,44 @@ fi
 
 echo "Making iso..."
 cd $root || exit
-find . | cpio -H newc -o | gzip -9 >$cdroot/initrd.gz
-cd $cdroot || exit
-rm -rf rootfs
-cp -r /isolinux .
-xorriso -as mkisofs -o /tmp/paopao-gateway-x86-64-custom.iso \
-  -isohybrid-mbr isolinux/isolinux.bin \
-  -c isolinux/boot.cat -b isolinux/isolinux.bin \
-  -no-emul-boot -boot-load-size 4 -boot-info-table \
-  -eltorito-alt-boot -e /isolinux/efi.img \
-  -no-emul-boot -isohybrid-gpt-basdat -V "paopao-gateway" $cdroot >/dev/null 2>&1
+if [ $arm64 -eq 1 ]; then
+  # armsr kernel has no initramfs decompressor, the cpio must stay raw.
+  find . | cpio -H newc -o >$cdroot/boot/initrd
+  cd $cdroot || exit
+  rm -rf rootfs
+  xorriso -as mkisofs -o /tmp/"$isoname" \
+    -e boot/grub/efi.img -no-emul-boot \
+    -append_partition 2 0xef $cdroot/boot/grub/efi.img \
+    -partition_cyl_align all \
+    -r -J -V "paopao-gateway" $cdroot >/dev/null 2>&1
+else
+  find . | cpio -H newc -o | gzip -9 >$cdroot/initrd.gz
+  cd $cdroot || exit
+  rm -rf rootfs
+  cp -r /isolinux .
+  # also expose the EFI loader on the ISO9660 tree itself, so firmwares that
+  # scan the medium (and tools that copy the ISO content onto a FAT stick)
+  # still find \EFI\BOOT\BOOTX64.EFI
+  mkdir -p $cdroot/EFI/BOOT
+  cp /isolinux/bootx64.efi $cdroot/EFI/BOOT/BOOTX64.EFI
+  # -isohybrid-mbr must get isohdpfx.bin (the hard-disk MBR template). Passing
+  # isolinux.bin here writes the El Torito CD boot sector into the MBR, which
+  # makes legacy BIOS bounce straight back to the boot device menu from USB.
+  xorriso -as mkisofs -o /tmp/"$isoname" \
+    -isohybrid-mbr isolinux/isohdpfx.bin \
+    -partition_offset 16 \
+    -c isolinux/boot.cat -b isolinux/isolinux.bin \
+    -no-emul-boot -boot-load-size 4 -boot-info-table \
+    -eltorito-alt-boot -e isolinux/efi.img \
+    -no-emul-boot -isohybrid-gpt-basdat \
+    -r -J -joliet-long -V "paopao-gateway" $cdroot >/dev/null 2>&1
+fi
 
-sha=$(sha256sum /tmp/paopao-gateway-x86-64-custom.iso | grep -Eo "^[0-9a-z]{7}")
-mv /tmp/paopao-gateway-x86-64-custom.iso /data/ppgw-rPPGW_version-"$sha".iso
-ls -lah /data/ppgw-rPPGW_version-"$sha".iso
+sha=$(sha256sum /tmp/"$isoname" | grep -Eo "^[0-9a-z]{7}")
+isoout=/data/ppgw-rPPGW_version-"$sha".iso
+if [ $arm64 -eq 1 ]; then
+  isoout=/data/ppgw-arm64-rPPGW_version-"$sha".iso
+fi
+mv /tmp/"$isoname" "$isoout"
+ls -lah "$isoout"
 rm -rf /tmp/ /*sh

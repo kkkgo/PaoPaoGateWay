@@ -1,5 +1,6 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+use crate::resolvepool::{Budget, Deadline, Outcome};
 use sb_dns::message::{self, TYPE_A, TYPE_AAAA};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -19,6 +20,10 @@ const RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BOOTSTRAP_SERVERS: usize = 8;
 
 const CLASH_SOCKS5: &str = "socks5h://127.0.0.1:1080";
+
+const CLASH_SOCKS5_ADDR: &str = "127.0.0.1:1080";
+
+const SOCKS5_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 const DNS_FIELDS: [&str; 7] = [
     "default-nameserver",
@@ -108,46 +113,117 @@ fn collect_strings(y: &Yaml, f: &mut impl FnMut(&str)) {
 }
 
 pub fn resolve_via_servers(domain: &str, specs: &[String], ipv6: bool) -> Vec<IpAddr> {
-    let mut set = BTreeSet::new();
+    let dl = Deadline::after(Budget::subdns().per_domain);
+    resolve_via_servers_traced(domain, specs, ipv6, dl).ips
+}
 
-    let clash = clash_running();
+pub fn resolve_via_servers_traced(
+    domain: &str,
+    specs: &[String],
+    ipv6: bool,
+    dl: Deadline,
+) -> Outcome {
+    let mut set = BTreeSet::new();
+    let mut trace: Vec<String> = Vec::new();
+    let parsed: Vec<(String, DnsSpec)> = specs
+        .iter()
+        .filter_map(|s| parse_dns_spec(s).map(|p| (spec_label(s), p)))
+        .collect();
+
     let boot = bootstrap_servers(specs);
 
-    for spec in specs {
-        match parse_dns_spec(spec) {
-            Some(DnsSpec::Doh(url)) => {
-                bootstrap_resolve(&crate::dnsutil::url_hostname(&url), &boot, ipv6);
-            }
-            Some(DnsSpec::Dot(host, _)) => {
-                bootstrap_resolve(&host, &boot, ipv6);
-            }
-            _ => {}
-        }
-    }
-    for spec in specs {
-        if let Some(parsed) = parse_dns_spec(spec) {
-            for ip in resolve_bounded(domain, &parsed, ipv6, clash, &boot) {
+    bootstrap_all(&parsed, &boot, ipv6, dl);
 
-                if crate::fallback::is_usable_node_ip(ip) {
-                    set.insert(ip);
-                }
-            }
+    let socks = !parsed.is_empty() && clash_socks5_ready();
+
+    let pending: Vec<(String, std::sync::mpsc::Receiver<Vec<IpAddr>>)> = parsed
+        .iter()
+        .map(|(label, spec)| {
+            let (domain, spec, boot) = (domain.to_string(), spec.clone(), boot.to_vec());
+            (
+                label.clone(),
+                spawn_bounded(move || resolve_via(&domain, &spec, ipv6, &boot, socks, dl)),
+            )
+        })
+        .collect();
+    for (label, rx) in pending {
+        let Some(wait) = dl.clamp(HARD_TIMEOUT) else {
+            trace.push(format!("{label}=skipped(budget)"));
+            continue;
+        };
+        match rx.recv_timeout(wait) {
+            Ok(ips) => trace.push(format!("{label}={}", absorb(ips, &mut set))),
+            Err(_) => trace.push(format!("{label}=timeout")),
         }
     }
 
     if set.is_empty() {
         for addr in crate::fallback::servers(&udp_specs(specs)) {
-            for ip in crate::dnsutil::resolve_host_via(domain, addr, ipv6) {
-                if crate::fallback::is_usable_node_ip(ip) {
-                    set.insert(ip);
-                }
+            if dl.expired() {
+                trace.push(format!("fb:{addr}=skipped(budget)"));
+                break;
             }
+            let ips = crate::dnsutil::resolve_host_via(domain, addr, ipv6);
+            trace.push(format!("fb:{addr}={}", absorb(ips, &mut set)));
             if !set.is_empty() {
                 break;
             }
         }
     }
-    set.into_iter().collect()
+    Outcome::new(set.into_iter().collect(), trace)
+}
+
+fn absorb(ips: Vec<IpAddr>, set: &mut BTreeSet<IpAddr>) -> String {
+    let total = ips.len();
+    if total == 0 {
+        return "none".to_string();
+    }
+    let mut kept = 0usize;
+    for ip in ips {
+        if crate::fallback::is_usable_node_ip(ip) {
+            set.insert(ip);
+            kept += 1;
+        }
+    }
+    if kept < total {
+        format!("{kept}/{total}ip")
+    } else {
+        format!("{kept}ip")
+    }
+}
+
+fn spec_label(spec: &str) -> String {
+    match parse_dns_spec(spec) {
+        Some(DnsSpec::Doh(url)) => format!("doh:{}", crate::dnsutil::url_hostname(&url)),
+        Some(DnsSpec::Dot(host, _)) => format!("dot:{host}"),
+        Some(DnsSpec::Udp(addr)) => addr.to_string(),
+        None => spec.to_string(),
+    }
+}
+
+fn bootstrap_all(parsed: &[(String, DnsSpec)], boot: &[SocketAddr], ipv6: bool, dl: Deadline) {
+    let hosts: Vec<String> = {
+        let mut seen = HashSet::new();
+        parsed
+            .iter()
+            .filter_map(|(_, spec)| match spec {
+                DnsSpec::Doh(url) => Some(crate::dnsutil::url_hostname(url)),
+                DnsSpec::Dot(host, _) => Some(host.clone()),
+                DnsSpec::Udp(_) => None,
+            })
+            .filter(|h| seen.insert(h.clone()))
+            .collect()
+    };
+    if hosts.is_empty() || dl.expired() {
+        return;
+    }
+    std::thread::scope(|s| {
+        for host in &hosts {
+            s.spawn(move || {
+                bootstrap_resolve(host, boot, ipv6, dl);
+            });
+        }
+    });
 }
 
 fn udp_specs(specs: &[String]) -> Vec<SocketAddr> {
@@ -178,76 +254,60 @@ fn bootstrap_servers(specs: &[String]) -> Vec<SocketAddr> {
     out
 }
 
-fn bootstrap_resolve(host: &str, boot: &[SocketAddr], ipv6: bool) -> Vec<IpAddr> {
+fn bootstrap_resolve(host: &str, boot: &[SocketAddr], ipv6: bool, dl: Deadline) -> Vec<IpAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return vec![ip];
     }
-    static CACHE: OnceLock<Mutex<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    let mut guard = cache.lock().unwrap();
-    if let Some(hit) = guard.get(host) {
+    type BootCache = Mutex<HashMap<String, Arc<OnceLock<Vec<IpAddr>>>>>;
+    static CACHE: OnceLock<BootCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cell = {
+        let mut guard = cache.lock().unwrap();
+        Arc::clone(guard.entry(host.to_string()).or_default())
+    };
+    if let Some(hit) = cell.get() {
         return hit.clone();
     }
 
-    let boot: Vec<SocketAddr> = boot.iter().copied().take(MAX_BOOTSTRAP_SERVERS).collect();
-    let results: Mutex<Vec<(usize, Vec<IpAddr>)>> = Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for (i, server) in boot.iter().enumerate() {
-            let (server, results) = (*server, &results);
-            s.spawn(move || {
-                let ips: Vec<IpAddr> = crate::dnsutil::resolve_host_via(host, server, ipv6)
-                    .into_iter()
-                    .filter(|ip| crate::fallback::is_usable_node_ip(*ip))
-                    .collect();
-                if !ips.is_empty() {
-                    results.lock().unwrap().push((i, ips));
-                }
-            });
-        }
-    });
+    if dl.expired() {
+        return Vec::new();
+    }
 
-    let mut by_server = results.into_inner().unwrap();
-    by_server.sort_by_key(|(i, _)| *i);
-    let mut found: Vec<IpAddr> = Vec::new();
-    for (_, ips) in by_server {
-        for ip in ips {
-            if !found.contains(&ip) {
-                found.push(ip);
+    cell.get_or_init(|| {
+        let boot: Vec<SocketAddr> = boot.iter().copied().take(MAX_BOOTSTRAP_SERVERS).collect();
+        let results: Mutex<Vec<(usize, Vec<IpAddr>)>> = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for (i, server) in boot.iter().enumerate() {
+                let (server, results) = (*server, &results);
+                s.spawn(move || {
+                    let ips: Vec<IpAddr> = crate::dnsutil::resolve_host_via(host, server, ipv6)
+                        .into_iter()
+                        .filter(|ip| crate::fallback::is_usable_node_ip(*ip))
+                        .collect();
+                    if !ips.is_empty() {
+                        results.lock().unwrap().push((i, ips));
+                    }
+                });
+            }
+        });
+
+        let mut by_server = results.into_inner().unwrap();
+        by_server.sort_by_key(|(i, _)| *i);
+        let mut found: Vec<IpAddr> = Vec::new();
+        for (_, ips) in by_server {
+            for ip in ips {
+                if !found.contains(&ip) {
+                    found.push(ip);
+                }
             }
         }
-    }
-    guard.insert(host.to_string(), found.clone());
-    found
+        found
+    })
+    .clone()
 }
 
-fn resolve_bounded(
-    domain: &str,
-    spec: &DnsSpec,
-    ipv6: bool,
-    clash: bool,
-    boot: &[SocketAddr],
-) -> Vec<IpAddr> {
-    let ips = run_bounded({
-        let (domain, spec, boot) = (domain.to_string(), spec.clone(), boot.to_vec());
-        move || resolve_via(&domain, &spec, ipv6, &boot)
-    });
-    if !ips.is_empty() {
-        return ips;
-    }
-
-    if clash {
-        if let DnsSpec::Doh(url) = spec {
-            return run_bounded({
-                let (domain, url) = (domain.to_string(), url.clone());
-                move || resolve_doh(doh_socks_agent().clone(), &domain, &url, ipv6)
-            });
-        }
-    }
-    ips
-}
-
-fn run_bounded<F>(f: F) -> Vec<IpAddr>
+fn spawn_bounded<F>(f: F) -> std::sync::mpsc::Receiver<Vec<IpAddr>>
 where
     F: FnOnce() -> Vec<IpAddr> + Send + 'static,
 {
@@ -255,38 +315,54 @@ where
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(HARD_TIMEOUT).unwrap_or_default()
+    rx
 }
 
-pub fn clash_running() -> bool {
-    let Ok(rd) = std::fs::read_dir("/proc") else {
+pub fn clash_socks5_ready() -> bool {
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| match CLASH_SOCKS5_ADDR.parse::<SocketAddr>() {
+        Ok(addr) => socks5_ready_at(addr),
+        Err(_) => false,
+    })
+}
+
+fn socks5_ready_at(addr: SocketAddr) -> bool {
+    let Ok(mut sock) = TcpStream::connect_timeout(&addr, SOCKS5_PROBE_TIMEOUT) else {
         return false;
     };
-    for entry in rd.flatten() {
-        let name = entry.file_name();
-        if !name
-            .to_str()
-            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-        {
-            continue;
-        }
-        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
-            if comm.trim() == "clash" {
-                return true;
-            }
-        }
+    if sock.set_read_timeout(Some(SOCKS5_PROBE_TIMEOUT)).is_err()
+        || sock.set_write_timeout(Some(SOCKS5_PROBE_TIMEOUT)).is_err()
+    {
+        return false;
     }
-    false
+
+    if sock.write_all(&[0x05, 0x01, 0x00]).is_err() {
+        return false;
+    }
+    let mut reply = [0u8; 2];
+
+    sock.read_exact(&mut reply).is_ok() && reply[0] == 0x05 && reply[1] != 0xFF
 }
 
-fn resolve_via(domain: &str, spec: &DnsSpec, ipv6: bool, boot: &[SocketAddr]) -> Vec<IpAddr> {
+fn resolve_via(
+    domain: &str,
+    spec: &DnsSpec,
+    ipv6: bool,
+    boot: &[SocketAddr],
+    socks: bool,
+    dl: Deadline,
+) -> Vec<IpAddr> {
     match spec {
         DnsSpec::Udp(addr) => crate::dnsutil::resolve_host_via(domain, *addr, ipv6),
+        DnsSpec::Dot(host, port) => resolve_dot(domain, host, *port, ipv6, boot, dl),
         DnsSpec::Doh(url) => {
             let host = crate::dnsutil::url_hostname(url);
-            doh_resolve(&host, url, domain, ipv6, boot)
+            let ips = doh_resolve(&host, url, domain, ipv6, boot, dl);
+            if !ips.is_empty() || !socks || dl.expired() {
+                return ips;
+            }
+            resolve_doh(doh_socks_agent().clone(), domain, url, ipv6)
         }
-        DnsSpec::Dot(host, port) => resolve_dot(domain, host, *port, ipv6, boot),
     }
 }
 
@@ -311,11 +387,18 @@ fn doh_agent_pinned(key: &str, ips: Vec<IpAddr>, timeout: Duration) -> ureq::Age
     agent
 }
 
-fn doh_resolve(host: &str, url: &str, domain: &str, ipv6: bool, boot: &[SocketAddr]) -> Vec<IpAddr> {
+fn doh_resolve(
+    host: &str,
+    url: &str,
+    domain: &str,
+    ipv6: bool,
+    boot: &[SocketAddr],
+    dl: Deadline,
+) -> Vec<IpAddr> {
     static WINNER: OnceLock<Mutex<HashMap<String, IpAddr>>> = OnceLock::new();
     let winner = WINNER.get_or_init(|| Mutex::new(HashMap::new()));
 
-    let candidates = bootstrap_resolve(host, boot, ipv6);
+    let candidates = bootstrap_resolve(host, boot, ipv6, dl);
     if candidates.is_empty() {
         return resolve_doh(doh_agent().clone(), domain, url, ipv6);
     }
@@ -337,6 +420,10 @@ fn doh_resolve(host: &str, url: &str, domain: &str, ipv6: bool, boot: &[SocketAd
     }
 
     for ip in candidates {
+
+        if dl.expired() {
+            break;
+        }
         let agent = doh_agent_pinned(&format!("{host}|{ip}"), vec![ip], RETRY_TIMEOUT);
         let ips = resolve_doh(agent, domain, url, ipv6);
         if !ips.is_empty() {
@@ -450,8 +537,18 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
     .clone()
 }
 
-fn resolve_dot(domain: &str, host: &str, port: u16, ipv6: bool, boot: &[SocketAddr]) -> Vec<IpAddr> {
-    for addr in dot_addrs(host, port, ipv6, boot) {
+fn resolve_dot(
+    domain: &str,
+    host: &str,
+    port: u16,
+    ipv6: bool,
+    boot: &[SocketAddr],
+    dl: Deadline,
+) -> Vec<IpAddr> {
+    for addr in dot_addrs(host, port, ipv6, boot, dl) {
+        if dl.expired() {
+            break;
+        }
         if let Some(ips) = dot_query(domain, host, addr, ipv6) {
             if !ips.is_empty() {
                 return ips;
@@ -461,10 +558,19 @@ fn resolve_dot(domain: &str, host: &str, port: u16, ipv6: bool, boot: &[SocketAd
     Vec::new()
 }
 
-fn dot_addrs(host: &str, port: u16, ipv6: bool, boot: &[SocketAddr]) -> Vec<SocketAddr> {
-    let ips = bootstrap_resolve(host, boot, ipv6);
+fn dot_addrs(
+    host: &str,
+    port: u16,
+    ipv6: bool,
+    boot: &[SocketAddr],
+    dl: Deadline,
+) -> Vec<SocketAddr> {
+    let ips = bootstrap_resolve(host, boot, ipv6, dl);
     if !ips.is_empty() {
-        return ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+        return ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
     }
     (host, port)
         .to_socket_addrs()
@@ -472,12 +578,7 @@ fn dot_addrs(host: &str, port: u16, ipv6: bool, boot: &[SocketAddr]) -> Vec<Sock
         .unwrap_or_default()
 }
 
-fn dot_query(
-    domain: &str,
-    host: &str,
-    addr: SocketAddr,
-    ipv6: bool,
-) -> Option<Vec<IpAddr>> {
+fn dot_query(domain: &str, host: &str, addr: SocketAddr, ipv6: bool) -> Option<Vec<IpAddr>> {
     let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
     sock.set_read_timeout(Some(TIMEOUT)).ok()?;
     sock.set_write_timeout(Some(TIMEOUT)).ok()?;
@@ -533,6 +634,10 @@ mod tests {
     use std::net::Ipv4Addr;
     use yaml_rust2::YamlLoader;
 
+    fn test_dl() -> Deadline {
+        Deadline::after(Duration::from_secs(30))
+    }
+
     #[test]
     fn doh_blackhole_server_does_not_hang() {
         use std::net::TcpListener;
@@ -554,11 +659,55 @@ mod tests {
 
         let ips = resolve_via_servers("blackhole.invalid", std::slice::from_ref(&spec), false);
         let elapsed = start.elapsed();
-        assert!(ips.is_empty(), "blackhole DoH should not resolve to any IP: {ips:?}");
+        assert!(
+            ips.is_empty(),
+            "blackhole DoH should not resolve to any IP: {ips:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(30),
             "resolve_via_servers stuck {elapsed:?} (should return near HARD_TIMEOUT + fallback budget)"
         );
+    }
+
+    #[test]
+    fn socks5_probe_distinguishes_real_proxy_from_dead_port() {
+        use std::net::TcpListener;
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        assert!(!socks5_ready_at(dead_addr), "no listener must not be ready");
+
+        let mute = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mute_addr = mute.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in mute.incoming().flatten() {
+                held.push(s);
+            }
+        });
+        let start = std::time::Instant::now();
+        assert!(
+            !socks5_ready_at(mute_addr),
+            "mute listener must not be ready"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "probe should give up fast, took {:?}",
+            start.elapsed()
+        );
+
+        let real = TcpListener::bind("127.0.0.1:0").unwrap();
+        let real_addr = real.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = real.accept() {
+                let mut greet = [0u8; 3];
+                if s.read_exact(&mut greet).is_ok() {
+                    let _ = s.write_all(&[0x05, 0x00]);
+                }
+            }
+        });
+        assert!(socks5_ready_at(real_addr), "a real SOCKS5 greeter is ready");
     }
 
     #[test]
@@ -569,7 +718,7 @@ mod tests {
             format!("127.0.0.1:{}", polluted.port).parse().unwrap(),
             format!("127.0.0.1:{}", clean.port).parse().unwrap(),
         ];
-        let got = bootstrap_resolve("boot-union.test", &boot, false);
+        let got = bootstrap_resolve("boot-union.test", &boot, false, test_dl());
         assert_eq!(
             got,
             vec![
@@ -588,7 +737,7 @@ mod tests {
             format!("127.0.0.1:{}", a.port).parse().unwrap(),
             format!("127.0.0.1:{}", b.port).parse().unwrap(),
         ];
-        let got = bootstrap_resolve("boot-dedup.test", &boot, false);
+        let got = bootstrap_resolve("boot-dedup.test", &boot, false, test_dl());
         assert_eq!(got, vec!["9.9.9.9".parse::<IpAddr>().unwrap()], "{got:?}");
     }
 
@@ -600,8 +749,12 @@ mod tests {
             format!("127.0.0.1:{}", fake.port).parse().unwrap(),
             format!("127.0.0.1:{}", clean.port).parse().unwrap(),
         ];
-        let got = bootstrap_resolve("boot-fakeip.test", &boot, false);
-        assert_eq!(got, vec!["104.16.0.2".parse::<IpAddr>().unwrap()], "{got:?}");
+        let got = bootstrap_resolve("boot-fakeip.test", &boot, false, test_dl());
+        assert_eq!(
+            got,
+            vec!["104.16.0.2".parse::<IpAddr>().unwrap()],
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -744,7 +897,7 @@ mod tests {
         println!("DoH  https://dns.alidns.com/dns-query  cp.cloudflare.com -> {doh:?}");
         assert!(!doh.is_empty(), "DoH should resolve at least one IP");
 
-        let dot = resolve_dot("cp.cloudflare.com", "dot.pub", 853, false, &[]);
+        let dot = resolve_dot("cp.cloudflare.com", "dot.pub", 853, false, &[], test_dl());
         println!("DoT  tls://dot.pub:853                  cp.cloudflare.com -> {dot:?}");
         assert!(!dot.is_empty(), "DoT should resolve at least one IP");
 
@@ -772,7 +925,7 @@ mod tests {
             true,
         );
         println!("DoH ipv6  cp.cloudflare.com -> {doh:?}");
-        let dot = resolve_dot("cp.cloudflare.com", "dot.pub", 853, true, &[]);
+        let dot = resolve_dot("cp.cloudflare.com", "dot.pub", 853, true, &[], test_dl());
         println!("DoT ipv6  cp.cloudflare.com -> {dot:?}");
         assert!(
             doh.iter().any(|ip| ip.is_ipv6()),

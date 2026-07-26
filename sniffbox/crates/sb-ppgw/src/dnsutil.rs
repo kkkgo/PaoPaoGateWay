@@ -1,5 +1,6 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+use crate::resolvepool::{Budget, Deadline, Log, Outcome};
 use regex_lite::Regex;
 use sb_dns::message::{self, TYPE_A, TYPE_AAAA};
 use std::collections::{BTreeSet, HashSet};
@@ -7,6 +8,8 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Mutex;
 use std::time::Duration;
+
+const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn url_hostname(raw: &str) -> String {
     let s = match raw.split_once("://") {
@@ -149,12 +152,26 @@ fn lookup_hosts_in(content: &str, host: &str, ipv6_enabled: bool) -> Option<IpAd
 }
 
 pub fn resolve_domain_ips(domain: &str, dns_servers: &[String], ipv6_enabled: bool) -> Vec<IpAddr> {
-    let mut set = query_servers(domain, dns_servers, ipv6_enabled);
+    let dl = Deadline::after(Budget::dns_burn().per_domain);
+    resolve_domain_ips_traced(domain, dns_servers, ipv6_enabled, dl).ips
+}
+
+pub fn resolve_domain_ips_traced(
+    domain: &str,
+    dns_servers: &[String],
+    ipv6_enabled: bool,
+    dl: Deadline,
+) -> Outcome {
+    let (mut set, mut trace) = query_servers(domain, dns_servers, ipv6_enabled, dl, "");
     if set.is_empty() {
         let fallback = crate::fallback::server_strings(dns_servers);
-        set = query_servers(domain, &fallback, ipv6_enabled);
+        if !fallback.is_empty() {
+            let (fset, ftrace) = query_servers(domain, &fallback, ipv6_enabled, dl, "fb:");
+            set = fset;
+            trace.extend(ftrace);
+        }
     }
-    set.into_iter().collect()
+    Outcome::new(set.into_iter().collect(), trace)
 }
 
 pub fn resolve_domains_concurrent(
@@ -162,57 +179,122 @@ pub fn resolve_domains_concurrent(
     dns_servers: &[String],
     ipv6_enabled: bool,
 ) -> std::collections::HashMap<String, Vec<IpAddr>> {
-    use std::sync::Mutex;
-    let out: Mutex<std::collections::HashMap<String, Vec<IpAddr>>> =
-        Mutex::new(std::collections::HashMap::new());
-    let out_ref = &out;
-    for chunk in domains.chunks(16) {
-        std::thread::scope(|s| {
-            for domain in chunk {
-                let domain = domain.clone();
-                s.spawn(move || {
-                    let ips = resolve_domain_ips(&domain, dns_servers, ipv6_enabled);
-                    if !ips.is_empty() {
-                        out_ref.lock().unwrap().insert(domain, ips);
-                    }
-                });
-            }
-        });
-    }
-    out.into_inner().unwrap()
+    resolve_domains_logged(
+        crate::resolvepool::DNS_LOG,
+        "dns_burn",
+        domains,
+        dns_servers,
+        ipv6_enabled,
+    )
 }
 
-fn query_servers(domain: &str, servers: &[String], ipv6_enabled: bool) -> BTreeSet<IpAddr> {
+pub fn resolve_domains_logged(
+    log: Log,
+    tag: &str,
+    domains: &[String],
+    dns_servers: &[String],
+    ipv6_enabled: bool,
+) -> std::collections::HashMap<String, Vec<IpAddr>> {
+    crate::resolvepool::resolve_batch(log, tag, domains, Budget::dns_burn(), |domain, dl| {
+        resolve_domain_ips_traced(domain, dns_servers, ipv6_enabled, dl)
+    })
+}
+
+fn query_servers(
+    domain: &str,
+    servers: &[String],
+    ipv6_enabled: bool,
+    dl: Deadline,
+    prefix: &str,
+) -> (BTreeSet<IpAddr>, Vec<String>) {
     let mut set = BTreeSet::new();
+    let mut trace = Vec::new();
     for s in servers {
         let Some(addr) = parse_dns_server(s) else {
+            trace.push(format!("{prefix}{s}=badaddr"));
             continue;
         };
-        if let Some(resp) = query(domain, addr, TYPE_A) {
-            for ip in resp.v4 {
-                keep_usable(domain, IpAddr::V4(ip), &mut set);
-            }
+        if dl.expired() {
+            trace.push(format!("{prefix}{s}=skipped(budget)"));
+            continue;
         }
+        let mut notes = vec![format!(
+            "A={}",
+            absorb(
+                domain,
+                query_deadline(domain, addr, TYPE_A, dl),
+                false,
+                &mut set
+            )
+        )];
         if ipv6_enabled {
-            if let Some(resp) = query(domain, addr, TYPE_AAAA) {
-                for ip in resp.v6 {
-                    keep_usable(domain, IpAddr::V6(ip), &mut set);
-                }
-            }
+            notes.push(format!(
+                "AAAA={}",
+                absorb(
+                    domain,
+                    query_deadline(domain, addr, TYPE_AAAA, dl),
+                    true,
+                    &mut set
+                )
+            ));
         }
+        trace.push(format!("{prefix}{s}({})", notes.join(",")));
     }
-    set
+    (set, trace)
 }
 
-fn keep_usable(domain: &str, ip: IpAddr, set: &mut BTreeSet<IpAddr>) {
+fn absorb(domain: &str, r: QueryOutcome, want_v6: bool, set: &mut BTreeSet<IpAddr>) -> String {
+    let resp = match r {
+        QueryOutcome::Ok(resp) => resp,
+        QueryOutcome::Timeout => return "timeout".to_string(),
+        QueryOutcome::Failed(what) => return format!("err:{what}"),
+        QueryOutcome::NoBudget => return "skipped(budget)".to_string(),
+    };
+    let ips: Vec<IpAddr> = if want_v6 {
+        resp.v6.into_iter().map(IpAddr::V6).collect()
+    } else {
+        resp.v4.into_iter().map(IpAddr::V4).collect()
+    };
+    if ips.is_empty() {
+        return rcode_label(resp.rcode);
+    }
+    let total = ips.len();
+    let mut kept = 0usize;
+    for ip in ips {
+        if keep_usable(domain, ip, set) {
+            kept += 1;
+        }
+    }
+
+    if kept < total {
+        format!("{kept}/{total}ip")
+    } else {
+        format!("{kept}ip")
+    }
+}
+
+fn rcode_label(rcode: u8) -> String {
+    match rcode {
+        0 => "empty".to_string(),
+        1 => "formerr".to_string(),
+        2 => "servfail".to_string(),
+        3 => "nxdomain".to_string(),
+        5 => "refused".to_string(),
+        n => format!("rcode{n}"),
+    }
+}
+
+fn keep_usable(domain: &str, ip: IpAddr, set: &mut BTreeSet<IpAddr>) -> bool {
     if crate::fallback::is_usable_node_ip(ip) {
         set.insert(ip);
+        true
     } else {
         let _ = writeln!(
             std::io::stdout(),
             "{}{domain} -> {ip} discarded (fakeip/reserved)",
             crate::term::orange("[PaoPaoGW DNS]")
         );
+        false
     }
 }
 
@@ -294,29 +376,73 @@ fn server_addr(server: &str, port: i64) -> Option<SocketAddr> {
     (server, p).to_socket_addrs().ok()?.next()
 }
 
-fn query(host: &str, addr: SocketAddr, qtype: u16) -> Option<message::DnsResponse> {
-    let id = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .subsec_nanos()
-        & 0xffff) as u16;
-    let q = message::build_query(id, host, qtype).ok()?;
+enum QueryOutcome {
+    Ok(message::DnsResponse),
+    Timeout,
+    Failed(&'static str),
+
+    NoBudget,
+}
+
+fn query_deadline(host: &str, addr: SocketAddr, qtype: u16, dl: Deadline) -> QueryOutcome {
+    let Some(wait) = dl.clamp(QUERY_TIMEOUT) else {
+        return QueryOutcome::NoBudget;
+    };
+
+    if wait.is_zero() {
+        return QueryOutcome::NoBudget;
+    }
+    let id = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.subsec_nanos() & 0xffff) as u16,
+        Err(_) => return QueryOutcome::Failed("clock"),
+    };
+    let Ok(q) = message::build_query(id, host, qtype) else {
+        return QueryOutcome::Failed("badname");
+    };
     let bind: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
         "[::]:0".parse().unwrap()
     };
-    let sock = UdpSocket::bind(bind).ok()?;
-    sock.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    sock.connect(addr).ok()?;
-    sock.send(&q).ok()?;
-    let mut buf = [0u8; 1500];
-    let n = sock.recv(&mut buf).ok()?;
-    let resp = message::parse_response(&buf[..n]).ok()?;
-    if resp.id != id {
-        return None;
+    let Ok(sock) = UdpSocket::bind(bind) else {
+        return QueryOutcome::Failed("bind");
+    };
+    if sock.set_read_timeout(Some(wait)).is_err() {
+        return QueryOutcome::Failed("timeout-opt");
     }
-    Some(resp)
+    if sock.connect(addr).is_err() {
+        return QueryOutcome::Failed("connect");
+    }
+    if sock.send(&q).is_err() {
+        return QueryOutcome::Failed("send");
+    }
+    let mut buf = [0u8; 1500];
+    let n = match sock.recv(&mut buf) {
+        Ok(n) => n,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return QueryOutcome::Timeout;
+        }
+        Err(_) => return QueryOutcome::Failed("recv"),
+    };
+    let Ok(resp) = message::parse_response(&buf[..n]) else {
+        return QueryOutcome::Failed("parse");
+    };
+    if resp.id != id {
+        return QueryOutcome::Failed("id-mismatch");
+    }
+    QueryOutcome::Ok(resp)
+}
+
+fn query(host: &str, addr: SocketAddr, qtype: u16) -> Option<message::DnsResponse> {
+    match query_deadline(host, addr, qtype, Deadline::after(QUERY_TIMEOUT)) {
+        QueryOutcome::Ok(resp) => Some(resp),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +527,42 @@ mod tests {
         assert_eq!(
             lookup_hosts_in("1.2.3.4 a # paopao.dns\n", "paopao.dns", false),
             None
+        );
+    }
+
+    #[test]
+    fn blackhole_dns_is_bounded_and_traced() {
+        use std::net::UdpSocket;
+        use std::time::Instant;
+
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let servers = vec![format!("127.0.0.1:{port}")];
+
+        let start = Instant::now();
+        let got = resolve_domain_ips_traced(
+            "blackhole.invalid",
+            &servers,
+            false,
+            Deadline::after(Duration::from_millis(600)),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            got.ips.is_empty(),
+            "blackhole must resolve nothing: {got:?}",
+            got = got.ips
+        );
+        assert!(
+            got.trace.contains("timeout") || got.trace.contains("skipped(budget)"),
+            "trace must name the failure mode, got: {}",
+            got.trace
+        );
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "deadline did not bound the resolve: {elapsed:?} (trace: {})",
+            got.trace
         );
     }
 

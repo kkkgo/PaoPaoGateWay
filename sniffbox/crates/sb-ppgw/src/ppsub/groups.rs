@@ -282,7 +282,10 @@ mod tests {
         assert!(out_names.contains(&"G1"));
         assert!(out_names.contains(&"G2"), "include valid group → valid");
         assert!(out_names.contains(&"G3"), "include REJECT → valid");
-        assert!(!out_names.contains(&"G4"), "no nodes and no valid include → remove");
+        assert!(
+            !out_names.contains(&"G4"),
+            "no nodes and no valid include → remove"
+        );
     }
 
     fn group_inc(name: &str, kw: &[&str], include: Vec<String>) -> NodeGroup {
@@ -321,7 +324,10 @@ mod tests {
         g.include = vec!["DIRECT".to_string()];
         let (out, _) = generate_proxy_groups(&[g], &all, &[]);
         assert_eq!(out[0]["type"].as_str(), Some("select"));
-        assert!(out[0]["url"].is_badvalue(), "smart group should not have url-test field");
+        assert!(
+            out[0]["url"].is_badvalue(),
+            "smart group should not have url-test field"
+        );
         let proxies: Vec<&str> = out[0]["proxies"]
             .as_vec()
             .unwrap()
@@ -345,7 +351,9 @@ mod tests {
         assert_eq!(out[0]["type"].as_str(), Some("select"));
 
         assert!(out[0]["proxies"].is_badvalue());
-        let payload = providers[&ystr("Grp=(Pre🔗Grp)")]["payload"].as_vec().unwrap();
+        let payload = providers[&ystr("Grp=(Pre🔗Grp)")]["payload"]
+            .as_vec()
+            .unwrap();
         let last = payload.last().unwrap();
         assert_eq!(last["name"].as_str(), Some(SMART_HIDE_NODE));
         assert_eq!(last["type"].as_str(), Some("reject"));

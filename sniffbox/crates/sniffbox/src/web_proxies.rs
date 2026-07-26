@@ -289,7 +289,9 @@ pub(crate) fn build_trimmed(
     for (name, pv) in &providers_raw.providers {
         let mut names = Vec::new();
         for node in &pv.proxies {
-            let Some(n) = node.name.as_deref() else { continue };
+            let Some(n) = node.name.as_deref() else {
+                continue;
+            };
 
             if n == sb_ppgw::ppsub::SMART_HIDE_NODE {
                 continue;
@@ -520,7 +522,11 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
     fn pv(v: Value) -> RawProviders {
-        if v.is_null() { RawProviders::default() } else { serde_json::from_value(v).unwrap() }
+        if v.is_null() {
+            RawProviders::default()
+        } else {
+            serde_json::from_value(v).unwrap()
+        }
     }
 
     #[test]
@@ -551,16 +557,15 @@ mod tests {
                 "default": {"name": "default", "vehicleType": "Compatible", "proxies": []}
             }
         });
-        let out: Value =
-            serde_json::from_str(&build_trimmed(
-                &px(proxies),
-                &pv(providers),
-                "Rule",
-                "http://t",
-                &HashMap::new(),
-                &|_| None
-            ))
-            .unwrap();
+        let out: Value = serde_json::from_str(&build_trimmed(
+            &px(proxies),
+            &pv(providers),
+            "Rule",
+            "http://t",
+            &HashMap::new(),
+            &|_| None,
+        ))
+        .unwrap();
         assert_eq!(out["mode"], "Rule");
         assert_eq!(out["testUrl"], "http://t");
 
@@ -607,26 +612,24 @@ mod tests {
                 ]}
             }
         });
-        let smart_urls =
-            HashMap::from([("Smart".to_string(), "http://smart/204".to_string())]);
-        let out: Value =
-            serde_json::from_str(&build_trimmed(
-                &px(proxies),
-                &pv(providers),
-                "rule",
-                "u",
-                &smart_urls,
-                &|g| (g == "Smart").then(|| json!({"N1": {"score": 123, "samples": [100, null]}})),
-            ))
-            .unwrap();
+        let smart_urls = HashMap::from([("Smart".to_string(), "http://smart/204".to_string())]);
+        let out: Value = serde_json::from_str(&build_trimmed(
+            &px(proxies),
+            &pv(providers),
+            "rule",
+            "u",
+            &smart_urls,
+            &|g| (g == "Smart").then(|| json!({"N1": {"score": 123, "samples": [100, null]}})),
+        ))
+        .unwrap();
 
         assert!(out["proxies"].get("smartspeedtest@hide").is_none());
         assert_eq!(out["proxies"]["Smart"]["all"], json!(["N1"]));
-        assert_eq!(out["proxies"]["GLOBAL"]["all"], json!(["Smart", "Plain", "N1"]));
         assert_eq!(
-            out["providers"]["Grp=(Pre🔗Grp)"]["proxies"],
-            json!(["P1"])
+            out["proxies"]["GLOBAL"]["all"],
+            json!(["Smart", "Plain", "N1"])
         );
+        assert_eq!(out["providers"]["Grp=(Pre🔗Grp)"]["proxies"], json!(["P1"]));
 
         assert_eq!(out["proxies"]["Smart"]["smart"], true);
         assert!(out["proxies"]["Plain"].get("smart").is_none());
@@ -636,7 +639,10 @@ mod tests {
         assert!(out["proxies"]["Plain"].get("testUrl").is_none());
 
         assert_eq!(out["proxies"]["Smart"]["scores"]["N1"]["score"], 123);
-        assert_eq!(out["proxies"]["Smart"]["scores"]["N1"]["samples"], json!([100, null]));
+        assert_eq!(
+            out["proxies"]["Smart"]["scores"]["N1"]["samples"],
+            json!([100, null])
+        );
         assert!(out["proxies"]["Plain"].get("scores").is_none());
         assert!(out["proxies"]["GLOBAL"].get("scores").is_none());
     }
@@ -725,9 +731,10 @@ mod tests {
             }
         })
         .to_string();
-        let node: Value =
-            serde_json::from_str(&find_provider_node(body.as_bytes(), "US🇺🇸-SJC-direct-backup").unwrap())
-                .unwrap();
+        let node: Value = serde_json::from_str(
+            &find_provider_node(body.as_bytes(), "US🇺🇸-SJC-direct-backup").unwrap(),
+        )
+        .unwrap();
         assert_eq!(node["type"], "Trojan");
         assert_eq!(node["server"], "1.2.3.4");
         assert_eq!(node["port"], 443);
@@ -740,16 +747,15 @@ mod tests {
 
     #[test]
     fn missing_proxies_key_yields_empty_map() {
-        let out: Value =
-            serde_json::from_str(&build_trimmed(
-                &px(json!({})),
-                &RawProviders::default(),
-                "rule",
-                "u",
-                &HashMap::new(),
-                &|_| None
-            ))
-            .unwrap();
+        let out: Value = serde_json::from_str(&build_trimmed(
+            &px(json!({})),
+            &RawProviders::default(),
+            "rule",
+            "u",
+            &HashMap::new(),
+            &|_| None,
+        ))
+        .unwrap();
         assert_eq!(out["proxies"], json!({}));
         assert_eq!(out["providers"], json!({}));
     }

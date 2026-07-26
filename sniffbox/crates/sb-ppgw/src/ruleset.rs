@@ -297,9 +297,12 @@ where
     report
 }
 
+pub const PREFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn prefetch(clash_yaml: &str, dir: &str) -> PrefetchReport {
     prefetch_with(clash_yaml, dir, |url, tmp| {
         crate::download::Downloader::new(url, tmp)
+            .best_effort(PREFETCH_TIMEOUT)
             .download()
             .map_err(|e| e.to_string())?;
         std::fs::read(tmp).map_err(|e| e.to_string())

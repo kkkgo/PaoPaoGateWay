@@ -120,6 +120,12 @@ pub(crate) fn pp_warn(msg: &str) {
     );
 }
 
+pub(crate) const LOG: crate::resolvepool::Log = crate::resolvepool::Log {
+    info: pp_log,
+    step: pp_step,
+    warn: pp_warn,
+};
+
 pub fn process_ppsub(
     config_file: &str,
     output_file: &str,
