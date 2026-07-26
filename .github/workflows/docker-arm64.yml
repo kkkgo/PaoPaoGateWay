@@ -46,7 +46,7 @@ jobs:
       with:
         context: "./iso"
         push: true
-        platforms: linux/amd64
+        platforms: linux/amd64,linux/arm64
         tags: sliamb/ppgwiso:arm64
 
   push-ecr:
