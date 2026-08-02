@@ -99,6 +99,19 @@ pub fn bind_spoof_udp(spoof_src: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
+pub fn bind_udp_reuseaddr(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
 pub fn bind_tproxy_udp(addr: SocketAddr) -> io::Result<TproxyUdp> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -573,6 +586,30 @@ fn set_sockbuf_forced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bind_specific_reuseaddr(addr: SocketAddr) -> io::Result<Socket> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_reuse_address(true)?;
+        sock.bind(&addr.into())?;
+        Ok(sock)
+    }
+
+    #[tokio::test]
+    async fn reuseaddr_wildcard_lets_spoof_cobind_same_port() {
+        let wildcard = bind_udp_reuseaddr("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        bind_specific_reuseaddr(SocketAddr::from(([127, 0, 0, 1], port)))
+            .expect("spoof-style bind must succeed alongside a SO_REUSEADDR wildcard");
+    }
+
+    #[test]
+    fn plain_wildcard_blocks_spoof_cobind() {
+        let wildcard = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        let err = bind_specific_reuseaddr(SocketAddr::from(([127, 0, 0, 1], port)))
+            .expect_err("must conflict when the wildcard socket lacks SO_REUSEADDR");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
 
     #[test]
     fn libc_constants_sane() {

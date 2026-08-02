@@ -10,8 +10,8 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
-pub async fn bind_dns(addr: SocketAddr) -> std::io::Result<UdpSocket> {
-    UdpSocket::bind(addr).await
+pub fn bind_dns(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    sb_tproxy::udp::bind_udp_reuseaddr(addr)
 }
 
 pub async fn run_dns_server(

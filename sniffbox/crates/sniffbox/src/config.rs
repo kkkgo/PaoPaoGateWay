@@ -24,6 +24,8 @@ pub struct Config {
     pub outbound: OutboundCfg,
 
     pub report: ReportCfg,
+
+    pub cloudflared: CloudflaredCfg,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +330,49 @@ pub struct ReportCfg {
     pub pplog_uuid: Option<[u8; 16]>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CloudflaredCfg {
+
+    pub token: Option<String>,
+
+    pub proxy: CfProxyMode,
+
+    pub tproxy: Option<SocketAddr>,
+
+    pub tproxy6: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CfProxyMode {
+
+    #[default]
+    Yes,
+
+    No,
+
+    Both,
+}
+
+impl CfProxyMode {
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yes" | "true" | "1" | "on" | "proxy" | "only" => Some(Self::Yes),
+            "no" | "false" | "0" | "off" | "direct" => Some(Self::No),
+            "both" | "all" | "dual" | "2" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Both => "both",
+        }
+    }
+}
+
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     let hexs: String = s.chars().filter(|c| *c != '-').collect();
     if hexs.len() != 32 {
@@ -379,6 +424,7 @@ impl Config {
         let inbound_proxy = parse_inbound_proxy(ini.get("inbound_proxy"))?;
         let outbound = parse_outbound(ini.get("outbound"))?;
         let report = parse_report(ini.get("report"))?;
+        let cloudflared = parse_cloudflared(ini.get("cloudflared"))?;
         Ok(Self {
             log,
             inbound,
@@ -391,6 +437,7 @@ impl Config {
             inbound_proxy,
             outbound,
             report,
+            cloudflared,
         })
     }
 }
@@ -778,6 +825,31 @@ fn parse_report(sec: Option<&Section>) -> Result<ReportCfg, ConfigErr> {
             value: v.into(),
             msg: "expected uuid (32 hex digits, dashes optional)".into(),
         })?);
+    }
+    Ok(c)
+}
+
+fn parse_cloudflared(sec: Option<&Section>) -> Result<CloudflaredCfg, ConfigErr> {
+    let mut c = CloudflaredCfg::default();
+    if let Some(v) = get(sec, "token") {
+        c.token = (!v.is_empty()).then(|| v.to_string());
+    }
+    if let Some(v) = get(sec, "proxy") {
+        match CfProxyMode::parse(v) {
+            Some(m) => c.proxy = m,
+
+            None => tracing::warn!(
+                value = v,
+                default = c.proxy.as_str(),
+                "cloudflared: unknown cf_proxy value (want yes|no|both); using default"
+            ),
+        }
+    }
+    if let Some(v) = get(sec, "tproxy") {
+        c.tproxy = Some(parse_socket("cloudflared", "tproxy", v)?);
+    }
+    if let Some(v) = get(sec, "tproxy6") {
+        c.tproxy6 = Some(parse_socket("cloudflared", "tproxy6", v)?);
     }
     Ok(c)
 }

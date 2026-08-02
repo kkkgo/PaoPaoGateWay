@@ -37,6 +37,56 @@ else
                 meta l4proto {tcp, udp} th dport 1080 drop"
 fi
 
+cf_uid=7844
+cf_uid_direct=7845
+cf_port=1082
+cf_dns=1.1.1.1
+cf_dns6=2606:4700:4700::1111
+cf_enable="no"
+if [ -n "$cloudflared_token" ] || [ -x /usr/bin/cloudflared ]; then
+    cf_enable="yes"
+fi
+if [ "$cf_enable" = "yes" ]; then
+    cf_tproxy_rule="                meta mark 1 ip protocol tcp tproxy to 127.0.0.1:$cf_port accept
+                meta mark 1 ip protocol udp tproxy to 127.0.0.1:$cf_port accept"
+    cf_dns_rule="                meta skuid $cf_uid udp dport 53 dnat to $cf_dns:53
+                meta skuid $cf_uid tcp dport 53 dnat to $cf_dns:53
+                meta skuid $cf_uid_direct udp dport 53 dnat to $cf_dns:53
+                meta skuid $cf_uid_direct tcp dport 53 dnat to $cf_dns:53"
+    cf_dns_chain6="
+        chain ppgw_cf_dns6 {
+                type nat hook output priority dstnat; policy accept;
+                meta skuid $cf_uid udp dport 53 dnat to [$cf_dns6]:53
+                meta skuid $cf_uid tcp dport 53 dnat to [$cf_dns6]:53
+                meta skuid $cf_uid_direct udp dport 53 dnat to [$cf_dns6]:53
+                meta skuid $cf_uid_direct tcp dport 53 dnat to [$cf_dns6]:53
+        }
+"
+    cf_output_chain="
+        chain ppgw_cf_output {
+                type route hook output priority filter; policy accept;
+                ip daddr @localnetwork return
+                meta skuid $cf_uid meta l4proto {tcp, udp} meta mark set 1
+        }
+"
+    cf_tproxy_rule6="                meta mark 1 meta l4proto tcp tproxy to [::1]:$cf_port accept
+                meta mark 1 meta l4proto udp tproxy to [::1]:$cf_port accept"
+    cf_output_chain6="
+        chain ppgw_cf_output6 {
+                type route hook output priority filter; policy accept;
+                ip6 daddr @localnetwork6 return
+                meta skuid $cf_uid meta l4proto {tcp, udp} meta mark set 1
+        }
+"
+else
+    cf_tproxy_rule="                # cloudflared not integrated: no uid $cf_uid proxy rule"
+    cf_dns_rule="                # cloudflared not integrated: no uid $cf_uid/$cf_uid_direct dns rule"
+    cf_output_chain=""
+    cf_tproxy_rule6="                # cloudflared not integrated: no uid $cf_uid proxy rule"
+    cf_output_chain6=""
+    cf_dns_chain6=""
+fi
+
 block_quic=$(echo "$box" | grep -Eo "block_quic[ ]*=[ ]*[a-zA-Z]+" | grep -Eo "(true|false)" | head -1)
 if [ -z "$block_quic" ]; then
     block_quic="true"
@@ -96,6 +146,7 @@ table ip6 ppgw {
         chain ppgw_tproxy6 {
                 type filter hook prerouting priority mangle; policy accept;
                 ip6 daddr @localnetwork6 return
+$cf_tproxy_rule6
 $udp_rules6
                 meta l4proto tcp tproxy to [::1]:1081 meta mark set 1
         }
@@ -103,7 +154,7 @@ $udp_rules6
                 type filter hook input priority filter; policy accept;
 $openport_input_rule6
         }
-}
+$cf_dns_chain6$cf_output_chain6}
 "
 else
     IP6_TABLE=""
@@ -139,6 +190,7 @@ table ip ppgw {
         chain ppgw_tproxy {
                 type filter hook prerouting priority mangle; policy accept;
                 ip daddr @localnetwork return
+$cf_tproxy_rule
 $udp_rules
                 ip protocol tcp tproxy to 127.0.0.1:1081 meta mark set 1
         }
@@ -155,8 +207,9 @@ $openport_input_rule
         chain hijackdns {
                 type nat hook output priority dstnat; policy accept;
                 meta skuid 65534 accept
+$cf_dns_rule
                 ip daddr @original_dns udp dport 53 dnat to \$DNS_R_IP:\$DNS_R_PORT
         }
-}
+$cf_output_chain}
 $IP6_TABLE
 EOF

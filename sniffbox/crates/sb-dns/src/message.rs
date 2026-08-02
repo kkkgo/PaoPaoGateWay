@@ -4,6 +4,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_PTR: u16 = 12;
+pub const TYPE_MX: u16 = 15;
+
+pub const TYPE_SRV: u16 = 33;
+pub const TYPE_TXT: u16 = 16;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SVCB: u16 = 64;
 pub const TYPE_HTTPS: u16 = 65;
@@ -150,9 +154,13 @@ fn write_response_header(out: &mut [u8], rd: bool, rcode: u8, ancount: u16) {
 }
 
 pub fn build_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>, DnsError> {
+    build_query_with(id, name, qtype, true)
+}
+
+pub fn build_query_with(id: u16, name: &str, qtype: u16, rd: bool) -> Result<Vec<u8>, DnsError> {
     let mut out = Vec::with_capacity(HEADER_LEN + name.len() + 6);
     out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&0x0100u16.to_be_bytes());
+    out.extend_from_slice(&if rd { 0x0100u16 } else { 0x0000u16 }.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes());
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
 
@@ -181,6 +189,12 @@ pub struct DnsResponse {
     pub rcode: u8,
     pub v4: Vec<Ipv4Addr>,
     pub v6: Vec<Ipv6Addr>,
+
+    pub txt: Vec<String>,
+
+    pub mx: Vec<String>,
+
+    pub srv: Vec<(String, u16)>,
 
     pub min_ttl: u32,
 }
@@ -240,6 +254,33 @@ pub fn parse_response(buf: &[u8]) -> Result<DnsResponse, DnsError> {
                 out.v6.push(Ipv6Addr::from(o));
                 min_ttl = min_ttl.min(ttl);
             }
+
+            TYPE_TXT => {
+                let mut p = pos;
+                while p < rdata_end {
+                    let slen = buf[p] as usize;
+                    let end = match p.checked_add(1 + slen).filter(|e| *e <= rdata_end) {
+                        Some(e) => e,
+                        None => break,
+                    };
+                    out.txt
+                        .push(String::from_utf8_lossy(&buf[p + 1..end]).into_owned());
+                    p = end;
+                }
+            }
+
+            TYPE_MX if rdlen > 2 => {
+                if let Some(name) = read_name(buf, pos + 2) {
+                    out.mx.push(name);
+                }
+            }
+
+            TYPE_SRV if rdlen > 6 => {
+                let port = u16::from_be_bytes([buf[pos + 4], buf[pos + 5]]);
+                if let Some(name) = read_name(buf, pos + 6) {
+                    out.srv.push((name, port));
+                }
+            }
             _ => {}
         }
         pos = rdata_end;
@@ -271,6 +312,40 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Result<usize, DnsError> {
             .ok_or(DnsError::Truncated)?;
     }
     Err(DnsError::NameTooLong)
+}
+
+fn read_name(buf: &[u8], mut pos: usize) -> Option<String> {
+    let mut out = String::new();
+
+    let mut hops = 0u8;
+    loop {
+        let len = *buf.get(pos)? as usize;
+        if len == 0 {
+            return Some(out);
+        }
+        if len & 0xC0 == 0xC0 {
+            let lo = *buf.get(pos + 1)? as usize;
+            let target = ((len & 0x3F) << 8) | lo;
+            hops += 1;
+            if hops > 8 || target >= buf.len() {
+                return None;
+            }
+            pos = target;
+            continue;
+        }
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        let end = pos.checked_add(1 + len).filter(|e| *e <= buf.len())?;
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(&buf[pos + 1..end]));
+        if out.len() > 255 {
+            return None;
+        }
+        pos = end;
+    }
 }
 
 pub fn error_response(query_buf: &[u8], rcode: u8) -> Vec<u8> {
@@ -412,6 +487,167 @@ mod tests {
         assert_eq!(p.name, "example.com");
         assert_eq!(p.qtype, TYPE_A);
         assert!(p.is_a());
+    }
+
+    #[test]
+    fn build_query_with_can_clear_rd() {
+        let q = build_query_with(7, "whoami.ds.akahelp.net", TYPE_TXT, false).unwrap();
+        let p = parse_query(&q).unwrap();
+        assert!(!p.rd, "RD must be clear");
+        assert_eq!(p.qtype, TYPE_TXT);
+        assert!(
+            build_query(7, "x.com", TYPE_A)
+                .map(|q| q[2] & 0x01)
+                .unwrap()
+                == 1
+        );
+    }
+
+    #[test]
+    fn parse_response_extracts_txt_strings() {
+        let mut b = build_query_with(0x1234, "whoami.ds.akahelp.net", TYPE_TXT, false).unwrap();
+        b[2] |= 0x80;
+        b[6..8].copy_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_TXT.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&60u32.to_be_bytes());
+        let rdata = {
+            let mut r = Vec::new();
+            for s in ["ns", "154.12.185.30"] {
+                r.push(s.len() as u8);
+                r.extend_from_slice(s.as_bytes());
+            }
+            r
+        };
+        b.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        b.extend_from_slice(&rdata);
+
+        let r = parse_response(&b).unwrap();
+        assert_eq!(r.rcode, RCODE_NOERROR);
+        assert_eq!(r.txt, vec!["ns".to_string(), "154.12.185.30".to_string()]);
+        assert_eq!(r.min_ttl, 0, "TXT ttl must not feed the A/AAAA cache ttl");
+    }
+
+    #[test]
+    fn parse_response_txt_truncated_segment_is_safe() {
+        let mut b = build_query_with(1, "x.com", TYPE_TXT, false).unwrap();
+        b[2] |= 0x80;
+        b[6..8].copy_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_TXT.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&[200, b'a', b'b']);
+        let r = parse_response(&b).unwrap();
+        assert!(r.txt.is_empty(), "oversized segment must be dropped");
+    }
+
+    #[test]
+    fn parse_response_extracts_mx_exchange_following_pointers() {
+        let mut b = build_query(0x2222, "gmail.com", TYPE_MX).unwrap();
+        b[2] |= 0x80;
+        b[6..8].copy_from_slice(&2u16.to_be_bytes());
+
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_MX.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&300u32.to_be_bytes());
+        let full = b"\x0dgmail-smtp-in\x01l\x06google\x03com\x00";
+        b.extend_from_slice(&((2 + full.len()) as u16).to_be_bytes());
+        b.extend_from_slice(&5u16.to_be_bytes());
+        let full_at = b.len();
+        b.extend_from_slice(full);
+
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_MX.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&300u32.to_be_bytes());
+        b.extend_from_slice(&9u16.to_be_bytes());
+        b.extend_from_slice(&20u16.to_be_bytes());
+        b.extend_from_slice(b"\x04alt2");
+        b.extend_from_slice(&[0xC0 | (full_at >> 8) as u8, full_at as u8]);
+
+        let r = parse_response(&b).unwrap();
+        assert_eq!(
+            r.mx,
+            vec![
+                "gmail-smtp-in.l.google.com".to_string(),
+                "alt2.gmail-smtp-in.l.google.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_response_extracts_srv_target_and_port() {
+        let mut b = build_query(0x33, "_v2-origintunneld._tcp.argotunnel.com", TYPE_SRV).unwrap();
+        b[2] |= 0x80;
+        b[6..8].copy_from_slice(&2u16.to_be_bytes());
+
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&300u32.to_be_bytes());
+        let full = b"\x07region1\x02v2\x0aargotunnel\x03com\x00";
+        b.extend_from_slice(&((6 + full.len()) as u16).to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&7844u16.to_be_bytes());
+        let suffix_at = b.len() + "\x07region1".len();
+        b.extend_from_slice(full);
+
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&300u32.to_be_bytes());
+        b.extend_from_slice(&16u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&7844u16.to_be_bytes());
+        b.extend_from_slice(b"\x07region2");
+        b.extend_from_slice(&[0xC0 | (suffix_at >> 8) as u8, suffix_at as u8]);
+
+        let r = parse_response(&b).unwrap();
+        assert_eq!(
+            r.srv,
+            vec![
+                ("region1.v2.argotunnel.com".to_string(), 7844),
+                ("region2.v2.argotunnel.com".to_string(), 7844),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_response_srv_too_short_is_dropped() {
+        let mut b = build_query(1, "x.com", TYPE_SRV).unwrap();
+        b[2] |= 0x80;
+        b[6..8].copy_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_SRV.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&[0, 1, 0, 1]);
+        assert!(parse_response(&b).unwrap().srv.is_empty());
+    }
+
+    #[test]
+    fn parse_response_mx_pointer_loop_is_dropped() {
+        let mut b = build_query(1, "x.com", TYPE_MX).unwrap();
+        b[2] |= 0x80;
+        b[6..8].copy_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&[0xC0, 0x0C]);
+        b.extend_from_slice(&TYPE_MX.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&10u16.to_be_bytes());
+        let here = b.len();
+        b.extend_from_slice(&[0xC0 | (here >> 8) as u8, here as u8]);
+        let r = parse_response(&b).unwrap();
+        assert!(r.mx.is_empty(), "self-referencing pointer must be dropped");
     }
 
     #[test]

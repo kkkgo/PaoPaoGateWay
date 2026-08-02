@@ -88,7 +88,11 @@ pub fn start_inbound_proxy(
     });
 }
 
-pub fn start_healthcheck_listener(shared: Arc<SharedState>, shutdown_rx: watch::Receiver<bool>) {
+pub fn start_healthcheck_listener(
+    shared: Arc<SharedState>,
+    udp: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), HEALTHCHECK_PORT);
         let listener = match TcpListener::bind(addr).await {
@@ -98,11 +102,10 @@ pub fn start_healthcheck_listener(shared: Arc<SharedState>, shutdown_rx: watch::
                 return;
             }
         };
-        tracing::info!(%addr, "healthcheck socks5 inbound listening");
-
+        tracing::info!(%addr, udp, "healthcheck socks5 inbound listening");
         let params = InboundProxyParams {
             listen_port: HEALTHCHECK_PORT,
-            udp: false,
+            udp,
             udp_idle: Duration::from_secs(60),
         };
         let mut sd = shutdown_rx;
@@ -224,6 +227,7 @@ fn dest_to_established(dest: DestAddr, inbound: InboundKind, sniff: bool) -> Est
             domain: None,
             prelude: Vec::new(),
             sniff,
+            group: None,
         },
         DestAddr::Domain(host, port) => Established {
 
@@ -232,6 +236,7 @@ fn dest_to_established(dest: DestAddr, inbound: InboundKind, sniff: bool) -> Est
             domain: Some(host),
             prelude: Vec::new(),
             sniff,
+            group: None,
         },
     }
 }
@@ -317,6 +322,7 @@ fn host_port_to_established(
             domain: None,
             prelude,
             sniff,
+            group: None,
         },
         Err(_) => Established {
             dest: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
@@ -324,6 +330,7 @@ fn host_port_to_established(
             domain: Some(host),
             prelude,
             sniff,
+            group: None,
         },
     }
 }
@@ -547,20 +554,7 @@ async fn udp_associate_inbound(
         }
     };
 
-    let rec = Arc::new(
-        ConnRecord::new(
-            shared.id_gen.next_id(),
-            (peer.ip(), peer.port()),
-            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            sb_stats::SniffedProto::Socks5,
-            None,
-        )
-        .with_inbound(inbound, Transport::Udp),
-    );
-    shared.conn_table.insert(Arc::clone(&rec));
-    if let Some(p) = &shared.pplog {
-        p.open(&rec);
-    }
+    let rec = Arc::new(UdpAssocRecords::new(Arc::clone(&shared), peer, inbound));
 
     let client_addr_seen: Arc<parking_lot::Mutex<Option<SocketAddr>>> =
         Arc::new(parking_lot::Mutex::new(None));
@@ -603,15 +597,124 @@ async fn udp_associate_inbound(
 
     reply_task.abort();
     upstream.shutdown().await;
-    let (du, dd) = rec.drain_delta();
-    if du != 0 || dd != 0 {
-        shared.traffic.add_totals(dd, du);
-    }
-    shared.conn_table.close(rec.id);
-    if let Some(p) = &shared.pplog {
-        p.close(&rec);
-    }
+    rec.close();
     Ok(())
+}
+
+struct UdpAssocRecords {
+    shared: Arc<SharedState>,
+    peer: SocketAddr,
+    inbound: InboundKind,
+
+    inner: parking_lot::Mutex<AssocRecs>,
+}
+
+#[derive(Default)]
+struct AssocRecs {
+    by_target: std::collections::HashMap<TargetKey, Arc<ConnRecord>>,
+
+    last: Option<Arc<ConnRecord>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum TargetKey {
+    Addr(SocketAddr),
+    Host(String, u16),
+}
+
+const MAX_TARGETS_PER_ASSOC: usize = 256;
+
+impl UdpAssocRecords {
+    fn new(shared: Arc<SharedState>, peer: SocketAddr, inbound: InboundKind) -> Self {
+        Self {
+            shared,
+            peer,
+            inbound,
+            inner: parking_lot::Mutex::new(AssocRecs::default()),
+        }
+    }
+
+    fn forward_record(
+        &self,
+        dst: SocketAddr,
+        domain: Option<&str>,
+        client_host: bool,
+        payload: &[u8],
+    ) -> Arc<ConnRecord> {
+        let key = match domain {
+            Some(h) => TargetKey::Host(h.to_owned(), dst.port()),
+            None => TargetKey::Addr(dst),
+        };
+        let mut g = self.inner.lock();
+        if let Some(r) = g.by_target.get(&key) {
+            let r = Arc::clone(r);
+            g.last = Some(Arc::clone(&r));
+            return r;
+        }
+        if g.by_target.len() >= MAX_TARGETS_PER_ASSOC
+            && let Some(r) = &g.last
+        {
+            return Arc::clone(r);
+        }
+
+        let proto = crate::udp_engine::classify_inbound_udp_proto(
+            dst,
+            payload,
+            client_host,
+            domain.is_some() && !client_host,
+            domain
+                .and_then(crate::domain_rules::match_group)
+                .or_else(|| self.shared.domain_ips.get(dst.ip())),
+        );
+        let r = Arc::new(
+            ConnRecord::new(
+                self.shared.id_gen.next_id(),
+                (self.peer.ip(), self.peer.port()),
+                (dst.ip(), dst.port()),
+                proto,
+                domain.map(str::to_owned),
+            )
+            .with_inbound(self.inbound, Transport::Udp),
+        );
+
+        if matches!(
+            proto,
+            sb_stats::SniffedProto::Socks5
+                | sb_stats::SniffedProto::FakeIp
+                | sb_stats::SniffedProto::RealIp
+        ) {
+            r.set_head(payload);
+        }
+        self.shared.conn_table.insert(Arc::clone(&r));
+        if let Some(p) = &self.shared.pplog {
+            p.open(&r);
+        }
+        g.by_target.insert(key, Arc::clone(&r));
+        g.last = Some(Arc::clone(&r));
+        r
+    }
+
+    fn reply_record(&self, src: SocketAddr) -> Option<Arc<ConnRecord>> {
+        let g = self.inner.lock();
+        g.by_target
+            .get(&TargetKey::Addr(src))
+            .cloned()
+            .or_else(|| g.last.clone())
+    }
+
+    fn close(&self) {
+        let g = self.inner.lock();
+        for r in g.by_target.values() {
+            let (du, dd) = r.drain_delta();
+            if du != 0 || dd != 0 {
+                self.shared.traffic.add_totals(dd, du);
+            }
+            self.shared.conn_table.close(r.id);
+            if let Some(p) = &self.shared.pplog {
+                p.close(r);
+            }
+        }
+    }
 }
 
 enum InboundUpstream {
@@ -665,7 +768,7 @@ impl InboundUpstream {
         shared: &Arc<SharedState>,
         frame: &[u8],
         up_buf: &mut Vec<u8>,
-        rec: &Arc<ConnRecord>,
+        rec: &UdpAssocRecords,
     ) -> io::Result<()> {
         match self {
             Self::Socks5 { relay, .. } => {
@@ -681,7 +784,7 @@ impl InboundUpstream {
         &self,
         relay: Arc<UdpSocket>,
         client_seen: Arc<parking_lot::Mutex<Option<SocketAddr>>>,
-        rec: Arc<ConnRecord>,
+        rec: Arc<UdpAssocRecords>,
     ) -> tokio::task::JoinHandle<()> {
         match self {
             Self::Socks5 {
@@ -709,7 +812,7 @@ async fn reply_loop_socks5(
     up_relay: Arc<UdpSocket>,
     relay: Arc<UdpSocket>,
     client_seen: Arc<parking_lot::Mutex<Option<SocketAddr>>>,
-    rec: Arc<ConnRecord>,
+    rec: Arc<UdpAssocRecords>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut out = Vec::with_capacity(2048);
@@ -729,7 +832,9 @@ async fn reply_loop_socks5(
         if relay.send_to(&out, client).await.is_err() {
             break;
         }
-        rec.add_down((n - off) as u64);
+        if let Some(r) = rec.reply_record(src) {
+            r.add_down((n - off) as u64);
+        }
     }
 }
 
@@ -737,7 +842,7 @@ async fn reply_loop_direct(
     sock: Arc<UdpSocket>,
     relay: Arc<UdpSocket>,
     client_seen: Arc<parking_lot::Mutex<Option<SocketAddr>>>,
-    rec: Arc<ConnRecord>,
+    rec: Arc<UdpAssocRecords>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut out = Vec::with_capacity(2048);
@@ -753,7 +858,9 @@ async fn reply_loop_direct(
         if relay.send_to(&out, client).await.is_err() {
             break;
         }
-        rec.add_down(n as u64);
+        if let Some(r) = rec.reply_record(real_src) {
+            r.add_down(n as u64);
+        }
     }
 }
 
@@ -762,7 +869,7 @@ async fn forward_client_packet(
     up_relay: &UdpSocket,
     frame: &[u8],
     up_buf: &mut Vec<u8>,
-    rec: &Arc<ConnRecord>,
+    rec: &UdpAssocRecords,
 ) -> io::Result<()> {
     let (dst, host, off) = match decode_client_udp_header(frame) {
         Some(v) => v,
@@ -770,12 +877,13 @@ async fn forward_client_packet(
     };
     let payload = &frame[off..];
 
+    let client_host = host.is_some();
     let domain = host.or_else(|| match (&shared.fakeip, dst.ip()) {
         (Some(f), IpAddr::V4(v4)) if f.contains(dst.ip()) => f.lookback(v4).map(|d| d.to_string()),
         _ => None,
     });
-    match domain {
-        Some(h) => encode_udp_request_domain_into(up_buf, &h, dst.port(), payload)
+    match &domain {
+        Some(h) => encode_udp_request_domain_into(up_buf, h, dst.port(), payload)
             .map_err(io::Error::other)?,
         None => {
 
@@ -785,7 +893,8 @@ async fn forward_client_packet(
             encode_udp_request_into(up_buf, dst, payload);
         }
     }
-    rec.add_up(payload.len() as u64);
+    rec.forward_record(dst, domain.as_deref(), client_host, payload)
+        .add_up(payload.len() as u64);
     up_relay.send(up_buf).await?;
     Ok(())
 }
@@ -795,7 +904,7 @@ async fn forward_client_packet_direct(
     sock: &UdpSocket,
     resolver: &Resolver,
     frame: &[u8],
-    rec: &Arc<ConnRecord>,
+    rec: &UdpAssocRecords,
 ) -> io::Result<()> {
     let (dst, host, off) = match decode_client_udp_header(frame) {
         Some(v) => v,
@@ -803,13 +912,14 @@ async fn forward_client_packet_direct(
     };
     let payload = &frame[off..];
 
+    let client_host = host.is_some();
     let domain = host.or_else(|| match (&shared.fakeip, dst.ip()) {
         (Some(f), IpAddr::V4(v4)) if f.contains(dst.ip()) => f.lookback(v4).map(|d| d.to_string()),
         _ => None,
     });
-    let real_dst = match domain {
+    let real_dst = match &domain {
         Some(h) => {
-            let ip = resolver.resolve_v4(&h).await?;
+            let ip = resolver.resolve_v4(h).await?;
             SocketAddr::new(IpAddr::V4(ip), dst.port())
         }
         None => {
@@ -820,7 +930,8 @@ async fn forward_client_packet_direct(
             dst
         }
     };
-    rec.add_up(payload.len() as u64);
+    rec.forward_record(dst, domain.as_deref(), client_host, payload)
+        .add_up(payload.len() as u64);
     sock.send_to(payload, real_dst).await?;
     Ok(())
 }
@@ -1286,7 +1397,7 @@ mod tests {
         assert!(shared.outbound.is_direct());
         let mut p = params();
         p.udp = true;
-        let proxy = spawn_inbound(shared, p).await;
+        let proxy = spawn_inbound(Arc::clone(&shared), p).await;
 
         let mut ctrl = TcpStream::connect(proxy).await.unwrap();
         ctrl.write_all(&[0x05, 1, 0x00]).await.unwrap();
@@ -1302,6 +1413,11 @@ mod tests {
         let bnd = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(arep[4], arep[5], arep[6], arep[7])),
             u16::from_be_bytes([arep[8], arep[9]]),
+        );
+
+        assert!(
+            shared.conn_table.is_empty(),
+            "no traffic record before the first datagram"
         );
 
         let cudp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1323,6 +1439,49 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), echo.port())
         );
         assert_eq!(&rbuf[off..n], b"ping");
+
+        let recs = shared.conn_table.snapshot();
+        assert_eq!(recs.len(), 1, "first datagram registers one record");
+        let r = &recs[0];
+        assert_eq!(r.domain.as_deref(), Some("udp.test"));
+        assert_eq!(r.dst.1, echo.port(), "dst port from the first datagram");
+        assert_eq!(r.display_domain(), "udp.test");
+        assert_eq!(r.transport, Transport::Udp);
+
+        assert_eq!(r.proto, sb_stats::SniffedProto::Socks5);
+        assert_eq!(r.head_bytes().as_deref(), Some(&b"ping"[..]));
+        assert!(r.upload.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+        assert!(r.download.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+
+        let echo2 = udp_echo_server().await;
+        let mut dg2 = vec![0u8, 0, 0, 0x01, 127, 0, 0, 1];
+        dg2.extend_from_slice(&echo2.port().to_be_bytes());
+        dg2.extend_from_slice(b"pong");
+        cudp.send_to(&dg2, bnd).await.unwrap();
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(2), cudp.recv_from(&mut rbuf))
+            .await
+            .expect("second target replies within 2s")
+            .unwrap();
+        let (src2, off2) = sb_outbound::socks5_udp::decode_udp_reply(&rbuf[..n2]).unwrap();
+        assert_eq!(src2.port(), echo2.port());
+        assert_eq!(&rbuf[off2..n2], b"pong");
+
+        let recs = shared.conn_table.snapshot();
+        assert_eq!(
+            recs.len(),
+            2,
+            "one record per target within the association"
+        );
+        let r2 = recs
+            .iter()
+            .find(|r| r.dst.1 == echo2.port())
+            .expect("second target has its own record");
+        assert_eq!(r2.domain, None, "ip-form target keeps its ip as display");
+        assert_eq!(r2.display_domain(), "127.0.0.1");
+        assert_eq!(r2.proto, sb_stats::SniffedProto::RealIp);
+        assert!(r2.upload.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+
+        assert!(r2.download.load(std::sync::atomic::Ordering::Relaxed) >= 4);
         drop(ctrl);
     }
 

@@ -57,6 +57,8 @@ pub enum InboundKind {
 
     HealthCheck,
 
+    Cloudflared,
+
     Clash(&'static str),
 }
 impl InboundKind {
@@ -66,6 +68,7 @@ impl InboundKind {
             InboundKind::Socks5 => "socks5",
             InboundKind::Http => "http",
             InboundKind::HealthCheck => "healthcheck",
+            InboundKind::Cloudflared => "cloudflared",
             InboundKind::Clash(label) => label,
         }
     }

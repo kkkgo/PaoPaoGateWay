@@ -9,8 +9,8 @@ use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::{Agent, ResponseExt};
 
-pub const UA_BROWSER: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                              (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+pub const UA_BROWSER: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0";
 
 const DEFAULT_HEADERS: &[(&str, &str)] = &[
     (
@@ -75,9 +75,17 @@ enum Method {
 }
 
 pub fn run_json(req_json: &str, proxy: &str) -> String {
+    run_json_inner(req_json, proxy, false)
+}
+
+pub fn run_json_relaxed(req_json: &str, proxy: &str) -> String {
+    run_json_inner(req_json, proxy, true)
+}
+
+fn run_json_inner(req_json: &str, proxy: &str, relaxed: bool) -> String {
     let req = match serde_json::from_str::<Value>(req_json)
         .map_err(|e| e.to_string())
-        .and_then(|v| validate(&v))
+        .and_then(|v| validate_with(&v, relaxed))
     {
         Ok(r) => r,
         Err(e) => return json!({ "ok": false, "denied": true, "error": e }).to_string(),
@@ -93,7 +101,7 @@ pub fn run_json(req_json: &str, proxy: &str) -> String {
     }
 }
 
-fn validate(v: &Value) -> Result<Req, String> {
+fn validate_with(v: &Value, relaxed: bool) -> Result<Req, String> {
     let obj = v.as_object().ok_or("request must be a JSON object")?;
 
     let method = match obj
@@ -116,7 +124,7 @@ fn validate(v: &Value) -> Result<Req, String> {
     if url.len() > MAX_URL_LEN {
         return Err("url too long".into());
     }
-    check_url(url)?;
+    check_url(url, relaxed)?;
 
     let headers = parse_headers(obj.get("headers"))?;
 
@@ -225,7 +233,7 @@ fn is_header_value(s: &str) -> bool {
     s.bytes().all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
 }
 
-fn check_url(url: &str) -> Result<(), String> {
+fn check_url(url: &str, relaxed: bool) -> Result<(), String> {
     let uri: Uri = url.parse().map_err(|_| "bad url".to_string())?;
     let scheme = uri.scheme_str().ok_or("url must be absolute")?;
     let https = match scheme {
@@ -233,24 +241,32 @@ fn check_url(url: &str) -> Result<(), String> {
         "https" => true,
         s => return Err(format!("scheme not allowed: {s}")),
     };
+
     match uri.port_u16() {
         None => {}
+        Some(0) => return Err("port not allowed: 0".into()),
+        Some(_) if relaxed => {}
         Some(80) if !https => {}
         Some(443) if https => {}
         Some(p) => return Err(format!("port not allowed: {p}")),
     }
     let host = uri.host().ok_or("url has no host")?;
-    check_host(host)
+    check_host(host, relaxed)
 }
 
-fn check_host(host: &str) -> Result<(), String> {
+fn check_host(host: &str, allow_lan: bool) -> Result<(), String> {
 
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        return if ip_is_global(ip) {
+        let ok = if allow_lan {
+            ip_is_lan_ok(ip)
+        } else {
+            ip_is_global(ip)
+        };
+        return if ok {
             Ok(())
         } else {
             Err(format!("non-public address: {bare}"))
@@ -265,6 +281,18 @@ fn check_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ip_is_lan_ok(ip: IpAddr) -> bool {
+    if ip_is_global(ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(a) => a.is_private(),
+        IpAddr::V6(a) => {
+            a.to_ipv4_mapped().is_some_and(|v4| v4.is_private())
+                || (a.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
 fn ip_is_global(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => v4_is_global(a),
@@ -431,6 +459,44 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_mode_allows_private_and_any_port_but_still_blocks_loopback_and_friends() {
+        for url in [
+            "http://192.168.193.25/",
+            "http://10.0.0.1/x",
+            "http://172.16.0.1/x",
+            "http://[fd00::1]/x",
+            "http://[::ffff:192.168.1.1]/x",
+            "http://192.168.1.1:8080/",
+            "https://example.com:8443/",
+            "https://example.com/",
+        ] {
+            check_url(url, true)
+                .unwrap_or_else(|e| panic!("{url} should be allowed in relaxed mode: {e}"));
+            assert!(
+                check_url(url, false).is_err() || url == "https://example.com/",
+                "{url} must stay blocked in the default (region-check) mode"
+            );
+        }
+        for url in [
+            "http://127.0.0.1/x",
+            "http://127.0.0.1:1079/x",
+            "http://[::1]/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://100.64.0.1/x",
+            "http://198.18.0.1/x",
+            "http://localhost/x",
+            "http://router/x",
+            "ftp://192.168.1.1/x",
+            "http://192.168.1.1:0/x",
+        ] {
+            assert!(
+                check_url(url, true).is_err(),
+                "{url} must stay blocked even in relaxed mode"
+            );
+        }
+    }
+
+    #[test]
     fn b64_encode_matches_rfc4648() {
         assert_eq!(b64_encode(b""), "");
         assert_eq!(b64_encode(b"f"), "Zg==");
@@ -476,7 +542,7 @@ mod tests {
             "https://1.1.1.1/",
             "https://[2606:4700::1]/",
         ] {
-            check_url(url).unwrap_or_else(|e| panic!("{url} should be allowed: {e}"));
+            check_url(url, false).unwrap_or_else(|e| panic!("{url} should be allowed: {e}"));
         }
     }
 
@@ -541,15 +607,22 @@ mod tests {
 
     #[test]
     fn clamps_limits() {
-        let r =
-            validate(&json!({"url":"https://example.com","timeoutMs":1,"maxBody":1<<30})).unwrap();
+        let r = validate_with(
+            &json!({"url":"https://example.com","timeoutMs":1,"maxBody":1<<30}),
+            false,
+        )
+        .unwrap();
         assert_eq!(r.timeout, Duration::from_millis(MIN_TIMEOUT_MS));
         assert_eq!(r.max_body, MAX_RESP_BODY);
 
-        let r = validate(&json!({"url":"https://example.com","timeoutMs":999_999})).unwrap();
+        let r = validate_with(
+            &json!({"url":"https://example.com","timeoutMs":999_999}),
+            false,
+        )
+        .unwrap();
         assert_eq!(r.timeout, Duration::from_millis(MAX_TIMEOUT_MS));
 
-        let r = validate(&json!({"url":"https://example.com"})).unwrap();
+        let r = validate_with(&json!({"url":"https://example.com"}), false).unwrap();
         assert_eq!(r.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
         assert_eq!(r.max_body, DEFAULT_RESP_BODY);
         assert!(r.follow);
@@ -558,14 +631,17 @@ mod tests {
 
     #[test]
     fn accepts_normal_request() {
-        let r = validate(&json!({
-            "url": "https://api.kktv.me/v3/ipcheck",
-            "method": "POST",
-            "headers": { "Accept-Language": "en-US", "X-Trace": "1" },
-            "body": "{}",
-            "ua": "curl/8",
-            "follow": false,
-        }))
+        let r = validate_with(
+            &json!({
+                "url": "https://api.kktv.me/v3/ipcheck",
+                "method": "POST",
+                "headers": { "Accept-Language": "en-US", "X-Trace": "1" },
+                "body": "{}",
+                "ua": "curl/8",
+                "follow": false,
+            }),
+            false,
+        )
         .unwrap();
         assert_eq!(r.method, Method::Post);
         assert_eq!(

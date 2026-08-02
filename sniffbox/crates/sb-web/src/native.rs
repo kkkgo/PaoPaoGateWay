@@ -24,6 +24,10 @@ pub async fn handle(
             probe(stream, req, cfg, ka, body).await?;
             Ok(ka)
         }
+        "/sniffbox/ruletest" => {
+            rule_test(stream, req, cfg, ka, body).await?;
+            Ok(ka)
+        }
         "/sniffbox/logs/sse" => {
             logs_sse(stream, cfg).await?;
             Ok(false)
@@ -88,6 +92,22 @@ pub async fn handle(
             clash_up(stream, cfg, ka).await?;
             Ok(ka)
         }
+        "/sniffbox/cloudflared" => {
+            cloudflared_status(stream, cfg, ka).await?;
+            Ok(ka)
+        }
+        "/sniffbox/cloudflared/restart" => {
+            cloudflared_restart(stream, req, cfg, ka).await?;
+            Ok(ka)
+        }
+        "/sniffbox/cloudflared/logs" => {
+            cloudflared_logs(stream, cfg, ka).await?;
+            Ok(ka)
+        }
+        "/sniffbox/cloudflared/logs/sse" => {
+            cloudflared_logs_sse(stream, cfg).await?;
+            Ok(false)
+        }
         _ => {
             respond::not_found(stream, ka).await?;
             Ok(ka)
@@ -141,6 +161,49 @@ async fn probe(
             tracing::warn!(%e, "probe task panicked");
             let msg = br#"{"ok":false,"error":"probe task failed"}"#;
             respond::send(stream, 500, "Internal Server Error", &[JSON], msg, ka).await
+        }
+    }
+}
+
+async fn rule_test(
+    stream: &mut TcpStream,
+    req: &ReqHead,
+    cfg: &ServerConfig,
+    ka: bool,
+    body: &[u8],
+) -> io::Result<()> {
+    let Some(src) = cfg.probe.as_ref() else {
+        return respond::not_found(stream, ka).await;
+    };
+    if !req.method.eq_ignore_ascii_case("POST") {
+        return respond::send(
+            stream,
+            405,
+            "Method Not Allowed",
+            &[JSON, ("Allow", "POST")],
+            b"",
+            ka,
+        )
+        .await;
+    }
+
+    if !cfg.clash_enabled {
+        let msg = br#"{"ok":false,"error":"rule test requires clash (yaml/suburl mode)"}"#;
+        return respond::send(stream, 503, "Service Unavailable", &[JSON], msg, ka).await;
+    }
+    match crate::rule_test::run(cfg, Arc::clone(src), body).await {
+        Ok(out) => respond::send(stream, 200, "OK", &[JSON], out.as_bytes(), ka).await,
+        Err(_busy) => {
+            let msg = br#"{"ok":false,"busy":true,"error":"too many concurrent probes"}"#;
+            respond::send(
+                stream,
+                429,
+                "Too Many Requests",
+                &[JSON, ("Retry-After", "1")],
+                msg,
+                ka,
+            )
+            .await
         }
     }
 }
@@ -440,6 +503,104 @@ async fn clash_up(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::R
                 ka,
             )
             .await
+        }
+    }
+}
+
+async fn cloudflared_status(
+    stream: &mut TcpStream,
+    cfg: &ServerConfig,
+    ka: bool,
+) -> io::Result<()> {
+    let Some(src) = cfg.cloudflared.as_ref() else {
+        return respond::not_found(stream, ka).await;
+    };
+    let src = Arc::clone(src);
+    let body = tokio::task::spawn_blocking(move || src.status_json())
+        .await
+        .unwrap_or_else(|_| "{}".to_string());
+    respond::send(stream, 200, "OK", &[JSON], body.as_bytes(), ka).await
+}
+
+async fn cloudflared_restart(
+    stream: &mut TcpStream,
+    req: &ReqHead,
+    cfg: &ServerConfig,
+    ka: bool,
+) -> io::Result<()> {
+    let Some(src) = cfg.cloudflared.as_ref() else {
+        return respond::not_found(stream, ka).await;
+    };
+    if !req.method.eq_ignore_ascii_case("POST") {
+        return respond::send(
+            stream,
+            405,
+            "Method Not Allowed",
+            &[JSON, ("Allow", "POST")],
+            b"",
+            ka,
+        )
+        .await;
+    }
+    let src = Arc::clone(src);
+    let which = query_param(&req.path, "egress");
+
+    match tokio::task::spawn_blocking(move || src.restart(which.as_deref())).await {
+        Ok(Ok(running)) => {
+            let body = format!(r#"{{"restarted":true,"running":{running}}}"#);
+            respond::send(stream, 200, "OK", &[JSON], body.as_bytes(), ka).await
+        }
+        Ok(Err(why)) => {
+            let body = serde_json::json!({ "restarted": false, "error": why }).to_string();
+            respond::send(stream, 409, "Conflict", &[JSON], body.as_bytes(), ka).await
+        }
+        Err(e) => {
+            tracing::warn!(%e, "cloudflared restart task failed");
+            respond::send(
+                stream,
+                500,
+                "Internal Server Error",
+                &[JSON],
+                br#"{"restarted":false,"error":"internal"}"#,
+                ka,
+            )
+            .await
+        }
+    }
+}
+
+async fn cloudflared_logs(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io::Result<()> {
+    let Some(hist) = cfg.cloudflared_log.as_ref() else {
+        return respond::not_found(stream, ka).await;
+    };
+    let body = hist.snapshot_text();
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/plain; charset=utf-8")],
+        body.as_bytes(),
+        ka,
+    )
+    .await
+}
+
+async fn cloudflared_logs_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+    let Some(hist) = cfg.cloudflared_log.as_ref() else {
+        return respond::not_found(stream, false).await;
+    };
+    let mut rx = hist.subscribe();
+    sse::write_headers(stream).await?;
+    let mut hb = tokio::time::interval(Duration::from_secs(15));
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            r = rx.recv() => match r {
+                Ok(chunk) => sse::event(stream, &chunk).await?,
+                Err(RecvError::Lagged(n)) => sse::comment(stream, &format!("lagged {n}")).await?,
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            _ = hb.tick() => sse::comment(stream, "ping").await?,
         }
     }
 }

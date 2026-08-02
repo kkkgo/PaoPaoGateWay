@@ -55,6 +55,10 @@ pub struct ServerConfig {
     pub clash_control: Option<Arc<dyn crate::clash_ctl::ClashControl>>,
 
     pub geo: Option<Arc<dyn crate::geo::GeoControl>>,
+
+    pub cloudflared: Option<Arc<dyn crate::cloudflared::CloudflaredSource>>,
+
+    pub cloudflared_log: Option<Arc<ScreenHistory>>,
 }
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);

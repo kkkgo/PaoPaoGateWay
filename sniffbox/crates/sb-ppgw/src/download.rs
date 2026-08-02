@@ -60,6 +60,16 @@ impl Downloader {
         self
     }
 
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn via_proxy(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
+        log_get(&format!("GET {} (via {proxy})", self.url));
+        self.attempt(proxy)
+    }
+
     pub fn download(&self) -> Result<SubInfo, HttpErr> {
         let ipv6 = crate::dnsutil::ipv6_enabled();
         let host = crate::dnsutil::url_hostname(&self.url);

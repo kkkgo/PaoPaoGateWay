@@ -139,7 +139,7 @@ fn emit_line(line: &[u8], log_tx: &LogTx) {
     let _ = log_tx.send(Arc::new(LogEvent::new(LogSource::Clash, level, msg)));
 }
 
-struct ChunkDecoder {
+pub(crate) struct ChunkDecoder {
     buf: Vec<u8>,
     remaining: usize,
     in_data: bool,
@@ -147,7 +147,7 @@ struct ChunkDecoder {
 }
 
 impl ChunkDecoder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: Vec::new(),
             remaining: 0,
@@ -156,7 +156,7 @@ impl ChunkDecoder {
         }
     }
 
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    pub(crate) fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         self.buf.extend_from_slice(input);
         loop {
             if self.done {

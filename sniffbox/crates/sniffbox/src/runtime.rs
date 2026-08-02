@@ -87,6 +87,8 @@ pub struct SharedState {
 
     pub fakeip: Option<Arc<FakeIpPool>>,
 
+    pub domain_ips: Arc<crate::domain_rules::IpHints>,
+
     proxy_acl: ArcSwap<CidrAcl>,
 
     splice_copy: AtomicBool,
@@ -116,6 +118,34 @@ pub struct SharedState {
     pub clash_conns_last_access: AtomicU64,
 
     pub traffic_last_access: AtomicU64,
+
+    pub cf_traffic: CfTraffic,
+}
+
+#[derive(Default)]
+pub struct CfTraffic {
+    up: AtomicU64,
+    down: AtomicU64,
+}
+
+impl CfTraffic {
+
+    pub fn add(&self, down: u64, up: u64) {
+        self.down.fetch_add(down, Ordering::Relaxed);
+        self.up.fetch_add(up, Ordering::Relaxed);
+    }
+
+    pub fn totals(&self) -> (u64, u64) {
+        (
+            self.down.load(Ordering::Relaxed),
+            self.up.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn clear(&self) {
+        self.down.store(0, Ordering::Relaxed);
+        self.up.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +172,7 @@ impl SharedState {
             peek_pool: Arc::new(PeekBufPool::with_defaults()),
             sniff_neg: Arc::new(SniffNegCache::default()),
             fakeip,
+            domain_ips: Arc::new(crate::domain_rules::IpHints::default()),
             proxy_acl: ArcSwap::from_pointee(cfg.acl.proxy_cidr.clone()),
             splice_copy: AtomicBool::new(cfg.inbound.splice_copy),
             splice_threshold: AtomicU64::new(cfg.inbound.splice_threshold),
@@ -157,6 +188,14 @@ impl SharedState {
             clash_conns_cache: ArcSwapOption::empty(),
             clash_conns_last_access: AtomicU64::new(0),
             traffic_last_access: AtomicU64::new(0),
+            cf_traffic: CfTraffic::default(),
+        }
+    }
+
+    pub fn account_delta(&self, rec: &ConnRecord, down: u64, up: u64) {
+        self.traffic.add_totals(down, up);
+        if rec.inbound == InboundKind::Cloudflared {
+            self.cf_traffic.add(down, up);
         }
     }
 
@@ -342,6 +381,97 @@ impl sb_web::NodesSource for WebNodes {
     }
 }
 
+pub struct WebCloudflared {
+    pub shared: Arc<SharedState>,
+    pub sup: Arc<crate::cf_ctl::CloudflaredSupervisor>,
+}
+
+impl WebCloudflared {
+
+    fn traffic_json(&self) -> serde_json::Value {
+        let (down, up) = self.shared.cf_traffic.totals();
+        let active = self
+            .shared
+            .conn_table
+            .snapshot()
+            .iter()
+            .filter(|r| {
+                r.inbound == InboundKind::Cloudflared && r.closed_ms.load(Ordering::Relaxed) == 0
+            })
+            .count();
+        serde_json::json!({
+            "downloadTotal": down,
+            "uploadTotal": up,
+            "total": down.saturating_add(up),
+            "connections": active,
+        })
+    }
+}
+
+impl sb_web::CloudflaredSource for WebCloudflared {
+    fn status_json(&self) -> String {
+        let st = self.sup.status();
+        let procs: Vec<serde_json::Value> = st
+            .procs
+            .iter()
+            .map(|p| {
+
+                let acc = self.sup.bytes(p.egress);
+                let metrics = p
+                    .running
+                    .then(|| {
+                        p.metrics
+                            .parse()
+                            .ok()
+                            .and_then(|addr| crate::cf_metrics::scrape(addr, acc))
+                    })
+                    .flatten();
+                let (up, down) = acc.totals();
+                serde_json::json!({
+                    "egress": p.egress.as_str(),
+                    "running": p.running,
+                    "wanted": p.wanted,
+                    "pid": p.pid,
+                    "uid": p.uid,
+                    "uptime": p.uptime,
+                    "note": p.note,
+                    "metricsAddr": p.metrics,
+
+                    "edges": p.edges,
+
+                    "bytes": { "up": up, "down": down, "total": up.saturating_add(down) },
+
+                    "traffic": (p.egress == crate::cf_ctl::Egress::Proxied)
+                        .then(|| self.traffic_json()),
+
+                    "metrics": metrics,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "enabled": st.enabled,
+
+            "proxyMode": st.proxy_mode.as_str(),
+            "binary": st.binary,
+            "version": st.version,
+            "replicas": procs,
+
+            "traffic": self.traffic_json(),
+        })
+        .to_string()
+    }
+
+    fn restart(&self, egress: Option<&str>) -> Result<usize, String> {
+        let which = match egress {
+            None | Some("") | Some("all") => None,
+            Some("proxy") => Some(crate::cf_ctl::Egress::Proxied),
+            Some("direct") => Some(crate::cf_ctl::Egress::Direct),
+            Some(other) => return Err(format!("unknown replica {other:?} (want proxy|direct)")),
+        };
+        self.sup.restart(which).map_err(|e| e.to_string())
+    }
+}
+
 pub struct InfoStatic {
     pub mode: OutboundMode,
     pub openport_enabled: bool,
@@ -383,6 +513,8 @@ struct InfoSample {
     proc_clash: Option<(u32, u64)>,
 
     proc_ovpn: Option<(u32, u64)>,
+
+    proc_cf: Vec<(u32, u64)>,
 }
 
 pub struct WebInfo {
@@ -584,6 +716,12 @@ impl WebInfo {
             .flatten();
         let now_ovpn = ovpn_pid.and_then(|p| sysinfo::process_cpu_jiffies(p).map(|j| (p, j)));
 
+        let cf_pids = sysinfo::find_pids_by_name(&["cloudflared"]);
+        let now_cf: Vec<(u32, u64)> = cf_pids
+            .iter()
+            .filter_map(|&p| sysinfo::process_cpu_jiffies(p).map(|j| (p, j)))
+            .collect();
+
         let mut cpu_pct = 0.0;
         let mut cpu_cores = Vec::new();
         let mut self_pct = 0.0;
@@ -593,6 +731,9 @@ impl WebInfo {
         let mut ovpn_pct = 0.0;
         let mut ovpn_rss = None;
         let mut ovpn_uptime = None;
+        let mut cf_pct = 0.0;
+        let mut cf_rss: Option<u64> = None;
+        let mut cf_uptime = None;
 
         {
             let mut s = self.sample.lock().unwrap();
@@ -630,11 +771,19 @@ impl WebInfo {
                 }
             }
 
+            for (cp, cur) in &now_cf {
+                if let Some((_, prev)) = s.proc_cf.iter().find(|(pp, _)| pp == cp) {
+                    cf_pct += sysinfo::process_cpu_pct(cur.saturating_sub(*prev), total_delta);
+                }
+            }
+            cf_pct = cf_pct.min(100.0);
+
             s.cpu = now_cpu;
             s.cpu_cores = now_cpu_cores;
             s.proc_self = now_self;
             s.proc_clash = now_clash;
             s.proc_ovpn = now_ovpn;
+            s.proc_cf = now_cf;
         }
 
         if let Some(pid) = clash_pid {
@@ -645,6 +794,15 @@ impl WebInfo {
         if let Some(pid) = ovpn_pid {
             ovpn_rss = Some(sysinfo::process_rss(pid));
             ovpn_uptime = sysinfo::process_uptime(pid);
+        }
+
+        if !cf_pids.is_empty() {
+            cf_rss = Some(cf_pids.iter().map(|&p| sysinfo::process_rss(p)).sum());
+
+            cf_uptime = cf_pids
+                .iter()
+                .filter_map(|&p| sysinfo::process_uptime(p))
+                .max();
         }
 
         let (_, mem_avail) = sysinfo::meminfo();
@@ -679,6 +837,8 @@ impl WebInfo {
                 "clash_uptime": clash_uptime,
                 "ovpn_rss": ovpn_rss,
                 "ovpn_uptime": ovpn_uptime,
+                "cloudflared_rss": cf_rss,
+                "cloudflared_uptime": cf_uptime,
             },
             "cpu": {
                 "usage": r1(cpu_pct),
@@ -690,6 +850,7 @@ impl WebInfo {
                 "sniffbox": r1(self_pct),
                 "clash": clash_pid.map(|_| r1(clash_pct)),
                 "ovpn": ovpn_pid.map(|_| r1(ovpn_pct)),
+                "cloudflared": (!cf_pids.is_empty()).then(|| r1(cf_pct)),
             },
             "traffic": {
                 "downloadTotal": down_total,
@@ -806,6 +967,7 @@ pub fn inbound_type_str(inbound: InboundKind) -> &'static str {
         InboundKind::Socks5 => "Socks5",
         InboundKind::Http => "HTTP",
         InboundKind::HealthCheck => "HealthCheck",
+        InboundKind::Cloudflared => "Cloudflared",
 
         InboundKind::Clash(label) => label,
     }
@@ -1020,6 +1182,130 @@ mod tests {
             dyn_totals(),
             (200_000_000, 2_000_000),
             "totals monotonically consistent before and after settlement"
+        );
+    }
+
+    #[test]
+    fn cf_traffic_counts_only_cloudflared_inbound_and_survives_eviction() {
+        use std::net::IpAddr;
+        let shared = Arc::new(SharedState::new(&cfg(false)));
+        let mk = |inbound: InboundKind, port: u16| {
+            Arc::new(
+                ConnRecord::new(
+                    shared.id_gen.next_id(),
+                    ("10.0.0.9".parse::<IpAddr>().unwrap(), port),
+                    ("1.1.1.1".parse::<IpAddr>().unwrap(), 443),
+                    sb_stats::SniffedProto::IpGroup("cloudflared"),
+                    None,
+                )
+                .with_inbound(inbound, sb_stats::Transport::Tcp),
+            )
+        };
+        let tunnel = mk(InboundKind::Cloudflared, 1111);
+        let user = mk(InboundKind::TProxy, 2222);
+
+        tunnel.download.store(700, Ordering::Relaxed);
+        tunnel.upload.store(300, Ordering::Relaxed);
+        user.download.store(50_000, Ordering::Relaxed);
+        for rec in [&tunnel, &user] {
+            let (u, d) = rec.drain_delta();
+            shared.account_delta(rec, d, u);
+        }
+        assert_eq!(
+            shared.cf_traffic.totals(),
+            (700, 300),
+            "user traffic leaked"
+        );
+
+        assert_eq!(shared.traffic.totals(), (50_700, 300));
+
+        drop(tunnel);
+        let again = mk(InboundKind::Cloudflared, 3333);
+        again.download.store(1, Ordering::Relaxed);
+        let (u, d) = again.drain_delta();
+        shared.account_delta(&again, d, u);
+        assert_eq!(shared.cf_traffic.totals(), (701, 300));
+
+        shared.cf_traffic.clear();
+        assert_eq!(shared.cf_traffic.totals(), (0, 0));
+    }
+
+    #[test]
+    fn web_cloudflared_status_json_shape_when_not_running() {
+        use sb_web::CloudflaredSource;
+        let shared = Arc::new(SharedState::new(&cfg(false)));
+        let sup = Arc::new(crate::cf_ctl::CloudflaredSupervisor::new(
+            crate::ConfigSource::Production,
+            OutboundMode::Free,
+            None,
+        ));
+        let src = WebCloudflared {
+            shared,
+            sup: Arc::clone(&sup),
+        };
+        let v: serde_json::Value = serde_json::from_str(&src.status_json()).expect("valid JSON");
+        for key in [
+            "enabled",
+            "proxyMode",
+            "binary",
+            "version",
+            "replicas",
+            "traffic",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}: {v}");
+        }
+        assert_eq!(v["traffic"]["total"], 0);
+        assert_eq!(v["traffic"]["connections"], 0);
+
+        let reps = v["replicas"].as_array().expect("replicas array");
+        assert_eq!(reps.len(), 2);
+        let names: Vec<&str> = reps.iter().map(|r| r["egress"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["direct", "proxy"],
+            "direct replica listed first"
+        );
+        for r in reps {
+            for key in [
+                "egress",
+                "running",
+                "wanted",
+                "pid",
+                "uid",
+                "uptime",
+                "note",
+                "metricsAddr",
+                "edges",
+                "metrics",
+                "bytes",
+            ] {
+                assert!(r.get(key).is_some(), "replica missing {key}: {r}");
+            }
+
+            assert_eq!(r["bytes"]["total"], 0);
+            assert_eq!(r["bytes"]["up"], 0);
+            assert_eq!(r["bytes"]["down"], 0);
+
+            assert_eq!(
+                r["metricsAddr"],
+                if r["egress"] == "proxy" {
+                    "127.0.0.1:20241"
+                } else {
+                    "127.0.0.1:20242"
+                }
+            );
+
+            if !r["running"].as_bool().unwrap() {
+                assert_eq!(r["metrics"], serde_json::Value::Null);
+            }
+        }
+
+        let proxy = reps.iter().find(|r| r["egress"] == "proxy").unwrap();
+        let direct = reps.iter().find(|r| r["egress"] == "direct").unwrap();
+        assert!(proxy["traffic"].is_object());
+        assert!(
+            direct["traffic"].is_null(),
+            "direct replica bytes are not visible to the gateway"
         );
     }
 

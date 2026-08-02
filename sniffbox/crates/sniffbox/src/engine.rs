@@ -23,6 +23,8 @@ pub struct Established {
     pub prelude: Vec<u8>,
 
     pub sniff: bool,
+
+    pub group: Option<&'static str>,
 }
 
 pub async fn handle_conn(
@@ -42,6 +44,25 @@ pub async fn handle_conn(
         domain: None,
         prelude: Vec::new(),
         sniff: true,
+        group: None,
+    };
+    serve_established(shared, client, peer, est).await
+}
+
+pub async fn handle_cf_conn(
+    client: TcpStream,
+    peer: SocketAddr,
+    shared: Arc<SharedState>,
+) -> std::io::Result<()> {
+    let orig = sb_tproxy::tcp::original_dst(&client)?;
+    let est = Established {
+        dest: orig,
+
+        inbound: InboundKind::Cloudflared,
+        domain: None,
+        prelude: Vec::new(),
+        sniff: false,
+        group: Some(crate::cf_ctl::CF_LABEL),
     };
     serve_established(shared, client, peer, est).await
 }
@@ -60,7 +81,10 @@ pub async fn serve_established(
 
     let port_skip = is_server_first_port(dest.port());
 
-    let ip_group = crate::ip_rules::match_group(dest.ip());
+    let ip_group = est
+        .group
+        .or_else(|| crate::ip_rules::match_group(dest.ip()))
+        .or_else(|| shared.domain_ips.get(dest.ip()));
     let (sniffed, peek) = if !est.sniff
         || port_skip
         || ip_group.is_some()
@@ -87,10 +111,21 @@ pub async fn serve_established(
 
     let known_domain = est.domain.is_some();
     let ResolvedDomains {
-        routing: domain,
+        routing: mut domain,
         stats: stats_domain,
         fakeip_unresolved,
+        in_fakeip,
     } = resolve_domains(est.domain.clone(), &sniffed, shared.fakeip.as_deref(), dest);
+
+    let group = ip_group.or_else(|| {
+        apply_domain_group(
+            &shared.domain_ips,
+            dest,
+            in_fakeip,
+            stats_domain.as_deref(),
+            &mut domain,
+        )
+    });
 
     if route.log_sniffed {
         tracing::info!(
@@ -105,7 +140,7 @@ pub async fn serve_established(
         );
     }
 
-    let should_block = ip_group.is_none()
+    let should_block = group.is_none()
         && (fakeip_unresolved
             || match sniffed.proto {
                 SniffedProto::Bittorrent => route.block_bittorrent,
@@ -141,7 +176,7 @@ pub async fn serve_established(
             conn_id,
             (peer.ip(), peer.port()),
             (dest.ip(), dest.port()),
-            if let Some(label) = ip_group {
+            if let Some(label) = group {
                 sb_stats::SniffedProto::IpGroup(label)
             } else if port_skip {
                 sb_stats::SniffedProto::Skipped
@@ -188,7 +223,7 @@ pub async fn serve_established(
 
     let (du, dd) = rec.drain_delta();
     if du != 0 || dd != 0 {
-        shared.traffic.add_totals(dd, du);
+        shared.account_delta(&rec, dd, du);
     }
 
     shared.conn_table.close(rec.id);
@@ -290,6 +325,8 @@ struct ResolvedDomains {
     stats: Option<String>,
 
     fakeip_unresolved: bool,
+
+    in_fakeip: bool,
 }
 
 fn resolve_domains(
@@ -325,7 +362,23 @@ fn resolve_domains(
         routing,
         stats,
         fakeip_unresolved,
+        in_fakeip,
     }
+}
+
+fn apply_domain_group(
+    hints: &crate::domain_rules::IpHints,
+    dest: SocketAddr,
+    in_fakeip: bool,
+    stats_domain: Option<&str>,
+    routing: &mut Option<String>,
+) -> Option<&'static str> {
+    let label = crate::domain_rules::match_group(stats_domain?)?;
+    if !in_fakeip {
+        hints.note(dest.ip(), label);
+        *routing = None;
+    }
+    Some(label)
 }
 
 fn unknown_label(inbound: InboundKind, has_domain: bool, port: u16) -> sb_stats::SniffedProto {
@@ -337,7 +390,8 @@ fn unknown_label(inbound: InboundKind, has_domain: bool, port: u16) -> sb_stats:
         },
         InboundKind::Socks5 => sb_stats::SniffedProto::Socks5,
         InboundKind::Http => sb_stats::SniffedProto::HttpProxy,
-        InboundKind::TProxy => {
+
+        InboundKind::TProxy | InboundKind::Cloudflared => {
             if has_domain {
                 sb_stats::SniffedProto::FakeIp
             } else {
@@ -575,6 +629,49 @@ mod tests {
         let r = resolve_domains(None, &s, Some(&pool), "7.1.2.3:443".parse().unwrap());
         assert_eq!(r.routing, None);
         assert!(r.fakeip_unresolved);
+    }
+
+    #[test]
+    fn domain_group_drops_override_and_notes_real_ip() {
+
+        let hints = crate::domain_rules::IpHints::default();
+        let dest: SocketAddr = "198.41.192.7:7844".parse().unwrap();
+        let mut routing = Some("region1.v2.argotunnel.com".to_string());
+        let label = apply_domain_group(
+            &hints,
+            dest,
+            false,
+            Some("region1.v2.argotunnel.com"),
+            &mut routing,
+        );
+        assert_eq!(label, Some("cloudflared"));
+        assert_eq!(routing, None, "no domain override for group traffic");
+        assert_eq!(hints.get(dest.ip()), Some("cloudflared"));
+    }
+
+    #[test]
+    fn domain_group_on_fakeip_keeps_override_and_notes_nothing() {
+
+        let hints = crate::domain_rules::IpHints::default();
+        let dest: SocketAddr = "7.1.2.3:443".parse().unwrap();
+        let mut routing = Some("argotunnel.com".to_string());
+        let label = apply_domain_group(&hints, dest, true, Some("argotunnel.com"), &mut routing);
+        assert_eq!(label, Some("cloudflared"));
+        assert_eq!(routing.as_deref(), Some("argotunnel.com"));
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn non_group_domain_untouched() {
+        let hints = crate::domain_rules::IpHints::default();
+        let dest: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let mut routing = Some("example.com".to_string());
+        assert_eq!(
+            apply_domain_group(&hints, dest, false, Some("example.com"), &mut routing),
+            None
+        );
+        assert_eq!(routing.as_deref(), Some("example.com"));
+        assert!(hints.is_empty());
     }
 
     #[test]

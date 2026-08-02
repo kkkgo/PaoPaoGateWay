@@ -324,10 +324,10 @@ mod tests {
             }
             Outcome::new(vec!["1.2.3.4".parse().unwrap()], vec!["ok=1ip".into()])
         });
-        assert_eq!(got.len(), 11, "只有黑洞域名该失败: {got:?}");
+        assert_eq!(got.len(), 11, "only blackhole domains should fail: {got:?}");
         assert!(
             start.elapsed() < Duration::from_secs(3),
-            "慢域名把整批钉住了: {:?}",
+            "slow domain pinned the whole batch: {:?}",
             start.elapsed()
         );
     }
@@ -345,12 +345,12 @@ mod tests {
         assert!(got.is_empty());
         assert!(
             calls.load(Ordering::Relaxed) <= 4,
-            "预算耗尽后仍在发查询: {} 次",
+            "queries still dispatched after budget exhausted: {} times",
             calls.load(Ordering::Relaxed)
         );
         assert!(
             start.elapsed() < Duration::from_secs(3),
-            "整批预算没兜住: {:?}",
+            "batch budget did not cap: {:?}",
             start.elapsed()
         );
     }

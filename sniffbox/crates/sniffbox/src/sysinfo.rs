@@ -799,6 +799,25 @@ pub fn find_pid_by_name(names: &[&str]) -> Option<u32> {
     None
 }
 
+pub fn find_pids_by_name(names: &[&str]) -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for ent in dir.flatten() {
+        let fname = ent.file_name();
+        let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if names.contains(&comm.trim()) {
+            out.push(pid);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 pub fn process_rss(pid: u32) -> u64 {
     rss_of_status(&std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default())
 }
@@ -941,7 +960,7 @@ mod tests {
         let root = fake_share("thermal");
         let (score, celsius, sensor) = scan_thermal_best(root.join("sysfs/thermal")).unwrap();
         assert_eq!(sensor, "cpu-thermal");
-        assert_eq!(score, 1000, "cpu-thermal 必须是确定的 CPU 传感器");
+        assert_eq!(score, 1000, "cpu-thermal must be the determined CPU sensor");
         assert!((celsius - 56.0).abs() < f64::EPSILON, "celsius={celsius}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -972,10 +991,13 @@ mod tests {
     #[test]
     fn no_host_share_on_bare_metal() {
         if std::path::Path::new("/sys/bus/virtio/devices").exists() {
-            eprintln!("跳过：本机是虚拟机");
+            eprintln!("skipping: this machine is a VM");
             return;
         }
-        assert!(hostinfo::root().is_none(), "物理机不应探测到宿主机共享");
+        assert!(
+            hostinfo::root().is_none(),
+            "bare metal should not detect host share"
+        );
     }
 
     #[test]

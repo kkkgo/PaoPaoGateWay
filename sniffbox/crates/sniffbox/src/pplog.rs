@@ -105,6 +105,7 @@ fn inbound_code(r: &ConnRecord) -> u8 {
         InboundKind::Http => 2,
         InboundKind::HealthCheck => 4,
         InboundKind::Clash(_) => 5,
+        InboundKind::Cloudflared => 6,
     }
 }
 

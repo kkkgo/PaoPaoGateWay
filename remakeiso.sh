@@ -219,6 +219,53 @@ if [ -f /data/ppsub.json ]; then
   patch ppsub.json ...
   cp /data/ppsub.json $root"/www/ppsub.json"
 fi
+
+cfneed=0
+if [ -f /data/cloudflared ]; then
+  cfneed=1
+elif [ "$CF" = "y" ] || [ "$CF" = "yes" ] || [ "$cf" = "y" ] || [ "$cf" = "yes" ]; then
+  cfneed=1
+fi
+if [ $cfneed -eq 1 ]; then
+  cfarch=amd64
+  cfelf="3e 00" # ELF e_machine EM_X86_64
+  if [ $arm64 -eq 1 ]; then
+    cfarch=arm64
+    cfelf="b7 00" # EM_AARCH64
+  fi
+  cfurl="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cfarch"
+  if [ -f /data/cloudflared ]; then
+    ls -lah /data/cloudflared
+    patch "cloudflared: use the local copy ./cloudflared"
+    cp /data/cloudflared /tmp/cloudflared
+  else
+    patch "cloudflared: downloading $cfurl ..."
+    if ! curl -fL --retry 3 --connect-timeout 20 -o /tmp/cloudflared "$cfurl"; then
+      rm -f /tmp/cloudflared
+      echo -e "\e[31m[ERROR]\e[0m cloudflared download failed: $cfurl"
+      echo -e "\e[31m[ERROR]\e[0m Download it yourself, put it next to ppgw.ini named 'cloudflared', and rerun. No ISO generated."
+      exit 1
+    fi
+  fi
+  chmod +x /tmp/cloudflared
+  if ! od -An -tx1 -j0 -N4 /tmp/cloudflared | grep -q "7f 45 4c 46" ||
+    ! od -An -tx1 -j18 -N2 /tmp/cloudflared | grep -q "$cfelf" ||
+    [ "$(stat -c %s /tmp/cloudflared)" -lt 1000000 ]; then
+    echo -e "\e[31m[ERROR]\e[0m cloudflared is not a valid linux-$cfarch ELF. No ISO generated."
+    exit 1
+  fi
+  if [ $arm64 -eq 0 ]; then
+    if ! /tmp/cloudflared --version; then
+      echo -e "\e[31m[ERROR]\e[0m cloudflared --version failed. No ISO generated."
+      exit 1
+    fi
+  fi
+  cp /tmp/cloudflared $root"/usr/bin/cloudflared"
+  chmod +x $root"/usr/bin/cloudflared"
+  rm -f /tmp/cloudflared
+  patch "cloudflared integrated (linux-$cfarch). Set cloudflared_token= in ppgw.ini to run it."
+fi
+
 if [ $patchclash -eq 1 ]; then
   if [ "$GEO" = "yes" ] || [ "$geo" = "yes" ]; then
     patch Add geo data ...

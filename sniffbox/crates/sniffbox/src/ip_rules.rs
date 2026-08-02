@@ -21,7 +21,17 @@ const TELEGRAM_CIDRS: &[&str] = &[
     "2a0a:f280::/32",
 ];
 
-const GROUPS: &[Group] = &[("telegram", TELEGRAM_CIDRS)];
+const CLOUDFLARED_EDGE_CIDRS: &[&str] = &[
+    "198.41.192.0/24",
+    "198.41.200.0/24",
+    "2606:4700:a0::/48",
+    "2606:4700:a8::/48",
+];
+
+const GROUPS: &[Group] = &[
+    ("telegram", TELEGRAM_CIDRS),
+    (crate::cf_ctl::CF_LABEL, CLOUDFLARED_EDGE_CIDRS),
+];
 
 static NETS: LazyLock<Vec<(&'static str, Vec<IpNet>)>> = LazyLock::new(|| {
     GROUPS
@@ -76,6 +86,30 @@ mod tests {
             match_group("2a0a:f280:1::1234".parse().unwrap()),
             Some("telegram")
         );
+    }
+
+    #[test]
+    fn matches_cloudflared_edge_ranges() {
+        for ip in crate::cf_edge::BUILTIN_V4 {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                match_group(ip),
+                Some("cloudflared"),
+                "builtin edge {ip} must fall inside the cloudflared group"
+            );
+        }
+
+        assert_eq!(
+            match_group("2606:4700:a0::1".parse().unwrap()),
+            Some("cloudflared")
+        );
+        assert_eq!(
+            match_group("2606:4700:a8::10".parse().unwrap()),
+            Some("cloudflared")
+        );
+
+        assert_eq!(match_group("104.16.0.1".parse().unwrap()), None);
+        assert_eq!(match_group("198.41.128.1".parse().unwrap()), None);
     }
 
     #[test]

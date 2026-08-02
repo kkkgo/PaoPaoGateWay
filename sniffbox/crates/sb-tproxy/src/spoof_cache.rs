@@ -90,6 +90,8 @@ impl SpoofCache {
                     g.nx.retain(|_, t| now.duration_since(*t) < NX_TTL);
                 }
                 g.nx.insert(spoof_src, now);
+
+                tracing::warn!(%spoof_src, ?e, "udp spoof bind failed; replies from this source will be dropped");
                 Err(e)
             }
         }

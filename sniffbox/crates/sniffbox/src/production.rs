@@ -1,8 +1,8 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use crate::config::{
-    AclCfg, CidrAcl, Config, DnsCfg, DnsResolverCfg, InboundCfg, InboundProxyCfg, LogCfg,
-    OutboundCfg, OutboundMode, ReportCfg, RouteCfg, SocksCfg, StatsCfg, WebCfg,
+    AclCfg, CidrAcl, CloudflaredCfg, Config, DnsCfg, DnsResolverCfg, InboundCfg, InboundProxyCfg,
+    LogCfg, OutboundCfg, OutboundMode, ReportCfg, RouteCfg, SocksCfg, StatsCfg, WebCfg,
 };
 use ipnet::Ipv4Net;
 use std::collections::HashMap;
@@ -113,6 +113,17 @@ fn build(p: &PpgwIni) -> Config {
         pplog_uuid: p.str("pplog_uuid").and_then(crate::config::parse_uuid),
     };
 
+    let cloudflared = CloudflaredCfg {
+        token: p.str("cloudflared_token").map(String::from),
+
+        proxy: p
+            .str("cf_proxy")
+            .and_then(crate::config::CfProxyMode::parse)
+            .unwrap_or_default(),
+        tproxy: Some("127.0.0.1:1082".parse().unwrap()),
+        tproxy6: ipv6_enabled().then(|| "[::1]:1082".parse().unwrap()),
+    };
+
     Config {
         log,
         inbound,
@@ -125,6 +136,7 @@ fn build(p: &PpgwIni) -> Config {
         inbound_proxy,
         outbound,
         report,
+        cloudflared,
     }
 }
 
@@ -294,6 +306,30 @@ mod tests {
         PpgwIni {
             kv: parse_ppgw(text),
         }
+    }
+
+    #[test]
+    fn cf_proxy_maps_from_ppgw_ini() {
+        use crate::config::CfProxyMode;
+        assert_eq!(
+            build(&PpgwIni::default()).cloudflared.proxy,
+            CfProxyMode::Yes
+        );
+        let cases = [
+            ("cf_proxy=\"no\"\n", CfProxyMode::No),
+            ("cf_proxy=\"yes\"\n", CfProxyMode::Yes),
+            ("cf_proxy=\"both\"\n", CfProxyMode::Both),
+
+            ("cf_proxy=\"sometimes\"\n", CfProxyMode::Yes),
+            ("cf_proxy=\"\"\n", CfProxyMode::Yes),
+        ];
+        for (text, want) in cases {
+            assert_eq!(build(&ppgw(text)).cloudflared.proxy, want, "for {text:?}");
+        }
+
+        let cfg = build(&ppgw("cf_proxy=\"no\"\ncloudflared_token=\"eyJhIjoi\"\n"));
+        assert_eq!(cfg.cloudflared.proxy, CfProxyMode::No);
+        assert_eq!(cfg.cloudflared.token.as_deref(), Some("eyJhIjoi"));
     }
 
     #[test]

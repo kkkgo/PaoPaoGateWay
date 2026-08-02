@@ -60,6 +60,28 @@ apply_defaults() {
     set_default ex_dns "223.5.5.5:53,1.0.0.1:53"
     set_default subtime "1d"
     set_default tomorrow "tomorrow"
+    set_default cf_proxy "yes"
+    case "$cf_proxy" in
+    yes | no | both) ;;
+    *) cf_proxy="yes" ;;
+    esac
+}
+
+log_cf_proxy() {
+    raw_cf_proxy=$(grep -E "^[ ]*cf_proxy[ ]*=" /tmp/ppgw.ini 2>/dev/null | tail -1 |
+        sed -e 's/^[ ]*cf_proxy[ ]*=[ ]*//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    if [ -n "$raw_cf_proxy" ] && [ "$raw_cf_proxy" != "$cf_proxy" ]; then
+        log "Unknown cf_proxy=[""$raw_cf_proxy""], treat as yes (proxied replica only)." warn
+    fi
+    if [ "$cf_proxy" = "no" ]; then
+        log "[CLOUDFLARED] : token set, cf_proxy=no (direct replica only, uid 7845)" succ
+    elif [ "$mode" = "free" ]; then
+        log "[CLOUDFLARED] : token set, cf_proxy=""$cf_proxy"" ignored in free mode (direct replica only, uid 7845)" warn
+    elif [ "$cf_proxy" = "both" ]; then
+        log "[CLOUDFLARED] : token set, cf_proxy=both (replicas: direct uid 7845 + proxied uid 7844)" succ
+    else
+        log "[CLOUDFLARED] : token set, cf_proxy=yes (proxied replica only, uid 7844)" succ
+    fi
 }
 
 require_ini() {
@@ -394,7 +416,7 @@ load_ovpn() {
 gen_hash() {
     if [ -f /tmp/ppgw.ini ]; then
         . /tmp/ppgw.ini 2>"$PPGWTTY"
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday""$pplog""$pplog_uuid""$admin_cidr""$proxy_cidr"
+        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday""$pplog""$pplog_uuid""$admin_cidr""$proxy_cidr""$cloudflared_token""$cf_proxy"
         echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
@@ -534,6 +556,8 @@ get_conf() {
             rm "/tmp/ppgw.ini.tmp"
             log "[Succ] Get ""$down_url" succ
             return 0
+        elif [ -s "$file_down_tmp" ]; then
+            log "[Fail] Missing #paopao-gateway in ""$down_url" warn
         fi
     fi
     if [ "$down_type" = "yaml" ]; then
@@ -706,6 +730,9 @@ reload_gw() {
     if [ -n "$mode" ]; then
         log "[MODE] : ""$mode" succ
     fi
+    if [ -n "$cloudflared_token" ]; then
+        log_cf_proxy
+    fi
 
     # route table
     if ip route list table 100 2>&1 | grep -q local; then
@@ -843,6 +870,7 @@ if [ "$1" = "reload" ]; then
     old_proxy_cidr=$proxy_cidr
     old_max_rec=$max_rec
     old_net_cleanday=$net_cleanday
+    old_cf_proxy=$cf_proxy
 
     if [ -f /tmp/sniffbox_running.ini ]; then
         . /tmp/sniffbox_running.ini 2>"$PPGWTTY"
@@ -909,6 +937,11 @@ if [ "$1" = "reload" ]; then
             log "socks5 upstream/auth changed, cold reload box." warn
         fi
     fi
+    if [ "$old_cf_proxy" != "$cf_proxy" ]; then
+        log "cf_proxy changed [""$old_cf_proxy""] -> [""$cf_proxy""], sniffbox will add/remove replicas." warn
+    elif [ -n "$cloudflared_token" ]; then
+        log_cf_proxy
+    fi
 
     if [ "$need_cold_reload" = "1" ]; then
         cold_reload_box
@@ -928,6 +961,7 @@ if [ "$1" = "reload" ]; then
     fi
     export PPGW_FORCE_CLOSEALL=1
     reload_gw force
+    date +%s >/tmp/ppgw_reload.ts 2>/dev/null
     log "Force reload gateway finsished." warn
     exit
 fi
@@ -963,6 +997,8 @@ while true; do
         old_socks5_username=$socks5_username
         old_socks5_password=$socks5_password
         old_mode=$mode
+        old_cloudflared_token=$cloudflared_token
+        old_cf_proxy=$cf_proxy
         if [ -f /tmp/sniffbox_running.ini ]; then
             . /tmp/sniffbox_running.ini 2>"$PPGWTTY"
             apply_defaults
@@ -1056,6 +1092,13 @@ while true; do
             nft_changed=0
             if [ "$old_dns_ip" != "$dns_ip" ] || [ "$old_dns_port" != "$dns_port" ] || [ "$old_udp_enable" != "$udp_enable" ] || [ "$old_openport" != "$openport" ] || [ "$old_box" != "$box" ]; then
                 nft_changed=1
+            fi
+            if [ "$old_cloudflared_token" != "$cloudflared_token" ]; then
+                nft_changed=1
+                log "cloudflared_token changed, reload nft rule." warn
+            fi
+            if [ "$old_cf_proxy" != "$cf_proxy" ]; then
+                log "cf_proxy changed [""$old_cf_proxy""] -> [""$cf_proxy""], sniffbox will add/remove replicas." warn
             fi
             if [ "$nft_changed" = "1" ]; then
                 reload_gw force

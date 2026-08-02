@@ -20,6 +20,7 @@ pub mod resolvepool;
 pub mod ruleset;
 pub mod subtime;
 pub mod term;
+pub mod udp_probe;
 pub mod yamltx;
 
 use goflag::PpgwFlags;

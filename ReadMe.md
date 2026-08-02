@@ -116,6 +116,11 @@ net_rec=no
 max_rec=5000
 #net_cleanday=15
 
+# Cloudflare Tunnel (cloudflared), run as two replicas (direct + via the gateway proxy)
+#cloudflared_token="eyJhIjoixxxxxxxx"
+# cloudflared replicas: yes=proxied only (default) / no=direct only / both=run both
+#cf_proxy=yes
+
 # box adv tune
 #box=
 ```
@@ -159,7 +164,12 @@ max_rec=5000
     - 3、理论上会略微增加资源占用，取决于你的并发连接数量以及`max_rec`，可适当增加运行资源。
 `net_cleanday=1-31`选项，指定每个月某一天清空网络流量数据记录，比如`net_cleanday=15`每月15日清空网络流量数据记录。如果指定值大于当月有效天数，比如2月份指定31，将会取该月最大值执行，该值为空的时候只有达到了max_rec限制才会清理。    
 - 16 `box`: 高级转发核心项目调整，以逗号分隔，一般不需要调整。可调整项目示例`route.block_bittorrent=true,route.block_quic=true,route.block_unknown=false`。 block_bittorrent：禁止bt下载（默认true）；block_quic：禁止quic流量(默认true)，block_unknown：禁止非http/tls的未识别流量（默认false）。   
-
+- 17 `cloudflared_token`选项：在网关内直接跑 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)（cloudflared）。把你的隧道 token（`eyJhIjoi...`那一长串）填进来即可，留空或不写则完全不启用。
+    - **单副本 / 双副本**：默认（`cf_proxy=yes`）只起**一个**经网关代理出网的 Replica（Connector）。填`cf_proxy=both`则用同一个 token 起两个 —— 一个**直连**出网、一个**经代理**出网，这正是 Cloudflare 官方的 Replica 用法：边缘会在两者间分流，任何一个断了（代理挂了、或者直连被墙了）都会秒级切到另一个，隧道不中断，面板上能看到两个 Replica（Connector） ID。详见下面的`cf_proxy`。
+- 18 `cf_proxy`选项：控制跑哪几只副本，取值`yes`/`no`/`both`，留空或不写等于`yes`。
+    - `yes`（默认）：**只跑经代理副本**。隧道出口恒等于当前代理出口。
+    - `no`：**只跑直连副本**。适合你根本不想让隧道流量占用代理带宽、或者直连本来就足够稳的场景。
+    - `both`：**跑双副本**，互为 Replica。这是可用性高的配置：代理挂了直连顶上，直连被墙了代理顶上；代价是cloudflare并没有确定的算法一定分配到哪个副本，一般优先转发到 **用户到Cloudflare节点地理上最近** 的而不是延迟最低的，比如大多数境内访问默认直连是LAX，即使你代理是HKG，特别是电信用户，大概率可能走绕地球两圈的LAX。`mode=free`下`yes`/`both`都无效。
 ## PPSUB 组合订阅使用指南
 
 #### 基本使用流程
@@ -290,6 +300,18 @@ ppgwurl="http://...."
 *内置核心*：如果当前目录没有放入自定义核心，将默认使用镜像内置的mihomo内核（compatible版本，不一定是最新版本）。如果你的CPU和虚拟机平台支持v3（比如PVE需要把CPU类别设置为host），可以使用`-e MI=3`使用内置的mihomo v3版本。
 #### Geo数据文件
 如果规则不含或者不需要Geo数据，可以设置`-e GEO=no`以减小镜像体积。默认为yes。      
+
+#### 内嵌`cloudflared`
+把 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) 的 cloudflared 二进制打进镜像，配合`ppgw.ini`的`cloudflared_token`即可让隧道直接跑在网关内并走代理出站（详见上文 ppgw.ini 第17项）。两种方式：
+- 自动下载：加上`-e CF=y`，定制脚本会按镜像架构自动下载对应的 release 并集成。
+- 手动放置：把下载好的二进制重命名为`cloudflared`放到当前目录即可自动集成（优先于自动下载）。
+
+```shell
+docker run --rm -e CF=y -v .:/data sliamb/ppgwiso
+```
+下载失败或校验不通过会直接报错并不生成 ISO。
+
+即使没有内嵌，只要`ppgw.ini`配了`cloudflared_token`，网关仍会在代理就绪后自行下载 cloudflared，内嵌只是省掉这段等待。
 
 #### 最后一步：一键生成ISO
 你只需要在放好文件的当前目录执行以下命令即可一键生成镜像。  

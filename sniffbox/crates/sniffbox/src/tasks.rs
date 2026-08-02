@@ -48,6 +48,7 @@ fn flush_once(shared: &SharedState, clean_state: &mut CleanState) {
         shared.traffic.clear();
         shared.agg.clear();
         shared.node_dist.clear();
+        shared.cf_traffic.clear();
     });
 
     shared.sniff_neg.gc();
@@ -73,7 +74,7 @@ fn drain_local(shared: &SharedState) {
 
             shared.conn_table.touch(rec.id);
 
-            shared.traffic.add_totals(dd, du);
+            shared.account_delta(&rec, dd, du);
 
             if let Some(p) = &shared.pplog
                 && rec.closed_ms.load(Ordering::Relaxed) == 0

@@ -137,6 +137,8 @@ pub struct UdpEngine {
     pub pkts_fwd_fc: AtomicU64,
     pub pkts_reply_sym: AtomicU64,
     pub pkts_reply_fc: AtomicU64,
+
+    cloudflared: bool,
 }
 
 struct FlowEntry {
@@ -156,14 +158,24 @@ impl UdpEngine {
     pub fn is_empty(&self) -> bool {
         self.symmetric.is_empty() && self.fullcone.is_empty()
     }
+
+    fn inbound_kind(&self) -> InboundKind {
+        if self.cloudflared {
+            InboundKind::Cloudflared
+        } else {
+            InboundKind::TProxy
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_udp_engine(
     shared: Arc<SharedState>,
     listen_addr: SocketAddr,
     idle_timeout: Duration,
     workers: usize,
     spoof_cache_cap: usize,
+    cloudflared: bool,
     shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<Arc<UdpEngine>> {
 
@@ -205,6 +217,7 @@ pub fn start_udp_engine(
         pkts_fwd_fc: AtomicU64::new(0),
         pkts_reply_sym: AtomicU64::new(0),
         pkts_reply_fc: AtomicU64::new(0),
+        cloudflared,
     });
 
     {
@@ -318,12 +331,12 @@ async fn dispatch_packet(
     tx_buf: &mut Vec<u8>,
 ) -> io::Result<()> {
 
-    if !shared.proxy_allowed(peer.ip()) {
+    if !engine.cloudflared && !shared.proxy_allowed(peer.ip()) {
         tracing::debug!(%peer, %orig_dst, "udp peer not in proxy_cidr; drop");
         return Ok(());
     }
 
-    if shared.route.load().block_quic && quic::is_quic_initial(payload) {
+    if !engine.cloudflared && shared.route.load().block_quic && quic::is_quic_initial(payload) {
         tracing::debug!(%peer, %orig_dst, "quic blocked by route.block_quic");
         return Ok(());
     }
@@ -436,18 +449,17 @@ fn spawn_open_symmetric(
 ) {
 
     let (is_fakeip, fakeip_host) = resolve_fakeip(shared, orig_dst);
-
-    let proto = if let Some(label) = crate::ip_rules::match_group(orig_dst.ip()) {
-        StatProto::IpGroup(label)
-    } else if is_udp_skip_port(orig_dst.port()) {
-        StatProto::Skipped
-    } else if quic::is_quic_initial(first_payload) {
-        StatProto::Quic
-    } else if fakeip_host.is_some() {
+    let fallback = if fakeip_host.is_some() {
         StatProto::FakeIp
     } else {
         StatProto::RealIp
     };
+    let proto = classify_udp_proto(
+        orig_dst,
+        first_payload,
+        fallback,
+        group_hint(engine, shared, orig_dst),
+    );
     let engine = Arc::clone(engine);
     let shared = Arc::clone(shared);
     tokio::spawn(async move {
@@ -584,7 +596,12 @@ async fn forward_symmetric(
                     );
                 }
 
-                if session.is_fakeip || !ech {
+                let group = crate::domain_rules::match_group(&h).filter(|_| !session.is_fakeip);
+                if let Some(label) = group {
+                    shared.domain_ips.note(orig_dst.ip(), label);
+                }
+
+                if group.is_none() && (session.is_fakeip || !ech) {
                     session.routing_host.store(Some(Arc::new(h)));
                 }
                 *sniffer_guard = None;
@@ -619,8 +636,52 @@ fn is_udp_skip_port(port: u16) -> bool {
     matches!(port, 53 | 67 | 68 | 123 | 161 | 162 | 514 | 1812 | 1813)
 }
 
+fn group_hint(
+    engine: &Arc<UdpEngine>,
+    shared: &Arc<SharedState>,
+    dst: SocketAddr,
+) -> Option<&'static str> {
+    if engine.cloudflared {
+        return Some(crate::cf_ctl::CF_LABEL);
+    }
+    shared.domain_ips.get(dst.ip())
+}
+
+fn classify_udp_proto(
+    dst: SocketAddr,
+    first_payload: &[u8],
+    fallback: StatProto,
+    group_hint: Option<&'static str>,
+) -> StatProto {
+    if let Some(label) = crate::ip_rules::match_group(dst.ip()).or(group_hint) {
+        StatProto::IpGroup(label)
+    } else if is_udp_skip_port(dst.port()) {
+        StatProto::Skipped
+    } else if quic::is_quic_initial(first_payload) {
+        StatProto::Quic
+    } else {
+        fallback
+    }
+}
+
+pub(crate) fn classify_inbound_udp_proto(
+    dst: SocketAddr,
+    first_payload: &[u8],
+    client_declared_host: bool,
+    fakeip_host: bool,
+    group_hint: Option<&'static str>,
+) -> StatProto {
+    let fallback = match (client_declared_host, fakeip_host) {
+        (true, _) => StatProto::Socks5,
+        (false, true) => StatProto::FakeIp,
+        (false, false) => StatProto::RealIp,
+    };
+    classify_udp_proto(dst, first_payload, fallback, group_hint)
+}
+
 fn register_udp_record(
     shared: &Arc<SharedState>,
+    inbound: InboundKind,
     peer: SocketAddr,
     dst: SocketAddr,
     proto: StatProto,
@@ -634,7 +695,7 @@ fn register_udp_record(
             proto,
             domain,
         )
-        .with_inbound(InboundKind::TProxy, Transport::Udp),
+        .with_inbound(inbound, Transport::Udp),
     );
     shared.conn_table.insert(Arc::clone(&rec));
     rec
@@ -693,7 +754,7 @@ async fn handle_fullcone(
             Entry::Vacant(v) => {
                 let pending = Arc::new(Pending::new((orig_dst, payload.to_vec()), engine.now_ms()));
                 v.insert(FcSlot::Pending(Arc::clone(&pending)));
-                spawn_open_fullcone(engine, shared, peer, orig_dst, pending);
+                spawn_open_fullcone(engine, shared, peer, orig_dst, payload, pending);
                 Ok(())
             }
         },
@@ -705,8 +766,16 @@ fn spawn_open_fullcone(
     shared: &Arc<SharedState>,
     peer: SocketAddr,
     orig_dst_hint: SocketAddr,
+    first_payload: &[u8],
     pending: Arc<Pending<(SocketAddr, Vec<u8>)>>,
 ) {
+
+    let proto = classify_udp_proto(
+        orig_dst_hint,
+        first_payload,
+        StatProto::RealIp,
+        group_hint(engine, shared, orig_dst_hint),
+    );
     let engine = Arc::clone(engine);
     let shared = Arc::clone(shared);
     tokio::spawn(async move {
@@ -721,6 +790,7 @@ fn spawn_open_fullcone(
                     peer,
                     orig_dst_hint,
                     engine.now_ms(),
+                    proto,
                 )
                 .await
             }
@@ -737,6 +807,7 @@ fn spawn_open_fullcone(
                     peer,
                     orig_dst_hint,
                     engine.now_ms(),
+                    proto,
                 )
                 .await
             }
@@ -768,7 +839,9 @@ fn spawn_open_fullcone(
                 }
                 let pkts = pending.take();
 
-                if let Some((_, first)) = pkts.first() {
+                if matches!(s.rec.proto, StatProto::RealIp)
+                    && let Some((_, first)) = pkts.first()
+                {
                     s.rec.set_head(first);
                 }
                 let mut tx_buf: Vec<u8> = Vec::with_capacity(2048);
@@ -860,7 +933,14 @@ async fn open_symmetric_session(
     let (mut ctrl, relay_udp) = open_socks5_udp(socks_target, auth, orig_dst.is_ipv4()).await?;
 
     let spoof_udp = engine.spoof_cache.get_or_bind(orig_dst)?;
-    let rec = register_udp_record(shared, peer, orig_dst, proto, fakeip_host.clone());
+    let rec = register_udp_record(
+        shared,
+        engine.inbound_kind(),
+        peer,
+        orig_dst,
+        proto,
+        fakeip_host.clone(),
+    );
     let reader_relay = Arc::clone(&relay_udp);
     let engine_ref = Arc::clone(engine);
     let reader_rec = Arc::clone(&rec);
@@ -947,6 +1027,7 @@ async fn open_symmetric_session(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_fullcone_session(
     engine: &Arc<UdpEngine>,
     shared: &Arc<SharedState>,
@@ -955,11 +1036,19 @@ async fn open_fullcone_session(
     peer: SocketAddr,
     orig_dst_hint: SocketAddr,
     now_ms: u64,
+    proto: StatProto,
 ) -> io::Result<Arc<FullconeSession>> {
     let (mut ctrl, relay_udp) =
         open_socks5_udp(socks_target, auth, orig_dst_hint.is_ipv4()).await?;
 
-    let rec = register_udp_record(shared, peer, orig_dst_hint, StatProto::RealIp, None);
+    let rec = register_udp_record(
+        shared,
+        engine.inbound_kind(),
+        peer,
+        orig_dst_hint,
+        proto,
+        None,
+    );
     let reader_relay = Arc::clone(&relay_udp);
     let spoof_cache = Arc::clone(&engine.spoof_cache);
     let engine_ref = Arc::clone(engine);
@@ -1049,7 +1138,14 @@ async fn open_direct_symmetric_session(
         Arc::new(bind_direct_udp(real_dst.is_ipv4(), bind_device, so_mark, Some(real_dst)).await?);
 
     let spoof_udp = engine.spoof_cache.get_or_bind(orig_dst)?;
-    let rec = register_udp_record(shared, peer, orig_dst, proto, fakeip_host.clone());
+    let rec = register_udp_record(
+        shared,
+        engine.inbound_kind(),
+        peer,
+        orig_dst,
+        proto,
+        fakeip_host.clone(),
+    );
     let reader_relay = Arc::clone(&relay);
     let engine_ref = Arc::clone(engine);
     let reader_rec = Arc::clone(&rec);
@@ -1095,6 +1191,7 @@ async fn open_direct_symmetric_session(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_direct_fullcone_session(
     engine: &Arc<UdpEngine>,
     shared: &Arc<SharedState>,
@@ -1103,10 +1200,18 @@ async fn open_direct_fullcone_session(
     peer: SocketAddr,
     orig_dst_hint: SocketAddr,
     now_ms: u64,
+    proto: StatProto,
 ) -> io::Result<Arc<FullconeSession>> {
     let relay =
         Arc::new(bind_direct_udp(orig_dst_hint.is_ipv4(), bind_device, so_mark, None).await?);
-    let rec = register_udp_record(shared, peer, orig_dst_hint, StatProto::RealIp, None);
+    let rec = register_udp_record(
+        shared,
+        engine.inbound_kind(),
+        peer,
+        orig_dst_hint,
+        proto,
+        None,
+    );
     let reader_relay = Arc::clone(&relay);
     let spoof_cache = Arc::clone(&engine.spoof_cache);
     let engine_ref = Arc::clone(engine);
@@ -1289,6 +1394,65 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
 mod tests {
     use super::*;
     use crate::config::{RouteCfg, SocksCfg};
+
+    const DNS_QUERY: &[u8] =
+        b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+
+    #[test]
+    fn classify_udp_proto_prefers_port_and_ip_group_over_fallback() {
+        let dns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let ntp: SocketAddr = "1.1.1.1:123".parse().unwrap();
+        let other: SocketAddr = "1.1.1.1:3478".parse().unwrap();
+
+        let tg: SocketAddr = "149.154.167.51:443".parse().unwrap();
+
+        assert_eq!(
+            classify_udp_proto(dns, DNS_QUERY, StatProto::RealIp, None),
+            StatProto::Skipped
+        );
+        assert_eq!(
+            classify_udp_proto(ntp, DNS_QUERY, StatProto::FakeIp, None),
+            StatProto::Skipped
+        );
+        assert_eq!(
+            classify_udp_proto(tg, DNS_QUERY, StatProto::RealIp, None),
+            StatProto::IpGroup("telegram")
+        );
+
+        assert_eq!(
+            classify_udp_proto(other, DNS_QUERY, StatProto::RealIp, None),
+            StatProto::RealIp
+        );
+        assert_eq!(
+            classify_udp_proto(other, DNS_QUERY, StatProto::FakeIp, None),
+            StatProto::FakeIp
+        );
+    }
+
+    #[test]
+    fn classify_inbound_udp_proto_fallbacks_by_domain_source() {
+        let host_form: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let host_form_dns: SocketAddr = "0.0.0.0:53".parse().unwrap();
+        let ip_form: SocketAddr = "9.9.9.9:443".parse().unwrap();
+
+        assert_eq!(
+            classify_inbound_udp_proto(host_form, DNS_QUERY, true, false, None),
+            StatProto::Socks5
+        );
+        assert_eq!(
+            classify_inbound_udp_proto(ip_form, DNS_QUERY, false, true, None),
+            StatProto::FakeIp
+        );
+        assert_eq!(
+            classify_inbound_udp_proto(ip_form, DNS_QUERY, false, false, None),
+            StatProto::RealIp
+        );
+
+        assert_eq!(
+            classify_inbound_udp_proto(host_form_dns, DNS_QUERY, true, false, None),
+            StatProto::Skipped
+        );
+    }
 
     #[test]
     fn decide_flow_kind_unknown_payload_is_fullcone() {
@@ -1640,6 +1804,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloudflared_inbound_ignores_block_quic() {
+        let engine = make_test_engine_kind(true);
+        let shared = make_test_shared(None);
+        shared.route.store(&RouteCfg {
+            block_quic: true,
+            ..RouteCfg::default()
+        });
+        let peer: SocketAddr = "10.0.0.4:4444".parse().unwrap();
+        let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let mut tx = Vec::new();
+        let _ = dispatch_packet(&engine, &shared, peer, dst, &quic_initial_pkt(), &mut tx).await;
+        assert!(
+            !engine.flow_path.is_empty(),
+            "cloudflared QUIC must reach diversion despite block_quic"
+        );
+    }
+
+    #[test]
+    fn cloudflared_inbound_group_hint_disables_sniff() {
+        let engine = make_test_engine_kind(true);
+        let shared = make_test_shared(None);
+        let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        assert_eq!(group_hint(&engine, &shared, dst), Some("cloudflared"));
+        let proto = classify_udp_proto(
+            dst,
+            &quic_initial_pkt(),
+            StatProto::RealIp,
+            group_hint(&engine, &shared, dst),
+        );
+        assert_eq!(proto, StatProto::IpGroup("cloudflared"));
+        assert!(matches!(proto, StatProto::IpGroup(_)), "sniff must be off");
+
+        let plain = make_test_engine();
+        assert_eq!(group_hint(&plain, &shared, dst), None);
+    }
+
+    #[test]
+    fn classify_udp_proto_uses_domain_group_hint() {
+        let dst: SocketAddr = "198.41.192.7:7844".parse().unwrap();
+        assert_eq!(
+            classify_udp_proto(dst, DNS_QUERY, StatProto::RealIp, Some("cloudflared")),
+            StatProto::IpGroup("cloudflared")
+        );
+
+        let dns_port: SocketAddr = "198.41.192.7:53".parse().unwrap();
+        assert_eq!(
+            classify_udp_proto(dns_port, DNS_QUERY, StatProto::RealIp, Some("cloudflared")),
+            StatProto::IpGroup("cloudflared")
+        );
+    }
+
+    #[tokio::test]
     async fn block_quic_passes_non_quic_udp_to_classify() {
         let engine = make_test_engine();
         let shared = make_test_shared_with(None, closed_port_addr());
@@ -1716,7 +1932,12 @@ mod tests {
     }
 
     fn make_test_engine() -> Arc<UdpEngine> {
+        make_test_engine_kind(false)
+    }
+
+    fn make_test_engine_kind(cloudflared: bool) -> Arc<UdpEngine> {
         Arc::new(UdpEngine {
+            cloudflared,
             symmetric: Arc::new(DashMap::new()),
             fullcone: Arc::new(DashMap::new()),
             flow_path: Arc::new(DashMap::new()),

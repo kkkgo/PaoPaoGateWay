@@ -5,4 +5,8 @@ pub struct Busy;
 
 pub trait ProbeSource: Send + Sync {
     fn probe(&self, req_json: &str) -> Result<String, Busy>;
+
+    fn probe_relaxed(&self, req_json: &str) -> Result<String, Busy> {
+        self.probe(req_json)
+    }
 }

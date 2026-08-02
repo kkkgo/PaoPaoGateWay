@@ -37,7 +37,7 @@ RUN ver=$(curl -s https://github.com/MetaCubeX/mihomo/releases | \
     /usr/bin/mihomo_v3 -v | grep "Mihomo" && \
     rm -rf /tmp/*
 FROM alpine:edge
-RUN apk add --no-cache xorriso 7zip
+RUN apk add --no-cache xorriso 7zip curl ca-certificates
 COPY --from=downloader /usr/bin/mihomo_compatible /clash/
 COPY --from=downloader /usr/bin/mihomo_v3 /clash/
 COPY --from=downloader /geodata/ASN.mmdb /geodata/ASN.mmdb
@@ -53,4 +53,5 @@ ENV sha="rootsha"
 ENV SNIFF=yes
 ENV GEO=yes
 ENV MI=y
+ENV CF=n
 ENTRYPOINT ["/remakeiso.sh"]

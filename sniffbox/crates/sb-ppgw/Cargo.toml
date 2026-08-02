@@ -18,6 +18,7 @@ sha2       = { workspace = true }
 hex        = { workspace = true }
 yaml-rust2 = { workspace = true }
 sb-dns     = { workspace = true }
+sb-outbound = { workspace = true }
 ureq       = { workspace = true }
 regex-lite = { workspace = true }
 time       = { workspace = true }

@@ -1,9 +1,13 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+pub mod cf_ctl;
+pub mod cf_edge;
+pub mod cf_metrics;
 pub mod clash_ctl;
 pub mod clash_pull;
 pub mod config;
 pub mod dns_server;
+pub mod domain_rules;
 pub mod engine;
 pub mod geo_cron;
 pub mod inbound_proxy;
@@ -408,13 +412,60 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
     });
 
     let tcp_workers = cfg.inbound.tcp_workers.max(1);
-    spawn_tcp_listeners(listen_addr, tcp_workers, &shared, &shutdown_rx, true)?;
+    spawn_tcp_listeners(listen_addr, tcp_workers, &shared, &shutdown_rx, true, false)?;
 
     if let Some(listen6) = cfg.inbound.listen6 {
-        if let Err(e) = spawn_tcp_listeners(listen6, tcp_workers, &shared, &shutdown_rx, false) {
+        if let Err(e) =
+            spawn_tcp_listeners(listen6, tcp_workers, &shared, &shutdown_rx, false, false)
+        {
             tracing::warn!(%listen6, ?e, "bind_tproxy_tcp (IPv6) failed; continuing IPv4-only");
         }
     }
+
+    if let Some(cf_addr) = cfg.cloudflared.tproxy {
+        if let Err(e) = spawn_tcp_listeners(cf_addr, 1, &shared, &shutdown_rx, false, true) {
+            tracing::warn!(%cf_addr, ?e, "cloudflared tproxy tcp bind failed");
+        }
+        match udp_engine::start_udp_engine(
+            Arc::clone(&shared),
+            cf_addr,
+            udp_idle,
+            1,
+            spoof_cache_cap,
+            true,
+            shutdown_rx.clone(),
+        ) {
+            Ok(_engine) => tracing::info!(%cf_addr, "cloudflared udp engine running"),
+            Err(e) => tracing::warn!(%cf_addr, ?e, "cloudflared udp engine bind failed"),
+        }
+    }
+    if let Some(cf6) = cfg.cloudflared.tproxy6 {
+        if let Err(e) = spawn_tcp_listeners(cf6, 1, &shared, &shutdown_rx, false, true) {
+            tracing::warn!(%cf6, ?e, "cloudflared tproxy tcp (IPv6) bind failed");
+        }
+        match udp_engine::start_udp_engine(
+            Arc::clone(&shared),
+            cf6,
+            udp_idle,
+            1,
+            spoof_cache_cap,
+            true,
+            shutdown_rx.clone(),
+        ) {
+            Ok(_engine) => tracing::info!(%cf6, "cloudflared udp engine (IPv6) running"),
+            Err(e) => tracing::warn!(%cf6, ?e, "cloudflared udp engine (IPv6) bind failed"),
+        }
+    }
+
+    let cf_sup = {
+        let sup = Arc::new(cf_ctl::CloudflaredSupervisor::new(
+            source.clone(),
+            cfg.outbound.mode,
+            shared.outbound.tun_ready(),
+        ));
+        cf_ctl::spawn_monitor(Arc::clone(&sup), shutdown_rx.clone());
+        sup
+    };
 
     {
         let shared = Arc::clone(&shared);
@@ -454,7 +505,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
         cfg.dns.as_ref().filter(|d| d.enabled),
         shared.fakeip.clone(),
     ) {
-        match dns_server::bind_dns(dns.listen).await {
+        match dns_server::bind_dns(dns.listen) {
             Ok(sock) => {
                 tracing::info!(
                     listen = %dns.listen, cidr = %fakeip.cidr(),
@@ -584,13 +635,20 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
             reload_cmd: (!cfg.web.reload_cmd.is_empty()).then(|| cfg.web.reload_cmd.clone()),
             reload_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 
-            probe: Some(Arc::new(probe::WebProbe::new()) as Arc<dyn sb_web::ProbeSource>),
+            probe: Some(Arc::new(probe::WebProbe::new(cfg.inbound_proxy.udp))
+                as Arc<dyn sb_web::ProbeSource>),
 
             clash_control: clash_supervisor
                 .clone()
                 .map(|s| s as Arc<dyn sb_web::ClashControl>),
 
             geo: web_geo.clone().map(|g| g as Arc<dyn sb_web::GeoControl>),
+
+            cloudflared: Some(Arc::new(runtime::WebCloudflared {
+                shared: Arc::clone(&shared),
+                sup: Arc::clone(&cf_sup),
+            }) as Arc<dyn sb_web::CloudflaredSource>),
+            cloudflared_log: Some(cf_sup.logs()),
         });
         let sd = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -610,7 +668,11 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
         shutdown_rx.clone(),
     );
 
-    inbound_proxy::start_healthcheck_listener(Arc::clone(&shared), shutdown_rx.clone());
+    inbound_proxy::start_healthcheck_listener(
+        Arc::clone(&shared),
+        cfg.inbound_proxy.udp,
+        shutdown_rx.clone(),
+    );
 
     if udp_enabled {
         match udp_engine::start_udp_engine(
@@ -619,6 +681,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
             udp_idle,
             udp_workers,
             spoof_cache_cap,
+            false,
             shutdown_rx.clone(),
         ) {
             Ok(_engine) => {
@@ -639,6 +702,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
                 udp_idle,
                 udp_workers,
                 spoof_cache_cap,
+                false,
                 shutdown_rx.clone(),
             ) {
                 Ok(_engine) => {
@@ -661,6 +725,8 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
     if let Some(sup) = ovpn_sup {
         let _ = tokio::task::spawn_blocking(move || sup.kill()).await;
     }
+
+    let _ = tokio::task::spawn_blocking(move || cf_sup.kill()).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
 }
@@ -671,6 +737,7 @@ fn spawn_tcp_listeners(
     shared: &Arc<SharedState>,
     shutdown_rx: &watch::Receiver<bool>,
     fatal: bool,
+    cloudflared: bool,
 ) -> std::io::Result<()> {
     let first = match sb_tproxy::tcp::bind_tproxy_tcp(listen_addr) {
         Ok(l) => l,
@@ -694,13 +761,14 @@ fn spawn_tcp_listeners(
             }
         }
     }
-    tracing::info!(%listen_addr, workers = listeners.len(), "tproxy tcp listening (REUSEPORT)");
+    tracing::info!(%listen_addr, workers = listeners.len(), cloudflared,
+        "tproxy tcp listening (REUSEPORT)");
 
     for listener in listeners {
         let shared = Arc::clone(shared);
         let mut sd = shutdown_rx.clone();
         tokio::spawn(async move {
-            accept_loop(listener, shared, &mut sd).await;
+            accept_loop(listener, shared, cloudflared, &mut sd).await;
         });
     }
     Ok(())
@@ -709,6 +777,7 @@ fn spawn_tcp_listeners(
 async fn accept_loop(
     listener: tokio::net::TcpListener,
     shared: Arc<SharedState>,
+    cloudflared: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     loop {
@@ -720,7 +789,12 @@ async fn accept_loop(
                     Ok((stream, peer)) => {
                         let shared = Arc::clone(&shared);
                         tokio::spawn(async move {
-                            if let Err(e) = engine::handle_conn(stream, peer, shared).await {
+                            let r = if cloudflared {
+                                engine::handle_cf_conn(stream, peer, shared).await
+                            } else {
+                                engine::handle_conn(stream, peer, shared).await
+                            };
+                            if let Err(e) = r {
                                 tracing::debug!(%peer, ?e, "conn ended with error");
                             }
                         });
