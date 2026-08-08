@@ -140,12 +140,10 @@ async fn probe(
         let msg = br#"{"ok":false,"denied":true,"error":"body must be utf-8"}"#;
         return respond::send(stream, 400, "Bad Request", &[JSON], msg, ka).await;
     };
-    let (src, body) = (Arc::clone(src), body.to_string());
+    match src.probe(body).await {
+        Ok(out) => respond::send(stream, 200, "OK", &[JSON], out.as_bytes(), ka).await,
 
-    match tokio::task::spawn_blocking(move || src.probe(&body)).await {
-        Ok(Ok(out)) => respond::send(stream, 200, "OK", &[JSON], out.as_bytes(), ka).await,
-
-        Ok(Err(_busy)) => {
+        Err(_busy) => {
             let msg = br#"{"ok":false,"busy":true,"error":"too many concurrent probes"}"#;
             respond::send(
                 stream,
@@ -156,11 +154,6 @@ async fn probe(
                 ka,
             )
             .await
-        }
-        Err(e) => {
-            tracing::warn!(%e, "probe task panicked");
-            let msg = br#"{"ok":false,"error":"probe task failed"}"#;
-            respond::send(stream, 500, "Internal Server Error", &[JSON], msg, ka).await
         }
     }
 }

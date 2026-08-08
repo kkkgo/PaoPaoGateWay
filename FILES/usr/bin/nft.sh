@@ -65,8 +65,10 @@ if [ "$cf_enable" = "yes" ]; then
     cf_output_chain="
         chain ppgw_cf_output {
                 type route hook output priority filter; policy accept;
+                meta skuid != $cf_uid return
                 ip daddr @localnetwork return
-                meta skuid $cf_uid meta l4proto {tcp, udp} meta mark set 1
+                fib daddr type local return
+                meta l4proto {tcp, udp} meta mark set 1
         }
 "
     cf_tproxy_rule6="                meta mark 1 meta l4proto tcp tproxy to [::1]:$cf_port accept
@@ -74,8 +76,10 @@ if [ "$cf_enable" = "yes" ]; then
     cf_output_chain6="
         chain ppgw_cf_output6 {
                 type route hook output priority filter; policy accept;
+                meta skuid != $cf_uid return
                 ip6 daddr @localnetwork6 return
-                meta skuid $cf_uid meta l4proto {tcp, udp} meta mark set 1
+                fib daddr type local return
+                meta l4proto {tcp, udp} meta mark set 1
         }
 "
 else
@@ -145,7 +149,10 @@ table ip6 ppgw {
         }
         chain ppgw_tproxy6 {
                 type filter hook prerouting priority mangle; policy accept;
+                meta l4proto != { tcp, udp } return
+                iif "lo" return
                 ip6 daddr @localnetwork6 return
+                fib daddr type local return
 $cf_tproxy_rule6
 $udp_rules6
                 meta l4proto tcp tproxy to [::1]:1081 meta mark set 1
@@ -189,7 +196,10 @@ table ip ppgw {
         }
         chain ppgw_tproxy {
                 type filter hook prerouting priority mangle; policy accept;
+                ip protocol != { tcp, udp } return
+                iif "lo" return
                 ip daddr @localnetwork return
+                fib daddr type local return
 $cf_tproxy_rule
 $udp_rules
                 ip protocol tcp tproxy to 127.0.0.1:1081 meta mark set 1

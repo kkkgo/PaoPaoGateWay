@@ -2,7 +2,8 @@
 
 use crate::clash_ctl::ClashSupervisor;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const CLASH_DIR: &str = "/etc/config/clash";
 
@@ -25,13 +26,22 @@ impl WebGeo {
 
 impl WebGeo {
 
-    pub fn update_then_restart(&self) -> String {
-        let _guard = self.updating.lock().unwrap_or_else(|e| e.into_inner());
-        let report = sb_ppgw::geo::update(&self.dir);
-        if let Err(e) = self.clash.restart() {
-            tracing::warn!(%e, "scheduled clash cold-restart failed");
-        }
+    pub async fn update_then_restart(&self) -> String {
+        let _guard = self.updating.lock().await;
+        let report = sb_ppgw::geo::update(&self.dir).await;
+        self.restart_clash("scheduled clash cold-restart failed")
+            .await;
         report.to_json()
+    }
+
+    async fn restart_clash(&self, what: &'static str) {
+        let clash = Arc::clone(&self.clash);
+        let r = tokio::task::spawn_blocking(move || clash.restart()).await;
+        match r {
+            Ok(Err(e)) => tracing::warn!(%e, "{what}"),
+            Err(e) => tracing::warn!(%e, "{what}"),
+            Ok(Ok(())) => {}
+        }
     }
 }
 
@@ -40,16 +50,17 @@ impl sb_web::GeoControl for WebGeo {
         sb_ppgw::geo::status(&self.dir).to_json()
     }
 
-    fn update(&self) -> String {
+    fn update(&self) -> sb_web::GeoFut<'_> {
+        Box::pin(async move {
 
-        let _guard = self.updating.lock().unwrap_or_else(|e| e.into_inner());
-        let report = sb_ppgw::geo::update(&self.dir);
-        if report.changed {
+            let _guard = self.updating.lock().await;
+            let report = sb_ppgw::geo::update(&self.dir).await;
+            if report.changed {
 
-            if let Err(e) = self.clash.restart() {
-                tracing::warn!(%e, "clash cold-restart after geo update failed");
+                self.restart_clash("clash cold-restart after geo update failed")
+                    .await;
             }
-        }
-        report.to_json()
+            report.to_json()
+        })
     }
 }

@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use yaml_rust2::Yaml;
 
-const DOH_UA: &str = "sniffbox-dns/1";
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+const DOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 const HARD_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -361,7 +362,14 @@ fn resolve_via(
             if !ips.is_empty() || !socks || dl.expired() {
                 return ips;
             }
-            resolve_doh(doh_socks_agent().clone(), domain, url, ipv6)
+            resolve_doh(
+                crate::httpcli::insecure_client(),
+                CLASH_SOCKS5,
+                domain,
+                url,
+                ipv6,
+                TIMEOUT,
+            )
         }
     }
 }
@@ -371,20 +379,18 @@ fn next_id() -> u16 {
     ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn doh_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| crate::httpcli::agent("", DOH_UA, TIMEOUT).expect("doh agent"))
-}
-
-fn doh_agent_pinned(key: &str, ips: Vec<IpAddr>, timeout: Duration) -> ureq::Agent {
-    static CACHE: OnceLock<Mutex<HashMap<String, ureq::Agent>>> = OnceLock::new();
+fn doh_client_pinned(key: &str, ips: Vec<IpAddr>) -> wreq::Client {
+    static CACHE: OnceLock<Mutex<HashMap<String, wreq::Client>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache.lock().unwrap().get(key) {
         return hit.clone();
     }
-    let agent = crate::httpcli::agent_with_ips(ips, DOH_UA, timeout);
-    cache.lock().unwrap().insert(key.to_string(), agent.clone());
-    agent
+    let client = crate::httpcli::client_for_ips(ips);
+    cache
+        .lock()
+        .unwrap()
+        .insert(key.to_string(), client.clone());
+    client
 }
 
 fn doh_resolve(
@@ -400,12 +406,19 @@ fn doh_resolve(
 
     let candidates = bootstrap_resolve(host, boot, ipv6, dl);
     if candidates.is_empty() {
-        return resolve_doh(doh_agent().clone(), domain, url, ipv6);
+        return resolve_doh(
+            crate::httpcli::insecure_client(),
+            "",
+            domain,
+            url,
+            ipv6,
+            TIMEOUT,
+        );
     }
 
     if let Some(ip) = winner.lock().unwrap().get(host).copied() {
-        let agent = doh_agent_pinned(&format!("{host}|{ip}"), vec![ip], TIMEOUT);
-        let ips = resolve_doh(agent, domain, url, ipv6);
+        let client = doh_client_pinned(&format!("{host}|{ip}"), vec![ip]);
+        let ips = resolve_doh(&client, "", domain, url, ipv6, TIMEOUT);
         if !ips.is_empty() {
             return ips;
         }
@@ -413,8 +426,8 @@ fn doh_resolve(
         winner.lock().unwrap().remove(host);
     }
 
-    let all = doh_agent_pinned(host, candidates.clone(), TIMEOUT);
-    let ips = resolve_doh(all, domain, url, ipv6);
+    let all = doh_client_pinned(host, candidates.clone());
+    let ips = resolve_doh(&all, "", domain, url, ipv6, TIMEOUT);
     if !ips.is_empty() {
         return ips;
     }
@@ -424,8 +437,8 @@ fn doh_resolve(
         if dl.expired() {
             break;
         }
-        let agent = doh_agent_pinned(&format!("{host}|{ip}"), vec![ip], RETRY_TIMEOUT);
-        let ips = resolve_doh(agent, domain, url, ipv6);
+        let client = doh_client_pinned(&format!("{host}|{ip}"), vec![ip]);
+        let ips = resolve_doh(&client, "", domain, url, ipv6, RETRY_TIMEOUT);
         if !ips.is_empty() {
             winner.lock().unwrap().insert(host.to_string(), ip);
             return ips;
@@ -434,49 +447,54 @@ fn doh_resolve(
     Vec::new()
 }
 
-fn doh_socks_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        crate::httpcli::agent(CLASH_SOCKS5, DOH_UA, TIMEOUT).expect("doh socks agent")
+fn resolve_doh(
+    client: &wreq::Client,
+    proxy: &str,
+    domain: &str,
+    url: &str,
+    ipv6: bool,
+    timeout: Duration,
+) -> Vec<IpAddr> {
+    crate::rt::block_on(async {
+        let mut out = Vec::new();
+        if let Some(resp) = doh_query(client, proxy, domain, url, TYPE_A, timeout).await {
+            out.extend(resp.v4.into_iter().map(IpAddr::V4));
+        }
+        if ipv6 && let Some(resp) = doh_query(client, proxy, domain, url, TYPE_AAAA, timeout).await
+        {
+            out.extend(resp.v6.into_iter().map(IpAddr::V6));
+        }
+        out
     })
 }
 
-fn resolve_doh(agent: ureq::Agent, domain: &str, url: &str, ipv6: bool) -> Vec<IpAddr> {
-    let mut out = Vec::new();
-    if let Some(resp) = doh_query(&agent, domain, url, TYPE_A) {
-        out.extend(resp.v4.into_iter().map(IpAddr::V4));
-    }
-    if ipv6 {
-        if let Some(resp) = doh_query(&agent, domain, url, TYPE_AAAA) {
-            out.extend(resp.v6.into_iter().map(IpAddr::V6));
-        }
-    }
-    out
-}
-
-fn doh_query(
-    agent: &ureq::Agent,
+async fn doh_query(
+    client: &wreq::Client,
+    proxy: &str,
     domain: &str,
     url: &str,
     qtype: u16,
+    timeout: Duration,
 ) -> Option<message::DnsResponse> {
     let id = next_id();
     let query = message::build_query(id, domain, qtype).ok()?;
-    let mut resp = agent
-        .post(url)
+    let mut rb = crate::httpcli::bare_identity(client.post(url))
         .header("Content-Type", "application/dns-message")
         .header("Accept", "application/dns-message")
-        .send(&query[..])
-        .ok()?;
+        .timeout(timeout)
+        .body(query);
+    if let Some(p) = crate::httpcli::proxy_for(proxy).ok()? {
+        rb = rb.proxy(p);
+    }
+
+    let resp = tokio::time::timeout(timeout, rb.send()).await.ok()?.ok()?;
     if !(200..300).contains(&resp.status().as_u16()) {
         return None;
     }
-    let body = resp
-        .body_mut()
-        .with_config()
-        .limit(65536)
-        .read_to_vec()
-        .ok()?;
+    let (body, truncated) = crate::httpcli::read_body_bounded(resp, 65536).await.ok()?;
+    if truncated {
+        return None;
+    }
     let parsed = message::parse_response(&body).ok()?;
     if parsed.id != id {
         return None;
@@ -484,57 +502,14 @@ fn doh_query(
     Some(parsed)
 }
 
-#[derive(Debug)]
-struct NoVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end: &rustls::pki_types::CertificateDer,
-        _inter: &[rustls::pki_types::CertificateDer],
-        _name: &rustls::pki_types::ServerName,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _msg: &[u8],
-        _cert: &rustls::pki_types::CertificateDer,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _msg: &[u8],
-        _cert: &rustls::pki_types::CertificateDer,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn tls_config() -> Arc<rustls::ClientConfig> {
-    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+fn dot_connector() -> &'static btls::ssl::SslConnector {
+    static CFG: OnceLock<btls::ssl::SslConnector> = OnceLock::new();
     CFG.get_or_init(|| {
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("rustls protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-        Arc::new(cfg)
+        let mut b = btls::ssl::SslConnector::builder(btls::ssl::SslMethod::tls())
+            .expect("btls connector builder");
+        b.set_verify(btls::ssl::SslVerifyMode::NONE);
+        b.build()
     })
-    .clone()
 }
 
 fn resolve_dot(
@@ -579,48 +554,68 @@ fn dot_addrs(
 }
 
 fn dot_query(domain: &str, host: &str, addr: SocketAddr, ipv6: bool) -> Option<Vec<IpAddr>> {
-    let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
-    sock.set_read_timeout(Some(TIMEOUT)).ok()?;
-    sock.set_write_timeout(Some(TIMEOUT)).ok()?;
-    let server_name = match host.parse::<IpAddr>() {
-        Ok(ip) => rustls::pki_types::ServerName::IpAddress(ip.into()),
-        Err(_) => rustls::pki_types::ServerName::try_from(host.to_string()).ok()?,
-    };
-    let conn = rustls::ClientConnection::new(tls_config(), server_name).ok()?;
-    let mut tls = rustls::StreamOwned::new(conn, sock);
+    crate::rt::block_on(dot_query_async(domain, host, addr, ipv6))
+}
+
+async fn dot_query_async(
+    domain: &str,
+    host: &str,
+    addr: SocketAddr,
+    ipv6: bool,
+) -> Option<Vec<IpAddr>> {
+    let tcp = tokio::time::timeout(DOT_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let mut cfg = dot_connector().configure().ok()?;
+
+    cfg.set_verify_hostname(false);
+    if host.parse::<IpAddr>().is_ok() {
+        cfg.set_use_server_name_indication(false);
+    }
+    let ssl = cfg.into_ssl(host).ok()?;
+    let mut tls = tokio_btls::SslStream::new(ssl, tcp).ok()?;
+    tokio::time::timeout(TIMEOUT, std::pin::Pin::new(&mut tls).connect())
+        .await
+        .ok()?
+        .ok()?;
 
     let mut out = Vec::new();
-    if let Some(resp) = dot_one(&mut tls, domain, TYPE_A) {
+    if let Some(resp) = dot_one(&mut tls, domain, TYPE_A).await {
         out.extend(resp.v4.into_iter().map(IpAddr::V4));
     }
-    if ipv6 {
-        if let Some(resp) = dot_one(&mut tls, domain, TYPE_AAAA) {
-            out.extend(resp.v6.into_iter().map(IpAddr::V6));
-        }
+    if ipv6 && let Some(resp) = dot_one(&mut tls, domain, TYPE_AAAA).await {
+        out.extend(resp.v6.into_iter().map(IpAddr::V6));
     }
     Some(out)
 }
 
-fn dot_one(
-    tls: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+async fn dot_one(
+    tls: &mut tokio_btls::SslStream<tokio::net::TcpStream>,
     domain: &str,
     qtype: u16,
 ) -> Option<message::DnsResponse> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let id = next_id();
     let query = message::build_query(id, domain, qtype).ok()?;
 
     let len = u16::try_from(query.len()).ok()?;
-    tls.write_all(&len.to_be_bytes()).ok()?;
-    tls.write_all(&query).ok()?;
-    tls.flush().ok()?;
-    let mut lenbuf = [0u8; 2];
-    tls.read_exact(&mut lenbuf).ok()?;
-    let rlen = u16::from_be_bytes(lenbuf) as usize;
-    if rlen == 0 || rlen > 65535 {
-        return None;
-    }
-    let mut buf = vec![0u8; rlen];
-    tls.read_exact(&mut buf).ok()?;
+    let exchange = async {
+        tls.write_all(&len.to_be_bytes()).await.ok()?;
+        tls.write_all(&query).await.ok()?;
+        tls.flush().await.ok()?;
+        let mut lenbuf = [0u8; 2];
+        tls.read_exact(&mut lenbuf).await.ok()?;
+        let rlen = u16::from_be_bytes(lenbuf) as usize;
+        if rlen == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; rlen];
+        tls.read_exact(&mut buf).await.ok()?;
+        Some(buf)
+    };
+    let buf = tokio::time::timeout(TIMEOUT, exchange).await.ok()??;
     let parsed = message::parse_response(&buf).ok()?;
     if parsed.id != id {
         return None;
@@ -666,6 +661,25 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(30),
             "resolve_via_servers stuck {elapsed:?} (should return near HARD_TIMEOUT + fallback budget)"
+        );
+    }
+
+    #[test]
+    fn dot_connector_builds_and_failed_handshake_returns_none() {
+        use std::net::TcpListener;
+        let _ = dot_connector();
+
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((s, _)) = l.accept() {
+                drop(s);
+            }
+        });
+        assert!(
+            dot_query("example.com", "dot.example", addr, false).is_none(),
+            "handshake failure must be None, not a panic"
         );
     }
 
@@ -889,10 +903,12 @@ mod tests {
     #[ignore = "requires network: real DoH/DoT resolution against real servers"]
     fn live_doh_dot_resolve_cp_cloudflare() {
         let doh = resolve_doh(
-            doh_agent().clone(),
+            crate::httpcli::insecure_client(),
+            "",
             "cp.cloudflare.com",
             "https://dns.alidns.com/dns-query",
             false,
+            TIMEOUT,
         );
         println!("DoH  https://dns.alidns.com/dns-query  cp.cloudflare.com -> {doh:?}");
         assert!(!doh.is_empty(), "DoH should resolve at least one IP");
@@ -919,10 +935,12 @@ mod tests {
     fn live_doh_dot_resolve_ipv6() {
 
         let doh = resolve_doh(
-            doh_agent().clone(),
+            crate::httpcli::insecure_client(),
+            "",
             "cp.cloudflare.com",
             "https://dns.alidns.com/dns-query",
             true,
+            TIMEOUT,
         );
         println!("DoH ipv6  cp.cloudflare.com -> {doh:?}");
         let dot = resolve_dot("cp.cloudflare.com", "dot.pub", 853, true, &[], test_dl());

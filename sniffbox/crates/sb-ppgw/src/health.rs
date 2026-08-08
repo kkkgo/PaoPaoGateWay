@@ -1,7 +1,7 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use crate::clash::ClashClient;
-use crate::httpcli::check_url_connectivity;
+use crate::httpcli::check_url_connectivity_blocking as check_url_connectivity;
 use std::thread::sleep;
 use std::time::Duration;
 

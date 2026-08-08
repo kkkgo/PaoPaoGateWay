@@ -46,11 +46,8 @@ async fn tick(geo: &Arc<WebGeo>) {
         return;
     }
     tracing::info!(hour, "restart_cron: geo update + clash cold-restart");
-    let g = Arc::clone(geo);
-    match tokio::task::spawn_blocking(move || g.update_then_restart()).await {
-        Ok(report) => tracing::info!(%report, "restart_cron done"),
-        Err(e) => tracing::warn!(%e, "restart_cron task panicked"),
-    }
+    let report = geo.update_then_restart().await;
+    tracing::info!(%report, "restart_cron done");
 }
 
 fn parse_restart_hour(json: &str) -> Option<u8> {

@@ -3,6 +3,8 @@
 pub mod cf_ctl;
 pub mod cf_edge;
 pub mod cf_metrics;
+pub mod cf_probe;
+pub mod cf_quality;
 pub mod clash_ctl;
 pub mod clash_pull;
 pub mod config;
@@ -13,6 +15,7 @@ pub mod geo_cron;
 pub mod inbound_proxy;
 pub mod ip_rules;
 pub mod logging;
+pub mod nft;
 pub mod nic;
 pub mod outbound;
 pub mod ovpn_ctl;
@@ -658,15 +661,17 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
         });
     }
 
-    inbound_proxy::start_inbound_proxy(
-        Arc::clone(&shared),
-        inbound_proxy::InboundProxyParams {
-            listen_port: cfg.inbound_proxy.listen_port,
-            udp: cfg.inbound_proxy.udp,
-            udp_idle: cfg.inbound.udp_idle,
-        },
-        shutdown_rx.clone(),
-    );
+    if cfg.inbound_proxy.enabled {
+        inbound_proxy::start_inbound_proxy(
+            Arc::clone(&shared),
+            inbound_proxy::InboundProxyParams {
+                listen_port: cfg.inbound_proxy.listen_port,
+                udp: cfg.inbound_proxy.udp,
+                udp_idle: cfg.inbound.udp_idle,
+            },
+            shutdown_rx.clone(),
+        );
+    }
 
     inbound_proxy::start_healthcheck_listener(
         Arc::clone(&shared),

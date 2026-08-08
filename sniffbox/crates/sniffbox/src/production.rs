@@ -120,6 +120,11 @@ fn build(p: &PpgwIni) -> Config {
             .str("cf_proxy")
             .and_then(crate::config::CfProxyMode::parse)
             .unwrap_or_default(),
+
+        protocol: p
+            .str("cf_protocol")
+            .and_then(crate::config::CfProtocol::parse)
+            .unwrap_or_default(),
         tproxy: Some("127.0.0.1:1082".parse().unwrap()),
         tproxy6: ipv6_enabled().then(|| "[::1]:1082".parse().unwrap()),
     };
@@ -330,6 +335,42 @@ mod tests {
         let cfg = build(&ppgw("cf_proxy=\"no\"\ncloudflared_token=\"eyJhIjoi\"\n"));
         assert_eq!(cfg.cloudflared.proxy, CfProxyMode::No);
         assert_eq!(cfg.cloudflared.token.as_deref(), Some("eyJhIjoi"));
+    }
+
+    #[test]
+    fn cf_protocol_maps_from_ppgw_ini() {
+        use crate::config::{CfProtocol, Protocol};
+        assert_eq!(
+            build(&PpgwIni::default()).cloudflared.protocol,
+            CfProtocol::Auto
+        );
+        let cases = [
+            ("cf_protocol=\"quic\"\n", CfProtocol::Fixed(Protocol::Quic)),
+            (
+                "cf_protocol=\"http2\"\n",
+                CfProtocol::Fixed(Protocol::Http2),
+            ),
+            ("cf_protocol=\"auto\"\n", CfProtocol::Auto),
+
+            ("cf_protocol=\"quik\"\n", CfProtocol::Auto),
+            ("cf_protocol=\"\"\n", CfProtocol::Auto),
+        ];
+        for (text, want) in cases {
+            assert_eq!(
+                build(&ppgw(text)).cloudflared.protocol,
+                want,
+                "for {text:?}"
+            );
+        }
+
+        let cfg = build(&ppgw(
+            "cf_protocol=\"quic\"\ncloudflared_token=\"eyJhIjoi\"\n",
+        ));
+        assert_eq!(cfg.cloudflared.protocol, CfProtocol::Fixed(Protocol::Quic));
+        assert_eq!(cfg.cloudflared.token.as_deref(), Some("eyJhIjoi"));
+
+        let stale = build(&ppgw("cf_protocol=\"auto\"\ncf_quality_interval=\"5\"\n"));
+        assert_eq!(stale.cloudflared.protocol, CfProtocol::Auto);
     }
 
     #[test]

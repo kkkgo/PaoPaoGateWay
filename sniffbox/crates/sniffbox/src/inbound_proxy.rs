@@ -67,6 +67,7 @@ pub fn start_inbound_proxy(
             tracing::warn!("openport fixed-on but no non-loopback IPv4 found; inbound proxy idle");
             return;
         }
+        let mut bound = Vec::with_capacity(ips.len());
         for ip in ips {
             let addr = SocketAddr::new(IpAddr::V4(ip), params.listen_port);
             let listener = match TcpListener::bind(addr).await {
@@ -78,6 +79,7 @@ pub fn start_inbound_proxy(
             };
             tracing::info!(%addr, udp = params.udp, auth = shared.openport_auth().is_some(),
                 "inbound proxy (socks5+http) listening");
+            bound.push(addr);
             let shared = Arc::clone(&shared);
             let params = params.clone();
             let mut sd = shutdown_rx.clone();
@@ -85,6 +87,7 @@ pub fn start_inbound_proxy(
                 accept_loop(listener, shared, params, OPENPORT, &mut sd).await;
             });
         }
+        shared.set_openport_listen(bound);
     });
 }
 
@@ -1255,9 +1258,7 @@ mod tests {
         let proxy = format!("socks5h://127.0.0.1:{}", inbound.port());
         let req =
             serde_json::json!({ "url": "http://example.com/probe", "timeoutMs": 5000 }).to_string();
-        let out = tokio::task::spawn_blocking(move || sb_ppgw::probe::run_json(&req, &proxy))
-            .await
-            .unwrap();
+        let out = sb_ppgw::probe::run_json(&req, &proxy).await;
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         assert_eq!(

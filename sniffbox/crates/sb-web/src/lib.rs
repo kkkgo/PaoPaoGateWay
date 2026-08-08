@@ -33,10 +33,10 @@ pub use clash_ctl::ClashControl;
 pub use cloudflared::CloudflaredSource;
 pub use connections::ConnectionsSource;
 pub use events::{LogEvent, LogSource, LogTx};
-pub use geo::GeoControl;
+pub use geo::{GeoControl, GeoFut};
 pub use info::{InfoScope, InfoSource};
 pub use nodes::NodesSource;
-pub use probe::{Busy, ProbeSource};
+pub use probe::{Busy, ProbeFut, ProbeSource};
 pub use proxies::ProxiesSource;
 pub use screen::ScreenHistory;
 

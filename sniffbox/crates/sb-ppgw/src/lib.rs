@@ -17,6 +17,7 @@ pub mod privsep;
 pub mod probe;
 pub mod procinfo;
 pub mod resolvepool;
+pub mod rt;
 pub mod ruleset;
 pub mod subtime;
 pub mod term;
@@ -454,7 +455,7 @@ fn cmd_testproxy(f: &PpgwFlags, io: &mut Io) -> i32 {
 }
 
 pub fn testproxy_probe(url: &str, proxy: &str, io: &mut Io) -> i32 {
-    match httpcli::check_url_connectivity(url, proxy, "0") {
+    match httpcli::check_url_connectivity_blocking(url, proxy, "0") {
         Ok((_, code)) => {
             let _ = writeln!(io.out, "Node Check success. HTTP CODE: {code}");
             0

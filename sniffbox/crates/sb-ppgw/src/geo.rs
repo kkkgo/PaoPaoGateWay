@@ -1,14 +1,17 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use crate::httpcli::{UA_DOWNLOAD, agent};
+use futures_util::future::join_all;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::httpcli;
+
 const TIMEOUT: Duration = Duration::from_secs(15);
+
+const MAX_BODY: u64 = 64 * 1024 * 1024;
 const SOCKS5: &str = "socks5h://127.0.0.1:1080";
 const VERSION_FEED: &str = "https://github.com/MetaCubeX/meta-rules-dat/commits/release.atom";
 const UPDATE_LOG: &str = "update.log";
@@ -140,7 +143,7 @@ struct FileOutcome {
     changed: bool,
 }
 
-fn update_one(f: &GeoFile, dir: &Path, rv: &Option<String>, sv: String) -> FileOutcome {
+async fn update_one(f: &GeoFile, dir: &Path, rv: &Option<String>, sv: String) -> FileOutcome {
 
     if let Some(rv) = rv {
         if !sv.is_empty() && sv == *rv {
@@ -154,7 +157,7 @@ fn update_one(f: &GeoFile, dir: &Path, rv: &Option<String>, sv: String) -> FileO
         }
     }
 
-    let Some(rh) = remote_sha256(f) else {
+    let Some(rh) = remote_sha256(f).await else {
         return FileOutcome {
             name: f.local.into(),
             status: GeoStatus::FetchFailed,
@@ -175,7 +178,7 @@ fn update_one(f: &GeoFile, dir: &Path, rv: &Option<String>, sv: String) -> FileO
         };
     }
 
-    match download_verified(f, dir, &rh) {
+    match download_verified(f, dir, &rh).await {
         Ok(()) => FileOutcome {
             name: f.local.into(),
             status: GeoStatus::Downloaded,
@@ -193,33 +196,16 @@ fn update_one(f: &GeoFile, dir: &Path, rv: &Option<String>, sv: String) -> FileO
     }
 }
 
-pub fn update(dir: &Path) -> GeoReport {
+pub async fn update(dir: &Path) -> GeoReport {
     init_update_log_if_missing(dir);
     let mut log = read_update_log(dir);
-    let rv = remote_version();
+    let rv = remote_version().await;
 
-    let results: Vec<FileOutcome> = std::thread::scope(|s| {
-        let handles: Vec<(&GeoFile, _)> = GEO_FILES
-            .iter()
-            .map(|f| {
-                let sv = log.get(f.local).cloned().unwrap_or_default();
-                let rv = rv.clone();
-                (f, s.spawn(move || update_one(f, dir, &rv, sv)))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|(f, h)| {
-                h.join().unwrap_or_else(|_| FileOutcome {
-                    name: f.local.into(),
-                    status: GeoStatus::DownloadFailed,
-                    display_version: String::new(),
-                    commit_version: None,
-                    changed: false,
-                })
-            })
-            .collect()
-    });
+    let results: Vec<FileOutcome> = join_all(GEO_FILES.iter().map(|f| {
+        let sv = log.get(f.local).cloned().unwrap_or_default();
+        update_one(f, dir, &rv, sv)
+    }))
+    .await;
 
     let mut files = Vec::with_capacity(results.len());
     let mut changed = false;
@@ -243,16 +229,16 @@ pub fn update(dir: &Path) -> GeoReport {
     }
 }
 
-pub fn remote_version() -> Option<String> {
+pub async fn remote_version() -> Option<String> {
     let sources = vec![
         (VERSION_FEED.to_string(), SOCKS5.to_string()),
         (VERSION_FEED.to_string(), String::new()),
     ];
-    let body = race_accept(sources, Arc::new(|b: &[u8]| parse_updated(b).is_some()))?;
+    let body = race_accept(sources, Arc::new(|b: &[u8]| parse_updated(b).is_some())).await?;
     parse_updated(&body)
 }
 
-pub fn remote_sha256(file: &GeoFile) -> Option<String> {
+pub async fn remote_sha256(file: &GeoFile) -> Option<String> {
     let mut sources = Vec::new();
     let gh_sum = format!("{}.sha256sum", file.gh);
     for proxy in [SOCKS5, ""] {
@@ -264,11 +250,11 @@ pub fn remote_sha256(file: &GeoFile) -> Option<String> {
             sources.push((cdn_sum.clone(), proxy.to_string()));
         }
     }
-    let body = race_accept(sources, Arc::new(|b: &[u8]| parse_sha(b).is_some()))?;
+    let body = race_accept(sources, Arc::new(|b: &[u8]| parse_sha(b).is_some())).await?;
     parse_sha(&body)
 }
 
-pub fn download_verified(file: &GeoFile, dir: &Path, expected: &str) -> Result<(), String> {
+pub async fn download_verified(file: &GeoFile, dir: &Path, expected: &str) -> Result<(), String> {
     let exp = expected.to_lowercase();
     let accept: Accept = Arc::new(move |b: &[u8]| sha256_hex(b) == exp);
 
@@ -281,40 +267,32 @@ pub fn download_verified(file: &GeoFile, dir: &Path, expected: &str) -> Result<(
         direct.push((cdn_url(host, file.cdn), String::new()));
     }
 
-    let body = race_accept(socks, Arc::clone(&accept))
-        .or_else(|| race_accept(direct, Arc::clone(&accept)));
+    let body = match race_accept(socks, Arc::clone(&accept)).await {
+        Some(b) => Some(b),
+        None => race_accept(direct, Arc::clone(&accept)).await,
+    };
     let Some(body) = body else {
         return Err("all sources failed or sha256 mismatch".to_string());
     };
     write_atomic(dir, file.local, &body).map_err(|e| e.to_string())
 }
 
-fn race_accept(sources: Vec<(String, String)>, accept: Accept) -> Option<Vec<u8>> {
+async fn race_accept(sources: Vec<(String, String)>, accept: Accept) -> Option<Vec<u8>> {
     if sources.is_empty() {
         return None;
     }
     let n = sources.len();
-    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
-    let done = Arc::new(AtomicBool::new(false));
+    let mut set = tokio::task::JoinSet::new();
     for (url, proxy) in sources {
-        let tx = tx.clone();
-        let done = Arc::clone(&done);
         let accept = Arc::clone(&accept);
-        std::thread::spawn(move || {
-            if done.load(Ordering::Relaxed) {
-                return;
-            }
-            let res = fetch(&url, &proxy).ok().filter(|b| accept(b));
-            let _ = tx.send(res);
-        });
+        set.spawn(async move { fetch(&url, &proxy).await.ok().filter(|b| accept(b)) });
     }
-    drop(tx);
 
     let mut fails = 0usize;
-    while let Ok(res) = rx.recv() {
-        match res {
+    while let Some(joined) = set.join_next().await {
+        match joined.ok().flatten() {
             Some(body) => {
-                done.store(true, Ordering::Relaxed);
+                set.abort_all();
                 return Some(body);
             }
             None => {
@@ -328,18 +306,23 @@ fn race_accept(sources: Vec<(String, String)>, accept: Accept) -> Option<Vec<u8>
     None
 }
 
-fn fetch(url: &str, proxy: &str) -> Result<Vec<u8>, String> {
-    let ag = agent(proxy, UA_DOWNLOAD, TIMEOUT).map_err(|e| e.to_string())?;
-    let mut resp = ag.get(url).call().map_err(|e| e.to_string())?;
+async fn fetch(url: &str, proxy: &str) -> Result<Vec<u8>, String> {
+    let mut rb = httpcli::insecure_client().get(url).timeout(TIMEOUT);
+    if let Some(p) = httpcli::proxy_for(proxy).map_err(|e| e.to_string())? {
+        rb = rb.proxy(p);
+    }
+    let resp = rb.send().await.map_err(|e| e.to_string())?;
     let code = resp.status().as_u16();
     if code >= 400 {
         return Err(format!("status {code}"));
     }
-    resp.body_mut()
-        .with_config()
-        .limit(64 * 1024 * 1024)
-        .read_to_vec()
-        .map_err(|e| e.to_string())
+    let (body, truncated) = httpcli::read_body_bounded(resp, MAX_BODY)
+        .await
+        .map_err(|e| e.to_string())?;
+    if truncated {
+        return Err(format!("body exceeds {MAX_BODY} bytes"));
+    }
+    Ok(body)
 }
 
 fn parse_updated(body: &[u8]) -> Option<String> {
@@ -531,7 +514,7 @@ mod tests {
         let (url, h) = mock_http(b"hello-geo");
         let want = sha256_hex(b"hello-geo");
         let accept: Accept = Arc::new(move |b| sha256_hex(b) == want);
-        let got = race_accept(vec![(url, String::new())], accept);
+        let got = crate::rt::block_on(race_accept(vec![(url, String::new())], accept));
         let _ = h.join();
         assert_eq!(got.as_deref(), Some(&b"hello-geo"[..]));
     }
@@ -540,7 +523,7 @@ mod tests {
     fn race_accept_rejects_mismatch() {
         let (url, h) = mock_http(b"hello-geo");
         let accept: Accept = Arc::new(|_b| false);
-        let got = race_accept(vec![(url, String::new())], accept);
+        let got = crate::rt::block_on(race_accept(vec![(url, String::new())], accept));
         let _ = h.join();
         assert_eq!(got, None);
     }

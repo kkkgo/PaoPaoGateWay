@@ -1,28 +1,23 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use crate::Io;
-use crate::httpcli::{UA_PROBE, agent};
+use crate::httpcli;
 use std::time::{Duration, Instant};
 
 const READY_WAIT: Duration = Duration::from_secs(15);
+const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn cmd_clash_up(io: &mut Io) -> i32 {
+    crate::rt::block_on(run(io))
+}
+
+async fn run(io: &mut Io<'_>) -> i32 {
     let port = env_or("clash_web_port", "80");
     let url = format!("http://127.0.0.1:{port}/sniffbox/clash/up");
-    let ag = match agent("", UA_PROBE, Duration::from_secs(10)) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = writeln!(
-                io.err,
-                "{}clash-up agent build failed: {e}",
-                crate::term::red("[PaoPaoGW Clash]")
-            );
-            return 1;
-        }
-    };
+    let client = httpcli::insecure_client();
     let deadline = Instant::now() + READY_WAIT;
     loop {
-        match ag.post(&url).send_empty() {
+        match client.post(&url).timeout(REQ_TIMEOUT).send().await {
 
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -54,7 +49,7 @@ pub fn cmd_clash_up(io: &mut Io) -> i32 {
                     );
                     return 1;
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }

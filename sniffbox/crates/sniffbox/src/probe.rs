@@ -25,29 +25,30 @@ impl WebProbe {
             udp_enabled,
         }
     }
+}
 
-    fn probe_udp(&self) -> String {
-        use std::time::Instant;
-        if !self.udp_enabled {
-            return r#"{"ok":true,"status":200,"body":"udp=0","ms":0}"#.to_string();
-        }
-        let started = Instant::now();
-        use sb_ppgw::udp_probe::UdpOutcome;
+fn probe_udp(socks_addr: std::net::SocketAddr, udp_enabled: bool) -> String {
+    use sb_ppgw::udp_probe::UdpOutcome;
+    use std::time::Instant;
 
-        let (body, ms) = match sb_ppgw::udp_probe::run(self.socks_addr) {
-            Ok(UdpOutcome::Egress { ip, via, ms }) => (format!("udp=1\nip={ip}\nvia={via}"), ms),
-
-            Ok(UdpOutcome::Partial { via, err, ms }) => (
-                format!("udp=3\nerr=udp reachable ({via}), egress probe blocked: {err}"),
-                ms,
-            ),
-            Err(err) => (
-                format!("udp=2\nerr={err}"),
-                started.elapsed().as_millis() as u64,
-            ),
-        };
-        serde_json::json!({ "ok": true, "status": 200, "body": body, "ms": ms }).to_string()
+    if !udp_enabled {
+        return r#"{"ok":true,"status":200,"body":"udp=0","ms":0}"#.to_string();
     }
+    let started = Instant::now();
+
+    let (body, ms) = match sb_ppgw::udp_probe::run(socks_addr) {
+        Ok(UdpOutcome::Egress { ip, via, ms }) => (format!("udp=1\nip={ip}\nvia={via}"), ms),
+
+        Ok(UdpOutcome::Partial { via, err, ms }) => (
+            format!("udp=3\nerr=udp reachable ({via}), egress probe blocked: {err}"),
+            ms,
+        ),
+        Err(err) => (
+            format!("udp=2\nerr={err}"),
+            started.elapsed().as_millis() as u64,
+        ),
+    };
+    serde_json::json!({ "ok": true, "status": 200, "body": body, "ms": ms }).to_string()
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -71,18 +72,31 @@ impl Drop for Permit {
 }
 
 impl sb_web::ProbeSource for WebProbe {
-    fn probe(&self, req_json: &str) -> Result<String, sb_web::Busy> {
-        let _permit = Permit::acquire(&self.inflight).ok_or(sb_web::Busy)?;
+    fn probe<'a>(&'a self, req_json: &'a str) -> sb_web::ProbeFut<'a> {
+        Box::pin(async move {
+            let _permit = Permit::acquire(&self.inflight).ok_or(sb_web::Busy)?;
 
-        if is_udp_req(req_json) {
-            return Ok(self.probe_udp());
-        }
-        Ok(sb_ppgw::probe::run_json(req_json, &self.proxy))
+            if is_udp_req(req_json) {
+
+                let (addr, enabled) = (self.socks_addr, self.udp_enabled);
+                return Ok(
+                    tokio::task::spawn_blocking(move || probe_udp(addr, enabled))
+                        .await
+                        .unwrap_or_else(|_| {
+                            r#"{"ok":true,"status":200,"body":"udp=2\nerr=probe task failed","ms":0}"#
+                                .to_string()
+                        }),
+                );
+            }
+            Ok(sb_ppgw::probe::run_json(req_json, &self.proxy).await)
+        })
     }
 
-    fn probe_relaxed(&self, req_json: &str) -> Result<String, sb_web::Busy> {
-        let _permit = Permit::acquire(&self.inflight).ok_or(sb_web::Busy)?;
-        Ok(sb_ppgw::probe::run_json_relaxed(req_json, &self.proxy))
+    fn probe_relaxed<'a>(&'a self, req_json: &'a str) -> sb_web::ProbeFut<'a> {
+        Box::pin(async move {
+            let _permit = Permit::acquire(&self.inflight).ok_or(sb_web::Busy)?;
+            Ok(sb_ppgw::probe::run_json_relaxed(req_json, &self.proxy).await)
+        })
     }
 }
 
@@ -119,12 +133,13 @@ mod tests {
         assert!(Permit::acquire(&p.inflight).is_some());
     }
 
-    #[test]
-    fn denied_request_never_touches_the_proxy() {
+    #[tokio::test]
+    async fn denied_request_never_touches_the_proxy() {
 
         let p = WebProbe::new(false);
         let out = p
             .probe(r#"{"url":"http://127.0.0.1/admin"}"#)
+            .await
             .expect("has quota");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], false);
@@ -155,10 +170,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn udp_probe_short_circuits_when_udp_disabled() {
+    #[tokio::test]
+    async fn udp_probe_short_circuits_when_udp_disabled() {
         let p = WebProbe::new(false);
-        let out = p.probe(r#"{"udp":true}"#).expect("has quota");
+        let out = p.probe(r#"{"udp":true}"#).await.expect("has quota");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["body"], "udp=0");
@@ -169,10 +184,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn udp_probe_failure_is_encoded_in_body_not_ok_false() {
+    #[tokio::test]
+    async fn udp_probe_failure_is_encoded_in_body_not_ok_false() {
         let p = WebProbe::new(true);
-        let out = p.probe(r#"{"udp":true}"#).expect("has quota");
+        let out = p.probe(r#"{"udp":true}"#).await.expect("has quota");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true, "failure must not surface as ok:false");
         let body = v["body"].as_str().unwrap();

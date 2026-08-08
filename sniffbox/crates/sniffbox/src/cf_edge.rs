@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::cf_ctl::Egress;
+use crate::config::Protocol;
 
 pub const EDGE_PORT: u16 = 7844;
 
@@ -12,7 +13,18 @@ pub const PICK: usize = 4;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 
+const PROBE_TIMEOUT_PROXIED: Duration = Duration::from_millis(3000);
+
 const ROUND_BUDGET: Duration = Duration::from_secs(8);
+
+const ROUND_BUDGET_PROXIED: Duration = Duration::from_secs(15);
+
+fn round_budget(egress: Egress) -> Duration {
+    match egress {
+        Egress::Direct => ROUND_BUDGET,
+        Egress::Proxied => ROUND_BUDGET_PROXIED,
+    }
+}
 
 const CONCURRENCY: usize = 8;
 
@@ -57,11 +69,45 @@ pub struct EdgeRtt {
     pub quic: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMode {
+
+    Auto,
+
+    QuicOnly,
+
+    TcpOnly,
+}
+
+impl EdgeMode {
+
+    pub fn for_protocol(p: Protocol) -> Self {
+        match p {
+            Protocol::Quic => Self::QuicOnly,
+            Protocol::Http2 => Self::TcpOnly,
+        }
+    }
+}
+
 pub async fn pick_edges(egress: Egress) -> Vec<EdgeRtt> {
+    pick_edges_mode(egress, EdgeMode::Auto).await
+}
+
+pub async fn pick_edges_proto(egress: Egress, proto: Protocol) -> Vec<EdgeRtt> {
+    if egress == Egress::Proxied && proto == Protocol::Http2 {
+        let by_quic = pick_edges_mode(egress, EdgeMode::QuicOnly).await;
+        if !by_quic.is_empty() {
+            return by_quic;
+        }
+    }
+    pick_edges_mode(egress, EdgeMode::for_protocol(proto)).await
+}
+
+pub async fn pick_edges_mode(egress: Egress, mode: EdgeMode) -> Vec<EdgeRtt> {
     let started = Instant::now();
     let builtin = builtin_candidates();
-    let mut best = measure(egress, builtin.clone()).await;
-    if best.is_empty() && started.elapsed() < ROUND_BUDGET {
+    let mut best = measure(egress, builtin.clone(), mode).await;
+    if best.is_empty() && started.elapsed() < round_budget(egress) {
 
         let tried: BTreeSet<IpAddr> = builtin.iter().copied().collect();
         let fresh: Vec<IpAddr> = discover_edges(egress)
@@ -81,7 +127,7 @@ pub async fn pick_edges(egress: Egress) -> Vec<EdgeRtt> {
                 n = fresh.len(),
                 "cf edge: builtin list unreachable; probing newly discovered addresses"
             );
-            best = measure(egress, fresh).await;
+            best = measure(egress, fresh, mode).await;
         }
     }
     best.sort_by_key(|e| e.rtt);
@@ -124,9 +170,12 @@ fn builtin_candidates() -> Vec<IpAddr> {
         .collect()
 }
 
-async fn measure(egress: Egress, candidates: Vec<IpAddr>) -> Vec<EdgeRtt> {
+async fn measure(egress: Egress, candidates: Vec<IpAddr>, mode: EdgeMode) -> Vec<EdgeRtt> {
+    if mode == EdgeMode::TcpOnly {
+        return measure_with(egress, &candidates, false).await;
+    }
     let quic = measure_with(egress, &candidates, true).await;
-    if !quic.is_empty() {
+    if !quic.is_empty() || mode == EdgeMode::QuicOnly {
         return quic;
     }
     tracing::debug!(
@@ -136,9 +185,41 @@ async fn measure(egress: Egress, candidates: Vec<IpAddr>) -> Vec<EdgeRtt> {
     measure_with(egress, &candidates, false).await
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EdgeRtts {
+    pub quic: Option<Duration>,
+    pub http2: Option<Duration>,
+}
+
+impl EdgeRtts {
+
+    pub fn reference_ms(&self) -> u128 {
+        [self.http2, self.quic]
+            .into_iter()
+            .flatten()
+            .map(|d| d.as_millis())
+            .find(|&ms| ms > 0)
+            .unwrap_or(0)
+    }
+}
+
+pub async fn edge_rtts(egress: Egress) -> EdgeRtts {
+    let quic = pick_edges_mode(egress, EdgeMode::QuicOnly)
+        .await
+        .first()
+        .map(|e| e.rtt);
+
+    let http2 = pick_edges_mode(egress, EdgeMode::TcpOnly)
+        .await
+        .first()
+        .map(|e| e.rtt)
+        .filter(|d| !d.is_zero());
+    EdgeRtts { quic, http2 }
+}
+
 async fn measure_with(egress: Egress, candidates: &[IpAddr], quic: bool) -> Vec<EdgeRtt> {
     let mut out = Vec::new();
-    let deadline = Instant::now() + ROUND_BUDGET;
+    let deadline = Instant::now() + round_budget(egress);
     for chunk in candidates.chunks(CONCURRENCY) {
         if Instant::now() >= deadline {
             break;
@@ -184,13 +265,23 @@ async fn probe_tcp(egress: Egress, dst: SocketAddr) -> Option<Duration> {
                 .ok()?;
         }
         Egress::Proxied => {
-            let mut s =
-                tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(HEALTH_SOCKS5))
-                    .await
-                    .ok()?
-                    .ok()?;
+            let mut s = tokio::time::timeout(
+                PROBE_TIMEOUT_PROXIED,
+                tokio::net::TcpStream::connect(HEALTH_SOCKS5),
+            )
+            .await
+            .ok()?
+            .ok()?;
+
             tokio::time::timeout(
-                PROBE_TIMEOUT,
+                PROBE_TIMEOUT_PROXIED,
+                sb_outbound::socks5::handshake_no_auth(&mut s),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            tokio::time::timeout(
+                PROBE_TIMEOUT_PROXIED,
                 sb_outbound::socks5::send_connect(&mut s, dst, None),
             )
             .await
@@ -247,13 +338,15 @@ async fn udp_roundtrip_direct(dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>
 }
 
 async fn udp_roundtrip_socks5(dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    let mut ctrl =
-        tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(HEALTH_SOCKS5))
-            .await
-            .ok()?
-            .ok()?;
+    let mut ctrl = tokio::time::timeout(
+        PROBE_TIMEOUT_PROXIED,
+        tokio::net::TcpStream::connect(HEALTH_SOCKS5),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let relay = tokio::time::timeout(
-        PROBE_TIMEOUT,
+        PROBE_TIMEOUT_PROXIED,
         sb_outbound::socks5_udp::udp_associate(&mut ctrl, "0.0.0.0:0".parse().ok()?),
     )
     .await
@@ -264,7 +357,7 @@ async fn udp_roundtrip_socks5(dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>
     let frame = sb_outbound::socks5_udp::encode_udp_request(dst, payload);
     sock.send_to(&frame, relay).await.ok()?;
     let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(PROBE_TIMEOUT, sock.recv(&mut buf))
+    let n = tokio::time::timeout(PROBE_TIMEOUT_PROXIED, sock.recv(&mut buf))
         .await
         .ok()?
         .ok()?;
@@ -297,6 +390,17 @@ async fn discover_edges(egress: Egress) -> Vec<IpAddr> {
         }
     }
     seen.into_iter().collect()
+}
+
+pub async fn resolve_a(egress: Egress, host: &str) -> Option<IpAddr> {
+    for (server, via) in dns_plan(egress) {
+        if let Some(ips) = dns_a(server, via, host).await
+            && let Some(ip) = ips.first()
+        {
+            return Some(*ip);
+        }
+    }
+    None
 }
 
 fn dns_plan(egress: Egress) -> [(&'static str, Egress); 2] {
@@ -360,6 +464,63 @@ mod tests {
 
         let uniq: BTreeSet<_> = ips.iter().collect();
         assert_eq!(uniq.len(), ips.len());
+    }
+
+    #[test]
+    fn edge_mode_follows_the_protocol() {
+        assert_eq!(EdgeMode::for_protocol(Protocol::Quic), EdgeMode::QuicOnly);
+        assert_eq!(EdgeMode::for_protocol(Protocol::Http2), EdgeMode::TcpOnly);
+    }
+
+    #[test]
+    fn http2_over_the_proxy_borrows_the_quic_ranking() {
+
+        assert_eq!(EdgeMode::for_protocol(Protocol::Http2), EdgeMode::TcpOnly);
+        assert_eq!(EdgeMode::for_protocol(Protocol::Quic), EdgeMode::QuicOnly);
+
+        let borrows = |e: Egress, p: Protocol| e == Egress::Proxied && p == Protocol::Http2;
+        assert!(borrows(Egress::Proxied, Protocol::Http2));
+        assert!(!borrows(Egress::Proxied, Protocol::Quic));
+        assert!(!borrows(Egress::Direct, Protocol::Http2));
+        assert!(!borrows(Egress::Direct, Protocol::Quic));
+
+        let src = include_str!("cf_edge.rs");
+        let body = src
+            .split("pub async fn pick_edges_proto")
+            .nth(1)
+            .expect("pick_edges_proto exists");
+        assert!(
+            body.contains("egress == Egress::Proxied && proto == Protocol::Http2"),
+            "the borrow condition moved; update this test"
+        );
+    }
+
+    #[test]
+    fn the_proxied_path_gets_a_longer_budget() {
+        assert!(PROBE_TIMEOUT_PROXIED > PROBE_TIMEOUT);
+        assert_eq!(round_budget(Egress::Direct), ROUND_BUDGET);
+        assert_eq!(round_budget(Egress::Proxied), ROUND_BUDGET_PROXIED);
+        let batches = BUILTIN_V4.len().div_ceil(CONCURRENCY) as u32;
+        assert!(
+            ROUND_BUDGET_PROXIED >= PROBE_TIMEOUT_PROXIED * batches,
+            "the budget must fit every batch, else the last one is silently dropped"
+        );
+        assert!(ROUND_BUDGET >= PROBE_TIMEOUT * batches);
+    }
+
+    #[test]
+    fn edge_rtts_reference_prefers_the_tcp_handshake() {
+        let both = EdgeRtts {
+            quic: Some(Duration::from_millis(20)),
+            http2: Some(Duration::from_millis(30)),
+        };
+        assert_eq!(both.reference_ms(), 30);
+        let quic_only = EdgeRtts {
+            quic: Some(Duration::from_millis(20)),
+            http2: None,
+        };
+        assert_eq!(quic_only.reference_ms(), 20);
+        assert_eq!(EdgeRtts::default().reference_ms(), 0);
     }
 
     #[test]
@@ -444,7 +605,7 @@ mod tests {
     async fn measure_unreachable_returns_empty_within_budget() {
         let dead: Vec<IpAddr> = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
         let t0 = Instant::now();
-        let got = measure(Egress::Direct, dead).await;
+        let got = measure(Egress::Direct, dead, EdgeMode::Auto).await;
         assert!(got.is_empty());
         assert!(
             t0.elapsed() < ROUND_BUDGET + Duration::from_secs(2),

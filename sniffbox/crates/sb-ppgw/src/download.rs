@@ -1,6 +1,6 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use crate::httpcli::{HttpErr, UA_DOWNLOAD, agent, agent_with_ip};
+use crate::httpcli::{self, HttpErr};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
@@ -8,6 +8,8 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 const MAX_RACE_IPS: usize = 16;
+
+const MAX_BODY: u64 = 64 * 1024 * 1024;
 
 fn log_get(msg: &str) {
     let _ = writeln!(
@@ -66,23 +68,31 @@ impl Downloader {
     }
 
     pub fn via_proxy(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
+        crate::rt::block_on(self.via_proxy_async(proxy))
+    }
+
+    pub async fn via_proxy_async(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
         log_get(&format!("GET {} (via {proxy})", self.url));
-        self.attempt(proxy)
+        self.attempt(proxy).await
     }
 
     pub fn download(&self) -> Result<SubInfo, HttpErr> {
+        crate::rt::block_on(self.download_async())
+    }
+
+    pub async fn download_async(&self) -> Result<SubInfo, HttpErr> {
         let ipv6 = crate::dnsutil::ipv6_enabled();
         let host = crate::dnsutil::url_hostname(&self.url);
         log_get(&format!("GET {} (host={host})", self.url));
 
         if host.parse::<IpAddr>().is_ok() {
             log_get(&format!("host is IP literal: {host}"));
-            return self.attempt("");
+            return self.attempt("").await;
         }
 
         if let Some(ip) = crate::dnsutil::lookup_hosts(&host, ipv6) {
             log_get(&format!("/etc/hosts: {host} -> {ip}"));
-            if let Some(info) = self.race_download(&[ip]) {
+            if let Some(info) = self.race_download(&[ip]).await {
                 return Ok(info);
             }
         }
@@ -94,7 +104,7 @@ impl Downloader {
                 servers.push(s);
             }
         }
-        if let Some(info) = self.resolve_and_race(&host, &servers, ipv6, "dns") {
+        if let Some(info) = self.resolve_and_race(&host, &servers, ipv6, "dns").await {
             return Ok(info);
         }
         if self.best_effort {
@@ -104,13 +114,15 @@ impl Downloader {
 
         let fb = crate::fallback::servers(&servers);
         if !fb.is_empty()
-            && let Some(info) = self.resolve_and_race(&host, &fb, ipv6, "fallback dns")
+            && let Some(info) = self
+                .resolve_and_race(&host, &fb, ipv6, "fallback dns")
+                .await
         {
             return Ok(info);
         }
 
         log_get("Trying Socks5 Proxy 127.0.0.1:1080...");
-        match self.attempt("socks5h://127.0.0.1:1080") {
+        match self.attempt("socks5h://127.0.0.1:1080").await {
             Ok(info) => {
                 log_get("OK via Socks5");
                 Ok(info)
@@ -122,7 +134,7 @@ impl Downloader {
         }
     }
 
-    fn resolve_and_race(
+    async fn resolve_and_race(
         &self,
         host: &str,
         servers: &[SocketAddr],
@@ -132,7 +144,13 @@ impl Downloader {
         if servers.is_empty() {
             return None;
         }
-        let ips = resolve_concurrent(host, servers, ipv6);
+
+        let ips = {
+            let (host, servers) = (host.to_string(), servers.to_vec());
+            tokio::task::spawn_blocking(move || resolve_concurrent(&host, &servers, ipv6))
+                .await
+                .unwrap_or_default()
+        };
         if ips.is_empty() {
             log_get_warn(&format!(
                 "{tag}: no answer from {} server(s)",
@@ -145,15 +163,13 @@ impl Downloader {
             servers.len(),
             fmt_ips(&ips)
         ));
-        self.race_download(&ips)
+        self.race_download(&ips).await
     }
 
-    fn race_download(&self, ips: &[IpAddr]) -> Option<SubInfo> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, mpsc};
+    async fn race_download(&self, ips: &[IpAddr]) -> Option<SubInfo> {
 
         if let [ip] = ips {
-            return match fetch(&self.url, agent_with_ip(*ip, UA_DOWNLOAD, self.timeout)) {
+            return match fetch(&self.url, *ip, self.timeout).await {
                 Ok((body, userinfo)) => self.finish(*ip, &body, userinfo, 1),
                 Err(e) => {
                     log_get_warn(&format!("{ip} failed: {e}"));
@@ -163,29 +179,23 @@ impl Downloader {
         }
 
         let n = ips.len();
-        let (tx, rx) = mpsc::channel::<(IpAddr, Result<(Vec<u8>, Option<String>), String>)>();
-        let done = Arc::new(AtomicBool::new(false));
+        let mut set = tokio::task::JoinSet::new();
         for &ip in ips {
-            let tx = tx.clone();
-            let done = Arc::clone(&done);
-            let url = self.url.clone();
-            let timeout = self.timeout;
-            std::thread::spawn(move || {
-                if done.load(Ordering::Relaxed) {
-                    return;
-                }
-                let res =
-                    fetch(&url, agent_with_ip(ip, UA_DOWNLOAD, timeout)).map_err(|e| e.to_string());
-                let _ = tx.send((ip, res));
+            let (url, timeout) = (self.url.clone(), self.timeout);
+            set.spawn(async move {
+                (
+                    ip,
+                    fetch(&url, ip, timeout).await.map_err(|e| e.to_string()),
+                )
             });
         }
-        drop(tx);
 
         let mut fails = 0usize;
-        while let Ok((ip, res)) = rx.recv() {
+        while let Some(joined) = set.join_next().await {
+            let Ok((ip, res)) = joined else { continue };
             match res {
                 Ok((body, userinfo)) => {
-                    done.store(true, Ordering::Relaxed);
+                    set.abort_all();
                     return self.finish(ip, &body, userinfo, n);
                 }
                 Err(e) => {
@@ -222,21 +232,40 @@ impl Downloader {
         }
     }
 
-    fn attempt(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
-        let agent = agent(proxy, UA_DOWNLOAD, self.timeout)?;
-        let (body, userinfo) = fetch(&self.url, agent)?;
+    async fn attempt(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
+        let mut rb = httpcli::insecure_client().get(&self.url);
+        if let Some(p) = httpcli::proxy_for(proxy)? {
+            rb = rb.proxy(p);
+        }
+        let (body, userinfo) = send(rb, &self.url, self.timeout).await?;
         std::fs::write(&self.output, &body)?;
         Ok(SubInfo { userinfo })
     }
 }
 
-fn fetch(url: &str, agent: ureq::Agent) -> Result<(Vec<u8>, Option<String>), HttpErr> {
-    let mut req = agent.get(url);
+async fn fetch(
+    url: &str,
+    ip: IpAddr,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Option<String>), HttpErr> {
+    let client = httpcli::client_for_ips(vec![ip]);
+    send(client.get(url), url, timeout).await
+}
+
+async fn send(
+    rb: wreq::RequestBuilder,
+    url: &str,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Option<String>), HttpErr> {
+    let mut rb = httpcli::download_identity(rb).timeout(timeout);
 
     if paopao_host_override(url) {
-        req = req.header("Host", "paopao.dns");
+        rb = rb.header("Host", "paopao.dns");
     }
-    let mut resp = req.call().map_err(|e| HttpErr::Request(e.to_string()))?;
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| HttpErr::Request(e.to_string()))?;
     let code = resp.status().as_u16();
     if code >= 400 {
         return Err(HttpErr::Request(format!("status {code}")));
@@ -246,12 +275,10 @@ fn fetch(url: &str, agent: ureq::Agent) -> Result<(Vec<u8>, Option<String>), Htt
         .get("subscription-userinfo")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    let body = resp
-        .body_mut()
-        .with_config()
-        .limit(64 * 1024 * 1024)
-        .read_to_vec()
-        .map_err(|e| HttpErr::Request(e.to_string()))?;
+    let (body, truncated) = httpcli::read_body_bounded(resp, MAX_BODY).await?;
+    if truncated {
+        return Err(HttpErr::Request(format!("body exceeds {MAX_BODY} bytes")));
+    }
     Ok((body, userinfo))
 }
 
@@ -421,7 +448,7 @@ mod tests {
 
         let dead: IpAddr = "127.0.0.9".parse().unwrap();
         let alive: IpAddr = "127.0.0.2".parse().unwrap();
-        let info = dl.race_download(&[dead, alive]);
+        let info = crate::rt::block_on(dl.race_download(&[dead, alive]));
         let _ = srv.join();
 
         assert!(info.is_some(), "should race to a usable IP");

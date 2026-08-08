@@ -19,10 +19,14 @@ hex        = { workspace = true }
 yaml-rust2 = { workspace = true }
 sb-dns     = { workspace = true }
 sb-outbound = { workspace = true }
-ureq       = { workspace = true }
+wreq       = { workspace = true }
+wreq-util  = { workspace = true }
 regex-lite = { workspace = true }
 time       = { workspace = true }
-rustls     = { workspace = true }
+btls       = { workspace = true }
+tokio-btls = { workspace = true }
+tokio      = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

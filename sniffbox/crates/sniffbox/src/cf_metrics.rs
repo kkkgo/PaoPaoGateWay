@@ -6,6 +6,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::config::Protocol;
+
 const TIMEOUT: Duration = Duration::from_millis(800);
 
 const MAX_BODY: usize = 256 * 1024;
@@ -367,6 +369,26 @@ fn summarize(
     })
 }
 
+pub fn metrics_text(addr: SocketAddr) -> Option<String> {
+    http_get(addr, "/metrics").map(|(_, body)| body)
+}
+
+pub fn ready(addr: SocketAddr) -> Option<u64> {
+    ready_connections(addr)
+}
+
+pub fn running_protocol(addr: SocketAddr) -> Option<Protocol> {
+    protocol_of(&diag_tunnel(addr)?)
+}
+
+fn protocol_of(d: &DiagTunnel) -> Option<Protocol> {
+    let c = d.connections.iter().find(|c| c.is_connected)?;
+    Some(match c.protocol {
+        1 => Protocol::Quic,
+        _ => Protocol::Http2,
+    })
+}
+
 pub struct DiagTunnel {
     pub tunnel_id: String,
     pub connector_id: String,
@@ -587,6 +609,39 @@ go_threads 9
             summarize(&wrong, None, None)["register"]["success"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn running_protocol_reads_the_omitempty_field() {
+        assert_eq!(protocol_of(&diag()), Some(Protocol::Quic));
+
+        let http2: serde_json::Value = serde_json::from_str(
+            r#"{"connections":[{"isConnected":true,"edgeAddress":"198.41.192.7"}]}"#,
+        )
+        .unwrap();
+        let d = DiagTunnel {
+            tunnel_id: String::new(),
+            connector_id: String::new(),
+            connections: http2["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| DiagConn {
+                    index: 0,
+                    edge_address: c["edgeAddress"].as_str().unwrap().to_string(),
+                    protocol: c.get("protocol").and_then(|x| x.as_u64()).unwrap_or(0),
+                    is_connected: c["isConnected"].as_bool().unwrap(),
+                })
+                .collect(),
+        };
+        assert_eq!(protocol_of(&d), Some(Protocol::Http2));
+
+        let empty = DiagTunnel {
+            tunnel_id: String::new(),
+            connector_id: String::new(),
+            connections: Vec::new(),
+        };
+        assert_eq!(protocol_of(&empty), None);
     }
 
     #[test]

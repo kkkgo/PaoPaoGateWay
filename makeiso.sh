@@ -10,13 +10,13 @@ if [ -f "$builddir""/sha.txt" ]; then
 fi
 
 rm -f "$builddir"/FILES/usr/bin/sniffbox
-docker pull rust:alpine
+docker pull rust:bookworm
 docker run --rm --name rustbuilder \
     -e SNIFFBOX_VERSION="$ppgwver" \
     -v "$builddir"/FILES/usr/bin/:/app/ \
     -v "$builddir"/buildbox.sh:/sh/buildbox.sh \
     -v "$builddir"/sniffbox:/box \
-    rust:alpine sh /sh/buildbox.sh
+    rust:bookworm bash /sh/buildbox.sh
 if [ -f "$builddir""/FILES/usr/bin/sniffbox" ]; then
     echo "sniffbox compilation OK."
 else

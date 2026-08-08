@@ -337,9 +337,78 @@ pub struct CloudflaredCfg {
 
     pub proxy: CfProxyMode,
 
+    pub protocol: CfProtocol,
+
     pub tproxy: Option<SocketAddr>,
 
     pub tproxy6: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Quic,
+    Http2,
+}
+
+impl Protocol {
+    pub const ALL: [Protocol; 2] = [Protocol::Quic, Protocol::Http2];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quic => "quic",
+            Self::Http2 => "http2",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "quic" | "udp" | "h3" => Some(Self::Quic),
+            "http2" | "h2" | "tcp" => Some(Self::Http2),
+            _ => None,
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Quic => Self::Http2,
+            Self::Http2 => Self::Quic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CfProtocol {
+    #[default]
+    Auto,
+    Fixed(Protocol),
+}
+
+impl CfProtocol {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "auto" | "" | "adaptive" | "best") {
+            return Some(Self::Auto);
+        }
+        Protocol::parse(&s).map(Self::Fixed)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fixed(p) => p.as_str(),
+        }
+    }
+
+    pub fn adaptive(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn initial(self) -> Protocol {
+        match self {
+            Self::Auto => Protocol::Quic,
+            Self::Fixed(p) => p,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -845,6 +914,16 @@ fn parse_cloudflared(sec: Option<&Section>) -> Result<CloudflaredCfg, ConfigErr>
             ),
         }
     }
+    if let Some(v) = get(sec, "protocol") {
+        match CfProtocol::parse(v) {
+            Some(p) => c.protocol = p,
+            None => tracing::warn!(
+                value = v,
+                default = c.protocol.as_str(),
+                "cloudflared: unknown cf_protocol value (want quic|http2|auto); using default"
+            ),
+        }
+    }
     if let Some(v) = get(sec, "tproxy") {
         c.tproxy = Some(parse_socket("cloudflared", "tproxy", v)?);
     }
@@ -1130,6 +1209,47 @@ mod tests {
         assert_eq!(OutboundMode::parse("whatever"), OutboundMode::Free);
         assert!(OutboundMode::Yaml.via_clash() && OutboundMode::Suburl.via_clash());
         assert!(!OutboundMode::Free.via_clash() && !OutboundMode::Socks5.via_clash());
+    }
+
+    #[test]
+    fn cf_protocol_parse() {
+        assert_eq!(CfProtocol::parse("auto"), Some(CfProtocol::Auto));
+        assert_eq!(CfProtocol::parse(""), Some(CfProtocol::Auto));
+        assert_eq!(
+            CfProtocol::parse(" QUIC "),
+            Some(CfProtocol::Fixed(Protocol::Quic))
+        );
+        assert_eq!(
+            CfProtocol::parse("http2"),
+            Some(CfProtocol::Fixed(Protocol::Http2))
+        );
+        assert_eq!(CfProtocol::parse("http3"), None);
+        assert!(CfProtocol::Auto.adaptive());
+        assert!(!CfProtocol::Fixed(Protocol::Quic).adaptive());
+
+        assert_eq!(CfProtocol::Auto.initial(), Protocol::Quic);
+        assert_eq!(
+            CfProtocol::Fixed(Protocol::Http2).initial(),
+            Protocol::Http2
+        );
+        assert_eq!(Protocol::Quic.other(), Protocol::Http2);
+    }
+
+    #[test]
+    fn cloudflared_section_parse() {
+        let ini =
+            parse_ini("[cloudflared]\ntoken = eyJhIjoi\nproxy = both\nprotocol = http2\n").unwrap();
+        let c = Config::from_ini(ini).unwrap().cloudflared;
+        assert_eq!(c.token.as_deref(), Some("eyJhIjoi"));
+        assert_eq!(c.proxy, CfProxyMode::Both);
+        assert_eq!(c.protocol, CfProtocol::Fixed(Protocol::Http2));
+    }
+
+    #[test]
+    fn cloudflared_bad_protocol_is_not_fatal() {
+        let ini = parse_ini("[cloudflared]\nprotocol = h4\n").unwrap();
+        let c = Config::from_ini(ini).unwrap().cloudflared;
+        assert_eq!(c.protocol, CfProtocol::Auto);
     }
 
     #[test]

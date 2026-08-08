@@ -5,6 +5,9 @@ cd "$(dirname "$0")"
 TARGET="${TARGET:-x86_64-unknown-linux-musl}"
 PROFILE="${PROFILE:-release}"
 
+echo ">>> cargo update"
+cargo update
+
 echo ">>> cargo test --workspace --locked (gate: build aborts on failure)"
 cargo test --workspace --locked
 

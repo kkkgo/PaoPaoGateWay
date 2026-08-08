@@ -372,31 +372,16 @@ async fn geo_update(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io:
     let Some(src) = cfg.geo.clone() else {
         return respond::not_found(stream, ka).await;
     };
-    match tokio::task::spawn_blocking(move || src.update()).await {
-        Ok(json) => {
-            respond::send(
-                stream,
-                200,
-                "OK",
-                &[("Content-Type", "application/json")],
-                json.as_bytes(),
-                ka,
-            )
-            .await
-        }
-        Err(e) => {
-            tracing::warn!(%e, "geo update task panicked");
-            respond::send(
-                stream,
-                500,
-                "Internal Server Error",
-                &[("Content-Type", "application/json")],
-                br#"{"error":"geo update failed"}"#,
-                ka,
-            )
-            .await
-        }
-    }
+    let json = src.update().await;
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json")],
+        json.as_bytes(),
+        ka,
+    )
+    .await
 }
 
 async fn serve_static(

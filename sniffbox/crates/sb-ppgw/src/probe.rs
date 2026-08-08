@@ -1,29 +1,18 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
-use ureq::config::Config;
-use ureq::http::Uri;
-use ureq::{Agent, ResponseExt};
+use wreq::Uri;
+use wreq::header::USER_AGENT;
 
-pub const UA_BROWSER: &str =
-    "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0";
+use crate::httpcli;
 
 const DEFAULT_HEADERS: &[(&str, &str)] = &[
-    (
-        "accept",
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    ),
-    ("accept-language", "en-US,en;q=0.9"),
     ("upgrade-insecure-requests", "1"),
-    ("sec-fetch-dest", "document"),
-    ("sec-fetch-mode", "navigate"),
     ("sec-fetch-site", "same-origin"),
     ("sec-fetch-user", "?1"),
-    ("priority", "u=0, i"),
 ];
 
 const MAX_HEADERS: usize = 24;
@@ -35,7 +24,7 @@ const MAX_REQ_BODY: usize = 8 * 1024;
 const MAX_RESP_BODY: u64 = 5 * 1024 * 1024;
 const DEFAULT_RESP_BODY: u64 = 256 * 1024;
 
-const MAX_REDIRECTS: u32 = 5;
+const MAX_REDIRECTS: usize = 5;
 const MIN_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 20_000;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -59,7 +48,8 @@ struct Req {
     url: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
-    ua: String,
+
+    ua: Option<String>,
     follow: bool,
     timeout: Duration,
     max_body: u64,
@@ -74,15 +64,15 @@ enum Method {
     Post,
 }
 
-pub fn run_json(req_json: &str, proxy: &str) -> String {
-    run_json_inner(req_json, proxy, false)
+pub async fn run_json(req_json: &str, proxy: &str) -> String {
+    run_json_inner(req_json, proxy, false).await
 }
 
-pub fn run_json_relaxed(req_json: &str, proxy: &str) -> String {
-    run_json_inner(req_json, proxy, true)
+pub async fn run_json_relaxed(req_json: &str, proxy: &str) -> String {
+    run_json_inner(req_json, proxy, true).await
 }
 
-fn run_json_inner(req_json: &str, proxy: &str, relaxed: bool) -> String {
+async fn run_json_inner(req_json: &str, proxy: &str, relaxed: bool) -> String {
     let req = match serde_json::from_str::<Value>(req_json)
         .map_err(|e| e.to_string())
         .and_then(|v| validate_with(&v, relaxed))
@@ -91,7 +81,7 @@ fn run_json_inner(req_json: &str, proxy: &str, relaxed: bool) -> String {
         Err(e) => return json!({ "ok": false, "denied": true, "error": e }).to_string(),
     };
     let started = Instant::now();
-    match execute(&req, proxy) {
+    match execute(&req, proxy).await {
         Ok(mut v) => {
             v["ms"] = json!(started.elapsed().as_millis() as u64);
             v.to_string()
@@ -142,8 +132,10 @@ fn validate_with(v: &Value, relaxed: bool) -> Result<Req, String> {
         Some(_) => return Err("body must be a string".into()),
     };
 
-    let ua = obj.get("ua").and_then(Value::as_str).unwrap_or(UA_BROWSER);
-    if ua.len() > MAX_UA_LEN || !is_header_value(ua) {
+    let ua = obj.get("ua").and_then(Value::as_str);
+    if let Some(ua) = ua
+        && (ua.len() > MAX_UA_LEN || !is_header_value(ua))
+    {
         return Err("bad ua".into());
     }
 
@@ -163,7 +155,7 @@ fn validate_with(v: &Value, relaxed: bool) -> Result<Req, String> {
         url: url.to_string(),
         headers,
         body,
-        ua: ua.to_string(),
+        ua: ua.map(str::to_string),
         follow: obj.get("follow").and_then(Value::as_bool).unwrap_or(true),
         timeout: Duration::from_millis(timeout_ms),
         max_body,
@@ -328,33 +320,39 @@ fn v6_is_global(a: Ipv6Addr) -> bool {
         || (s[0] == 0x2001 && s[1] == 0xdb8))
 }
 
-fn execute(req: &Req, proxy: &str) -> Result<Value, String> {
-    let agent = build_agent(req, proxy)?;
+async fn execute(req: &Req, proxy: &str) -> Result<Value, String> {
+    let client = httpcli::secure_client();
+    let mut rb = match req.method {
+        Method::Get => client.get(&req.url),
+        Method::Head => client.head(&req.url),
+        Method::Post => client.post(&req.url),
+    };
 
-    let mut resp = match req.method {
-        Method::Get => apply(agent.get(&req.url), req).call(),
-        Method::Head => apply(agent.head(&req.url), req).call(),
-        Method::Post => {
-            let rb = apply(agent.post(&req.url), req);
-            match &req.body {
-                Some(b) => rb.send(b.as_bytes()),
-                None => rb.send_empty(),
-            }
-        }
+    rb = rb.redirect(if req.follow {
+        wreq::redirect::Policy::limited(MAX_REDIRECTS)
+    } else {
+        wreq::redirect::Policy::none()
+    });
+    rb = rb.timeout(req.timeout);
+    if let Some(p) = httpcli::proxy_for(proxy).map_err(|e| e.to_string())? {
+        rb = rb.proxy(p);
     }
-    .map_err(|e| e.to_string())?;
+    rb = apply(rb, req);
+    if let Some(b) = &req.body {
+        rb = rb.body(b.clone());
+    }
+
+    let resp = rb.send().await.map_err(|e| e.to_string())?;
 
     let status = resp.status().as_u16();
-    let final_url = resp.get_uri().to_string();
+
+    let final_url = resp.uri().to_string();
     let (headers, set_cookie) = collect_headers(resp.headers());
 
-    let mut buf = Vec::new();
-    resp.body_mut()
-        .as_reader()
-        .take(req.max_body + 1)
-        .read_to_end(&mut buf)
+    let (mut buf, over) = httpcli::read_body_bounded(resp, req.max_body + 1)
+        .await
         .map_err(|e| e.to_string())?;
-    let truncated = buf.len() as u64 > req.max_body;
+    let truncated = over || buf.len() as u64 > req.max_body;
     buf.truncate(req.max_body as usize);
 
     let (body, encoding) = if req.binary {
@@ -375,23 +373,7 @@ fn execute(req: &Req, proxy: &str) -> Result<Value, String> {
     }))
 }
 
-fn build_agent(req: &Req, proxy: &str) -> Result<Agent, String> {
-    let redirects = if req.follow { MAX_REDIRECTS } else { 0 };
-    let mut b = Config::builder()
-        .http_status_as_error(false)
-        .max_redirects(redirects)
-
-        .max_redirects_will_error(false)
-        .save_redirect_history(true)
-        .timeout_global(Some(req.timeout))
-        .user_agent(req.ua.clone());
-    if !proxy.is_empty() {
-        b = b.proxy(Some(ureq::Proxy::new(proxy).map_err(|e| e.to_string())?));
-    }
-    Ok(b.build().into())
-}
-
-fn apply<T>(mut rb: ureq::RequestBuilder<T>, req: &Req) -> ureq::RequestBuilder<T> {
+fn apply(mut rb: wreq::RequestBuilder, req: &Req) -> wreq::RequestBuilder {
     let has = |name: &str| req.headers.iter().any(|(hk, _)| hk == name);
 
     for (k, v) in DEFAULT_HEADERS {
@@ -400,13 +382,17 @@ fn apply<T>(mut rb: ureq::RequestBuilder<T>, req: &Req) -> ureq::RequestBuilder<
         }
     }
 
-    if !has("referer") {
-        if let Some(origin) = origin_of(&req.url) {
-            rb = rb.header("referer", &origin);
-        }
+    if !has("referer")
+        && let Some(origin) = origin_of(&req.url)
+    {
+        rb = rb.header("referer", &origin);
     }
     for (k, v) in &req.headers {
         rb = rb.header(k, v);
+    }
+
+    if let Some(ua) = &req.ua {
+        rb = rb.header(USER_AGENT, ua);
     }
 
     rb
@@ -419,7 +405,7 @@ fn origin_of(url: &str) -> Option<String> {
     Some(format!("{scheme}://{authority}/"))
 }
 
-fn collect_headers(h: &ureq::http::HeaderMap) -> (Map<String, Value>, Vec<Value>) {
+fn collect_headers(h: &wreq::header::HeaderMap) -> (Map<String, Value>, Vec<Value>) {
     let mut map = Map::new();
     let mut cookies = Vec::new();
     for (name, val) in h.iter() {
@@ -448,7 +434,7 @@ mod tests {
 
     fn denied(json_req: &str) -> String {
 
-        let out = run_json(json_req, "");
+        let out = crate::rt::block_on(run_json(json_req, ""));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], false, "should be rejected: {out}");
         assert_eq!(
@@ -626,7 +612,7 @@ mod tests {
         assert_eq!(r.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
         assert_eq!(r.max_body, DEFAULT_RESP_BODY);
         assert!(r.follow);
-        assert_eq!(r.ua, UA_BROWSER);
+        assert_eq!(r.ua, None, "no `ua` field => emulation Chrome UA");
     }
 
     #[test]
@@ -657,10 +643,10 @@ mod tests {
 
     #[test]
     fn bad_json_is_denied_not_panic() {
-        let out = run_json("not json", "");
+        let out = crate::rt::block_on(run_json("not json", ""));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["denied"], true);
-        let out = run_json("[1,2,3]", "");
+        let out = crate::rt::block_on(run_json("[1,2,3]", ""));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["denied"], true);
     }
@@ -707,7 +693,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port}{path}"),
             headers: Vec::new(),
             body: None,
-            ua: UA_BROWSER.into(),
+            ua: None,
             follow: true,
             timeout: Duration::from_secs(5),
             max_body: DEFAULT_RESP_BODY,
@@ -718,7 +704,7 @@ mod tests {
     #[test]
     fn execute_reads_status_headers_cookies_body() {
         let port = spawn_server();
-        let v = execute(&req_to(port, "/ok"), "").unwrap();
+        let v = crate::rt::block_on(execute(&req_to(port, "/ok"), "")).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["status"], 200);
         assert_eq!(v["body"], "hello");
@@ -731,7 +717,7 @@ mod tests {
     #[test]
     fn execute_returns_error_statuses_not_err() {
         let port = spawn_server();
-        let v = execute(&req_to(port, "/teapot"), "").unwrap();
+        let v = crate::rt::block_on(execute(&req_to(port, "/teapot"), "")).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["status"], 418);
     }
@@ -741,7 +727,7 @@ mod tests {
         let port = spawn_server();
         let mut req = req_to(port, "/big");
         req.max_body = 10;
-        let v = execute(&req, "").unwrap();
+        let v = crate::rt::block_on(execute(&req, "")).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["body"], "xxxxxxxxxx");
         assert_eq!(v["truncated"], true);
@@ -750,7 +736,7 @@ mod tests {
     #[test]
     fn execute_follow_toggle() {
         let port = spawn_server();
-        let v = execute(&req_to(port, "/redir"), "").unwrap();
+        let v = crate::rt::block_on(execute(&req_to(port, "/redir"), "")).unwrap();
         assert_eq!(v["status"], 200);
         assert_eq!(
             v["url"],
@@ -760,7 +746,7 @@ mod tests {
 
         let mut req = req_to(port, "/redir");
         req.follow = false;
-        let v = execute(&req, "").unwrap();
+        let v = crate::rt::block_on(execute(&req, "")).unwrap();
         assert_eq!(
             v["status"], 302,
             "follow=false should not follow redirects nor report TooManyRedirects"
@@ -776,32 +762,40 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/echo"),
             headers: vec![("x-trace".into(), "abc".into())],
             body: Some("payload=1".into()),
-            ua: "probe-ua/1".into(),
+            ua: Some("probe-ua/1".into()),
             follow: true,
             timeout: Duration::from_secs(5),
             max_body: DEFAULT_RESP_BODY,
             binary: false,
         };
-        let v = execute(&req, "").unwrap();
+        let v = crate::rt::block_on(execute(&req, "")).unwrap();
         let echo = v["body"].as_str().unwrap().to_ascii_lowercase();
         assert!(echo.starts_with("post /echo"), "{echo}");
         assert!(echo.contains("x-trace: abc"), "{echo}");
         assert!(echo.contains("user-agent: probe-ua/1"), "{echo}");
 
-        assert!(
-            echo.contains("accept-encoding: gzip"),
-            "should advertise gzip for transparent decompression: {echo}"
-        );
+        let ae = echo
+            .lines()
+            .find(|l| l.starts_with("accept-encoding:"))
+            .unwrap_or_else(|| panic!("no accept-encoding header: {echo}"));
+        for enc in ["gzip", "deflate", "br", "zstd"] {
+            assert!(
+                ae.contains(enc),
+                "accept-encoding should advertise {enc} for transparent decompression: {ae}"
+            );
+        }
         assert!(
             !echo.contains("accept-encoding: identity"),
             "should not send identity (bot signature): {echo}"
         );
+
+        assert!(echo.contains("sec-ch-ua-platform:"), "{echo}");
     }
 
     #[test]
     fn execute_defaults_same_origin_referer() {
         let port = spawn_server();
-        let v = execute(&req_to(port, "/echo"), "").unwrap();
+        let v = crate::rt::block_on(execute(&req_to(port, "/echo"), "")).unwrap();
         let echo = v["body"].as_str().unwrap().to_ascii_lowercase();
         assert!(
             echo.contains(&format!("referer: http://127.0.0.1:{port}/")),
@@ -810,7 +804,7 @@ mod tests {
 
         let mut req = req_to(port, "/echo");
         req.headers = vec![("referer".into(), "https://example.com/x".into())];
-        let echo = execute(&req, "").unwrap()["body"]
+        let echo = crate::rt::block_on(execute(&req, "")).unwrap()["body"]
             .as_str()
             .unwrap()
             .to_ascii_lowercase();
@@ -830,7 +824,7 @@ mod tests {
         let port = spawn_server();
         let mut req = req_to(port, "/echo");
         req.headers = vec![("accept-language".into(), "ja-JP".into())];
-        let v = execute(&req, "").unwrap();
+        let v = crate::rt::block_on(execute(&req, "")).unwrap();
         let echo = v["body"].as_str().unwrap().to_ascii_lowercase();
         assert!(
             echo.contains("sec-fetch-mode: navigate"),
@@ -852,10 +846,10 @@ mod tests {
     #[test]
     fn run_json_network_error_is_not_denied() {
 
-        let out = run_json(
+        let out = crate::rt::block_on(run_json(
             &json!({"url":"https://127.0.0.1.nip.io/","timeoutMs":1000}).to_string(),
             "socks5h://127.0.0.1:1",
-        );
+        ));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], false);
         assert!(
@@ -868,7 +862,7 @@ mod tests {
 
     #[test]
     fn collect_headers_merges_dupes_and_splits_cookies() {
-        let mut h = ureq::http::HeaderMap::new();
+        let mut h = wreq::header::HeaderMap::new();
         h.append("x-a", "1".parse().unwrap());
         h.append("x-a", "2".parse().unwrap());
         h.append("set-cookie", "a=1".parse().unwrap());

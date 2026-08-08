@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::ConfigSource;
-use crate::config::{CfProxyMode, OutboundMode};
+use crate::cf_quality::VerdictSource;
+use crate::config::{CfProtocol, CfProxyMode, CloudflaredCfg, OutboundMode, Protocol};
 
 pub const CF_BIN: &str = "/usr/bin/cloudflared";
 
@@ -49,7 +50,7 @@ impl Egress {
         }
     }
 
-    fn idx(self) -> usize {
+    pub(crate) fn idx(self) -> usize {
         match self {
             Egress::Direct => 0,
             Egress::Proxied => 1,
@@ -63,7 +64,7 @@ impl Egress {
         }
     }
 
-    fn home(self) -> &'static str {
+    pub(crate) fn home(self) -> &'static str {
         match self {
             Egress::Proxied => CF_HOME,
             Egress::Direct => CF_HOME_DIRECT,
@@ -129,6 +130,33 @@ const RELOAD_MARKER: &str = "/tmp/ppgw_reload.ts";
 const OVPN_TUN: &str = "tun114";
 
 const CF_RELEASE_BASE: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download/";
+
+const READY_WAIT: Duration = Duration::from_secs(25);
+
+const READY_MISSES: u32 = 3;
+
+const RESCORE_AFTER: Duration = Duration::from_secs(3 * 60);
+
+struct Rung {
+    proto: Protocol,
+
+    pin_edges: bool,
+}
+
+const LADDER: [Rung; 3] = [
+    Rung {
+        proto: Protocol::Quic,
+        pin_edges: true,
+    },
+    Rung {
+        proto: Protocol::Http2,
+        pin_edges: true,
+    },
+    Rung {
+        proto: Protocol::Http2,
+        pin_edges: false,
+    },
+];
 
 const fn cf_asset() -> &'static str {
     if cfg!(target_arch = "aarch64") {
@@ -212,6 +240,49 @@ struct Proc {
     edges: Vec<String>,
 
     note: Option<&'static str>,
+
+    protocol: Option<Protocol>,
+
+    protocol_why: ProtocolWhy,
+
+    ready_misses: u32,
+
+    unready_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProtocolWhy {
+    #[default]
+    Unknown,
+
+    Locked,
+
+    Initial,
+
+    Scored,
+
+    Fallback,
+}
+
+impl From<crate::cf_quality::VerdictSource> for ProtocolWhy {
+    fn from(v: crate::cf_quality::VerdictSource) -> Self {
+        match v {
+            crate::cf_quality::VerdictSource::Scored => Self::Scored,
+            crate::cf_quality::VerdictSource::Fallback => Self::Fallback,
+        }
+    }
+}
+
+impl ProtocolWhy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Locked => "locked",
+            Self::Initial => "initial preference (not scored yet)",
+            Self::Scored => "scored",
+            Self::Fallback => "fallback: the preferred transport would not register",
+        }
+    }
 }
 
 pub struct CfProcStatus {
@@ -228,6 +299,13 @@ pub struct CfProcStatus {
 
     pub edges: Vec<String>,
     pub uid: u32,
+
+    pub protocol: Option<Protocol>,
+    pub protocol_why: ProtocolWhy,
+
+    pub next_probe_min: Option<u64>,
+
+    pub last_round: Option<crate::cf_quality::LastRound>,
 }
 
 pub struct CfStatus {
@@ -235,6 +313,8 @@ pub struct CfStatus {
     pub enabled: bool,
 
     pub proxy_mode: CfProxyMode,
+
+    pub protocol: CfProtocol,
 
     pub binary: bool,
 
@@ -301,7 +381,8 @@ impl CloudflaredSupervisor {
     }
 
     pub fn status(&self) -> CfStatus {
-        let (token, proxy_mode) = self.load_cf_cfg();
+        let cfg = self.load_cf_cfg();
+        let (token, proxy_mode) = (cfg.token, cfg.proxy);
         let enabled = token.is_some();
         let procs = Egress::ALL
             .iter()
@@ -335,6 +416,15 @@ impl CloudflaredSupervisor {
                         metrics: egress.metrics_addr(),
                         edges: p.edges.clone(),
                         uid: egress.uid_gid().0,
+                        protocol: p.protocol,
+                        protocol_why: why_now(p.protocol, p.protocol_why, egress),
+                        next_probe_min: (wanted && cfg.protocol.adaptive())
+                            .then(|| crate::cf_quality::probe_wait(egress).as_secs() / 60),
+                        last_round: cfg
+                            .protocol
+                            .adaptive()
+                            .then(|| crate::cf_quality::last_round(egress))
+                            .flatten(),
                     }
                 })
             })
@@ -342,19 +432,46 @@ impl CloudflaredSupervisor {
         CfStatus {
             enabled,
             proxy_mode,
+            protocol: cfg.protocol,
             binary: Path::new(CF_BIN).is_file(),
             version: Path::new(CF_BIN).is_file().then(cf_version),
             procs,
         }
     }
 
+    pub fn current_protocol(&self, egress: Egress) -> Option<Protocol> {
+        if !self.running(egress) {
+            return None;
+        }
+        self.with_proc(egress, |p| p.protocol)
+    }
+
+    pub fn scoring_wanted(&self, egress: Egress) -> bool {
+        let cfg = self.load_cf_cfg();
+        cfg.token.is_some() && cfg.protocol.adaptive() && want_egress(egress, cfg.proxy, self.mode)
+    }
+
+    pub async fn switch_protocol(self: &Arc<Self>, egress: Egress, proto: Protocol) {
+        crate::cf_quality::remember_verdict(egress, proto, VerdictSource::Scored);
+        let sup = Arc::clone(self);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = sup
+                .start_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sup.kill_one(egress);
+            sup.tick_locked();
+        })
+        .await;
+    }
+
     pub fn restart(&self, which: Option<Egress>) -> Result<usize, &'static str> {
-        let (token, mode) = self.load_cf_cfg();
-        if token.is_none() {
+        let cfg = self.load_cf_cfg();
+        if cfg.token.is_none() {
             return Err("cloudflared_token not configured");
         }
         if let Some(e) = which
-            && !want_egress(e, mode, self.mode)
+            && !want_egress(e, cfg.proxy, self.mode)
         {
             return Err("that replica is disabled in this configuration");
         }
@@ -379,23 +496,31 @@ impl CloudflaredSupervisor {
         Ok(Egress::ALL.iter().filter(|&&e| self.running(e)).count())
     }
 
-    fn load_cf_cfg(&self) -> (Option<String>, CfProxyMode) {
+    fn load_cf_cfg(&self) -> CloudflaredCfg {
         match self.source.load() {
-            Ok(cfg) => (
-                cfg.cloudflared.token.filter(|t| !t.is_empty()),
-                cfg.cloudflared.proxy,
-            ),
+            Ok(cfg) => CloudflaredCfg {
+                token: cfg.cloudflared.token.filter(|t| !t.is_empty()),
+                ..cfg.cloudflared
+            },
             Err(e) => {
                 tracing::debug!(
                     ?e,
                     "cloudflared: config reload failed; treat token as unset"
                 );
-                (None, CfProxyMode::default())
+                CloudflaredCfg {
+                    token: None,
+                    ..Default::default()
+                }
             }
         }
     }
 
-    fn stamp(&self, egress: Egress) -> Option<String> {
+    fn stamp(&self, egress: Egress, cfg: &CloudflaredCfg) -> Option<String> {
+        let base = self.stamp_base(egress)?;
+        Some(stamp_with(&base, self.desired_protocol(egress, cfg)))
+    }
+
+    fn stamp_base(&self, egress: Egress) -> Option<String> {
         let base = match egress {
             Egress::Proxied => self.proxy_stamp()?,
             Egress::Direct => "direct-egress".to_string(),
@@ -404,6 +529,15 @@ impl CloudflaredSupervisor {
             Some(g) => format!("{base}#reload={g}"),
             None => base,
         })
+    }
+
+    fn desired_protocol(&self, egress: Egress, cfg: &CloudflaredCfg) -> Protocol {
+        match cfg.protocol {
+            CfProtocol::Fixed(p) => p,
+            CfProtocol::Auto => crate::cf_quality::fresh_verdict(egress)
+                .map(|(p, _)| p)
+                .unwrap_or_else(|| cfg.protocol.initial()),
+        }
     }
 
     fn proxy_stamp(&self) -> Option<String> {
@@ -435,7 +569,8 @@ impl CloudflaredSupervisor {
     }
 
     fn link_ready(&self, egress: Egress) -> bool {
-        match sb_ppgw::httpcli::check_url_connectivity(READY_URL, egress.proxy_arg(), "0") {
+        match sb_ppgw::httpcli::check_url_connectivity_blocking(READY_URL, egress.proxy_arg(), "0")
+        {
             Ok((ok, _)) => ok,
             Err(e) => {
                 tracing::debug!(
@@ -471,6 +606,13 @@ impl CloudflaredSupervisor {
 
             Err(std::sync::TryLockError::Poisoned(g)) => g.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
+
+                for egress in Egress::ALL {
+                    self.with_proc(egress, |p| {
+                        p.ready_misses = 0;
+                        p.unready_since = None;
+                    });
+                }
                 tracing::debug!("cloudflared: (re)start already in flight; skip this tick");
                 return;
             }
@@ -478,9 +620,64 @@ impl CloudflaredSupervisor {
         self.tick_locked();
     }
 
+    fn ready_watchdog(&self, cfg: &CloudflaredCfg) -> Vec<Egress> {
+        let mut rescore = Vec::new();
+        for egress in Egress::ALL {
+            if !want_egress(egress, cfg.proxy, self.mode) {
+                continue;
+            }
+            let Ok(addr) = egress.metrics_addr().parse() else {
+                continue;
+            };
+            let ready = crate::cf_metrics::ready(addr).unwrap_or(0);
+            if ready >= 1 {
+                self.with_proc(egress, |p| {
+                    p.ready_misses = 0;
+                    p.unready_since = None;
+                });
+                continue;
+            }
+
+            if self.with_proc(egress, |p| p.protocol.is_none()) {
+                continue;
+            }
+            let (misses, down_for) = self.with_proc(egress, |p| {
+                p.ready_misses = p.ready_misses.saturating_add(1);
+                let since = *p.unready_since.get_or_insert_with(Instant::now);
+                (p.ready_misses, since.elapsed())
+            });
+
+            if down_for >= RESCORE_AFTER && cfg.protocol.adaptive() {
+                tracing::warn!(
+                    egress = egress.as_str(),
+                    down_s = down_for.as_secs(),
+                    "tunnel has not registered for a while; re-scoring the transport"
+                );
+                self.kill_one(egress);
+                self.with_proc(egress, |p| {
+                    p.ready_misses = 0;
+                    p.unready_since = None;
+                });
+                rescore.push(egress);
+                continue;
+            }
+            if misses >= READY_MISSES {
+                tracing::warn!(
+                    egress = egress.as_str(),
+                    misses,
+                    "running but no ready edge connection; restarting it"
+                );
+                self.kill_one(egress);
+                self.with_proc(egress, |p| p.ready_misses = 0);
+            }
+        }
+        rescore
+    }
+
     fn tick_locked(&self) {
-        let (token, mode) = self.load_cf_cfg();
-        let Some(token) = token else {
+        let cfg = self.load_cf_cfg();
+        let mode = cfg.proxy;
+        let Some(token) = cfg.token.clone() else {
             for egress in Egress::ALL {
                 if self.running(egress) {
                     tracing::info!(
@@ -492,6 +689,20 @@ impl CloudflaredSupervisor {
             }
             return;
         };
+
+        if !cfg.protocol.adaptive() {
+            for egress in Egress::ALL {
+                crate::cf_quality::forget(egress);
+            }
+        }
+
+        let rescore = self.ready_watchdog(&cfg);
+        for egress in rescore {
+
+            if let Some(winner) = block_on_scoring(egress) {
+                crate::cf_quality::remember_verdict(egress, winner, VerdictSource::Scored);
+            }
+        }
 
         let mut plan: Vec<(Egress, String)> = Vec::new();
         for egress in Egress::ALL {
@@ -508,7 +719,7 @@ impl CloudflaredSupervisor {
                 continue;
             }
 
-            let stamp = self.stamp(egress);
+            let stamp = self.stamp(egress, &cfg);
             let Some(stamp) = stamp else {
                 if self.running(egress) {
                     tracing::warn!(mode = ?self.mode, "proxy engine not ready; stopping proxy replica");
@@ -524,8 +735,13 @@ impl CloudflaredSupervisor {
             if need {
                 plan.push((egress, stamp));
             }
+
         }
         if plan.is_empty() {
+
+            if cfg.protocol.adaptive() && self.started.elapsed() >= STARTUP_GRACE {
+                self.spawn_background_scoring();
+            }
 
             if self.update_due()
                 && self.proxy_chores_possible()
@@ -533,7 +749,7 @@ impl CloudflaredSupervisor {
                 && self.run_update()
             {
                 tracing::info!("cloudflared binary updated; restarting both replicas");
-                self.restart_all_for_update(&token, mode);
+                self.restart_all_for_update(&token, &cfg);
             }
             return;
         }
@@ -579,7 +795,7 @@ impl CloudflaredSupervisor {
             tracing::info!("cloudflared binary changed; both replicas will restart");
             for egress in Egress::ALL {
                 if want_egress(egress, mode, self.mode) && !plan.iter().any(|(e, _)| *e == egress) {
-                    let stamp = self.stamp(egress);
+                    let stamp = self.stamp(egress, &cfg);
                     if let Some(stamp) = stamp {
                         plan.push((egress, stamp));
                     }
@@ -588,72 +804,151 @@ impl CloudflaredSupervisor {
         }
 
         for (egress, stamp) in plan {
-            self.start_replica(egress, &token, stamp);
+            self.start_replica(egress, &token, stamp, cfg.protocol);
+        }
+
+        if cfg.protocol.adaptive() {
+            self.spawn_background_scoring();
         }
     }
 
-    fn restart_all_for_update(&self, token: &str, mode: CfProxyMode) {
+    fn restart_all_for_update(&self, token: &str, cfg: &CloudflaredCfg) {
         for egress in Egress::ALL {
-            if !want_egress(egress, mode, self.mode) {
+            if !want_egress(egress, cfg.proxy, self.mode) {
                 continue;
             }
-            let stamp = self.stamp(egress);
+            let stamp = self.stamp(egress, cfg);
             if let Some(stamp) = stamp {
-                self.start_replica(egress, token, stamp);
+                self.start_replica(egress, token, stamp, cfg.protocol);
             }
         }
     }
 
-    fn start_replica(&self, egress: Egress, token: &str, stamp: String) {
-
-        let edges = block_on_edges(egress);
-        if edges.is_empty() && !self.link_ready(egress) {
-
-            if self.running(egress) {
-                tracing::warn!(
-                    egress = egress.as_str(),
-                    "egress became unusable; stopping replica until it recovers"
-                );
-                self.kill_one(egress);
-            }
-            self.note(egress, "egress cannot reach the internet");
+    fn spawn_background_scoring(&self) {
+        let cfg = self.load_cf_cfg();
+        let wanted: Vec<Egress> = Egress::ALL
+            .into_iter()
+            .filter(|&e| {
+                want_egress(e, cfg.proxy, self.mode)
+                    && crate::cf_quality::fresh_verdict(e).is_none()
+                    && crate::cf_quality::probe_wait(e).is_zero()
+            })
+            .collect();
+        if wanted.is_empty() || tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        if SCORING_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tokio::spawn(async move {
+            for egress in wanted {
+                match crate::cf_quality::pick(egress).await {
+                    Some(winner) => {
+                        tracing::info!(
+                            egress = egress.as_str(),
+                            protocol = winner.as_str(),
+                            "cloudflared: scoring picked a transport"
+                        );
+                        crate::cf_quality::remember_verdict(egress, winner, VerdictSource::Scored);
+                    }
 
-        self.kill_one(egress);
-        let edge_args: Vec<String> = edges
-            .iter()
-            .map(|e| format!("{}:{}", e.ip, crate::cf_edge::EDGE_PORT))
-            .collect();
-        match spawn_cf(token, egress, &edge_args, &self.logs) {
-            Ok(pid) => {
-                let bin_fp = file_fingerprint(CF_BIN);
-                self.with_proc(egress, |p| {
-                    p.pid = Some(pid);
-                    p.token = Some(token.to_string());
-                    p.stamp = Some(stamp);
-                    p.bin_fp = bin_fp;
-                    p.edges = edge_args.clone();
-                    p.note = None;
-                });
-                tracing::info!(
-                    pid,
-                    egress = egress.as_str(),
-                    uid = egress.uid_gid().0,
-                    metrics = egress.metrics_addr(),
-                    edges = %edge_args.join(","),
-                    "spawned cloudflared replica"
-                );
+                    None => tracing::info!(
+                        egress = egress.as_str(),
+                        next_probe_in_min = crate::cf_quality::probe_wait(egress).as_secs() / 60,
+                        "cloudflared: scoring produced no verdict; keeping the current transport"
+                    ),
+                }
             }
-            Err(e) => {
+            SCORING_IN_FLIGHT.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn start_replica(&self, egress: Egress, token: &str, stamp: String, policy: CfProtocol) {
+
+        let base = stamp
+            .split_once("#proto=")
+            .map(|(b, _)| b.to_string())
+            .unwrap_or(stamp);
+        let rungs = ladder_for(policy, crate::cf_quality::fresh_verdict(egress));
+        let last = rungs.len() - 1;
+        for (i, (proto, why, pin_edges)) in rungs.into_iter().enumerate() {
+
+            let edges = if pin_edges {
+                block_on_edges_proto(egress, proto)
+            } else {
+                Vec::new()
+            };
+            if pin_edges && edges.is_empty() && !self.link_ready(egress) {
+
+                if self.running(egress) {
+                    tracing::warn!(
+                        egress = egress.as_str(),
+                        "egress became unusable; stopping replica until it recovers"
+                    );
+                    self.kill_one(egress);
+                }
+                self.note(egress, "egress cannot reach the internet");
+                return;
+            }
+
+            self.kill_one(egress);
+            let edge_args: Vec<String> = edges
+                .iter()
+                .map(|e| format!("{}:{}", e.ip, crate::cf_edge::EDGE_PORT))
+                .collect();
+            let pid = match spawn_cf(token, egress, proto, &edge_args, &self.logs) {
+                Ok(pid) => pid,
+                Err(e) => {
+                    tracing::warn!(
+                        ?e,
+                        egress = egress.as_str(),
+                        bin = CF_BIN,
+                        "spawn cloudflared failed"
+                    );
+                    self.note(egress, "spawn failed");
+                    return;
+                }
+            };
+            let bin_fp = file_fingerprint(CF_BIN);
+            let stamp_now = stamp_with(&base, proto);
+            self.with_proc(egress, |p| {
+                p.pid = Some(pid);
+                p.token = Some(token.to_string());
+                p.stamp = Some(stamp_now);
+                p.bin_fp = bin_fp;
+                p.edges = edge_args.clone();
+                p.protocol = Some(proto);
+                p.protocol_why = why;
+                p.note = None;
+                p.ready_misses = 0;
+                p.unready_since = None;
+            });
+            tracing::info!(
+                pid,
+                egress = egress.as_str(),
+                uid = egress.uid_gid().0,
+                metrics = egress.metrics_addr(),
+                protocol = proto.as_str(),
+                why = why.as_str(),
+                edges = %edge_args.join(","),
+                "spawned cloudflared replica"
+            );
+
+            if policy.adaptive() && i < last && !wait_ready(egress, READY_WAIT) {
                 tracing::warn!(
-                    ?e,
                     egress = egress.as_str(),
-                    bin = CF_BIN,
-                    "spawn cloudflared failed"
+                    protocol = proto.as_str(),
+                    wait_s = READY_WAIT.as_secs(),
+                    "transport did not register; falling back to the next rung"
                 );
-                self.note(egress, "spawn failed");
+                self.kill_one(egress);
+                continue;
             }
+
+            if policy.adaptive() && i > 0 {
+                crate::cf_quality::remember_verdict(egress, proto, VerdictSource::Fallback);
+            }
+            return;
         }
     }
 
@@ -794,9 +1089,75 @@ fn reload_gen() -> Option<String> {
     (!g.is_empty()).then_some(g)
 }
 
-fn block_on_edges(egress: Egress) -> Vec<crate::cf_edge::EdgeRtt> {
+fn why_now(running: Option<Protocol>, at_spawn: ProtocolWhy, egress: Egress) -> ProtocolWhy {
+    let Some(running) = running else {
+        return at_spawn;
+    };
+    match crate::cf_quality::fresh_verdict(egress) {
+        Some((p, src)) if p == running => src.into(),
+        _ => at_spawn,
+    }
+}
+
+static SCORING_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn stamp_with(base: &str, proto: Protocol) -> String {
+    format!("{base}#proto={}", proto.as_str())
+}
+
+fn block_on_scoring(egress: Egress) -> Option<Protocol> {
     match tokio::runtime::Handle::try_current() {
-        Ok(h) => h.block_on(crate::cf_edge::pick_edges(egress)),
+        Ok(h) => h.block_on(crate::cf_quality::pick(egress)),
+        Err(_) => None,
+    }
+}
+
+fn ladder_for(
+    policy: CfProtocol,
+    remembered: Option<(Protocol, crate::cf_quality::VerdictSource)>,
+) -> Vec<(Protocol, ProtocolWhy, bool)> {
+    let CfProtocol::Auto = policy else {
+        return vec![(policy.initial(), ProtocolWhy::Locked, true)];
+    };
+    let skip_quic = remembered.map(|(p, _)| p) == Some(Protocol::Http2);
+    let first_why = match remembered {
+        Some((_, src)) => src.into(),
+        None => ProtocolWhy::Initial,
+    };
+    let mut out = Vec::with_capacity(LADDER.len());
+    for rung in LADDER.iter() {
+        if skip_quic && rung.proto == Protocol::Quic {
+            continue;
+        }
+        let why = if out.is_empty() {
+            first_why
+        } else {
+            ProtocolWhy::Fallback
+        };
+        out.push((rung.proto, why, rung.pin_edges));
+    }
+    out
+}
+
+fn wait_ready(egress: Egress, timeout: Duration) -> bool {
+    let Ok(addr) = egress.metrics_addr().parse() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if crate::cf_metrics::ready(addr).unwrap_or(0) >= 1 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn block_on_edges_proto(egress: Egress, proto: Protocol) -> Vec<crate::cf_edge::EdgeRtt> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => h.block_on(crate::cf_edge::pick_edges_proto(egress, proto)),
         Err(_) => Vec::new(),
     }
 }
@@ -836,7 +1197,7 @@ fn kill_locked(g: &mut Proc) -> bool {
     killed
 }
 
-fn prepare_home(egress: Egress) -> io::Result<()> {
+pub(crate) fn prepare_home(egress: Egress) -> io::Result<()> {
     ensure_passwd_entry(egress);
     let home = egress.home();
     std::fs::create_dir_all(home)?;
@@ -880,7 +1241,7 @@ fn append_line_if_missing(path: &str, prefix: &str, line: &str) {
     let _ = out.write_all(line.as_bytes());
 }
 
-fn chown_cf(path: &str, egress: Egress) -> io::Result<()> {
+pub(crate) fn chown_cf(path: &str, egress: Egress) -> io::Result<()> {
     let (uid, gid) = egress.uid_gid();
     let c = std::ffi::CString::new(path).map_err(|_| io::Error::other("path has NUL"))?;
 
@@ -960,6 +1321,7 @@ fn run_as_cf(
 fn spawn_cf(
     token: &str,
     egress: Egress,
+    proto: Protocol,
     edges: &[String],
     logs: &Arc<sb_web::LineHistory>,
 ) -> io::Result<u32> {
@@ -970,6 +1332,8 @@ fn spawn_cf(
     let mut argv: Vec<String> = vec![
         "tunnel".into(),
         "--no-autoupdate".into(),
+        "--protocol".into(),
+        proto.as_str().into(),
         "--metrics".into(),
         egress.metrics_addr().into(),
     ];
@@ -1023,7 +1387,7 @@ fn pump<R: std::io::Read + Send + 'static>(
                 Ok(_) => {}
             }
             let text = line.trim_end_matches(['\r', '\n']).to_string();
-            if text.is_empty() {
+            if text.is_empty() || is_noise(&text) {
                 continue;
             }
             let text = format!("{tag} {text}");
@@ -1033,7 +1397,13 @@ fn pump<R: std::io::Read + Send + 'static>(
     });
 }
 
-fn drop_to_cf(uid: u32, gid: u32) -> io::Result<()> {
+fn is_noise(line: &str) -> bool {
+    (line.contains("Collection started collector=")
+        || line.contains("Collection finished collector="))
+        && line.contains(" INF ")
+}
+
+pub(crate) fn drop_to_cf(uid: u32, gid: u32) -> io::Result<()> {
 
     unsafe {
         libc::setsid();
@@ -1117,7 +1487,7 @@ fn proc_is_cf(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn find_cf_pids() -> Vec<u32> {
+pub(crate) fn find_cf_pids() -> Vec<u32> {
     let Ok(rd) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -1139,6 +1509,15 @@ pub fn spawn_monitor(
     sup: Arc<CloudflaredSupervisor>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+
+    let reaped = crate::cf_probe::reap_strays();
+    if reaped > 0 {
+        tracing::info!(n = reaped, "cloudflared: reaped leaked probe tunnels");
+    }
+
+    if sup.load_cf_cfg().protocol.adaptive() {
+        crate::cf_quality::spawn_rescoring(Arc::clone(&sup), shutdown.clone());
+    }
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(MONITOR_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1323,7 +1702,10 @@ mod tests {
         std::fs::write(RELOAD_MARKER, "1000000001\n").expect("write marker");
         let first: Vec<String> = Egress::ALL
             .iter()
-            .map(|&e| s.stamp(e).expect("free mode always has a stamp"))
+            .map(|&e| {
+                s.stamp(e, &CloudflaredCfg::default())
+                    .expect("free mode always has a stamp")
+            })
             .collect();
         assert!(
             first.iter().all(|st| st.contains("#reload=1000000001")),
@@ -1333,7 +1715,7 @@ mod tests {
         std::fs::write(RELOAD_MARKER, "1000000002\n").expect("write marker");
         for (i, &e) in Egress::ALL.iter().enumerate() {
             assert_ne!(
-                s.stamp(e).unwrap(),
+                s.stamp(e, &CloudflaredCfg::default()).unwrap(),
                 first[i],
                 "{} must be restamped after a gateway reload",
                 e.as_str()
@@ -1396,10 +1778,174 @@ mod tests {
             "picking edges and spawning must never wait on the proxy; body was:\n{start}"
         );
 
-        assert!(start.contains("block_on_edges(egress)") && start.contains("spawn_cf("));
+        assert!(
+            start.contains("block_on_edges_proto(egress, proto)") && start.contains("spawn_cf(")
+        );
         assert!(
             !start.contains("fn "),
             "extraction must stop at the next fn"
+        );
+    }
+
+    #[test]
+    fn only_the_self_inflicted_diagnostic_chatter_is_filtered() {
+        for noisy in [
+            "2026-08-07T17:50:41Z INF Collection finished collector=tunnelState",
+            "2026-08-07T17:50:42Z INF Collection started collector=tunnelState",
+            "2026-08-07T17:50:42Z INF Collection started collector=systemInformation",
+        ] {
+            assert!(is_noise(noisy), "must be filtered: {noisy}");
+        }
+        for keep in [
+            "2026-08-07T17:46:42Z INF Registered tunnel connection connIndex=0 location=hkg10 protocol=http2",
+            "2026-08-07T17:46:48Z INF precheck complete hard_fail=false suggested_protocol=http2",
+            "2026-08-07T17:46:42Z WRN ICMP proxy feature is disabled",
+            "2026-08-07T17:46:37Z INF Requesting new quick Tunnel on trycloudflare.com...",
+
+            "2026-08-07T17:50:41Z ERR Collection finished collector=tunnelState error=boom",
+        ] {
+            assert!(!is_noise(keep), "must be kept: {keep}");
+        }
+    }
+
+    #[test]
+    fn a_locked_protocol_has_no_ladder() {
+        for p in [Protocol::Quic, Protocol::Http2] {
+            let rungs = ladder_for(CfProtocol::Fixed(p), None);
+            assert_eq!(rungs.len(), 1);
+            assert_eq!(rungs[0].0, p);
+            assert_eq!(rungs[0].1, ProtocolWhy::Locked);
+            assert!(rungs[0].2, "a locked transport still pins its own edges");
+
+            let with_memory = ladder_for(
+                CfProtocol::Fixed(p),
+                Some((p.other(), VerdictSource::Scored)),
+            );
+            assert_eq!(with_memory.len(), 1);
+            assert_eq!(with_memory[0].0, p);
+        }
+    }
+
+    #[test]
+    fn auto_climbs_the_full_ladder_without_memory() {
+        let rungs = ladder_for(CfProtocol::Auto, None);
+        assert_eq!(
+            rungs
+                .iter()
+                .map(|(p, _, pin)| (p.as_str(), *pin))
+                .collect::<Vec<_>>(),
+            vec![("quic", true), ("http2", true), ("http2", false)]
+        );
+        assert_eq!(rungs[0].1, ProtocolWhy::Initial);
+        assert_eq!(rungs[1].1, ProtocolWhy::Fallback);
+        assert_eq!(rungs[2].1, ProtocolWhy::Fallback);
+    }
+
+    #[test]
+    fn a_remembered_http2_skips_the_quic_rung() {
+        let rungs = ladder_for(
+            CfProtocol::Auto,
+            Some((Protocol::Http2, VerdictSource::Scored)),
+        );
+        assert!(
+            rungs.iter().all(|(p, _, _)| *p == Protocol::Http2),
+            "the quic rung must be skipped, got {:?}",
+            rungs.iter().map(|r| r.0.as_str()).collect::<Vec<_>>()
+        );
+
+        let quic = ladder_for(
+            CfProtocol::Auto,
+            Some((Protocol::Quic, VerdictSource::Scored)),
+        );
+        assert_eq!(quic.len(), LADDER.len());
+        assert_eq!(quic[0].0, Protocol::Quic);
+    }
+
+    #[test]
+    fn a_confirmed_verdict_updates_what_the_panel_says() {
+
+        let e = Egress::Proxied;
+        crate::cf_quality::forget(e);
+
+        assert_eq!(
+            why_now(Some(Protocol::Quic), ProtocolWhy::Initial, e),
+            ProtocolWhy::Initial
+        );
+
+        crate::cf_quality::remember_verdict(e, Protocol::Quic, VerdictSource::Scored);
+        assert_eq!(
+            why_now(Some(Protocol::Quic), ProtocolWhy::Initial, e),
+            ProtocolWhy::Scored
+        );
+
+        crate::cf_quality::remember_verdict(e, Protocol::Http2, VerdictSource::Fallback);
+        assert_eq!(
+            why_now(Some(Protocol::Http2), ProtocolWhy::Initial, e),
+            ProtocolWhy::Fallback
+        );
+
+        assert_eq!(
+            why_now(Some(Protocol::Quic), ProtocolWhy::Initial, e),
+            ProtocolWhy::Initial
+        );
+
+        assert_eq!(why_now(None, ProtocolWhy::Unknown, e), ProtocolWhy::Unknown);
+        crate::cf_quality::forget(e);
+    }
+
+    #[test]
+    fn the_first_rung_reports_how_the_memory_was_made() {
+        let scored = ladder_for(
+            CfProtocol::Auto,
+            Some((Protocol::Quic, VerdictSource::Scored)),
+        );
+        assert_eq!(scored[0].1, ProtocolWhy::Scored);
+        let fell_back = ladder_for(
+            CfProtocol::Auto,
+            Some((Protocol::Http2, VerdictSource::Fallback)),
+        );
+        assert_eq!(fell_back[0].1, ProtocolWhy::Fallback);
+
+        assert_eq!(
+            ladder_for(CfProtocol::Auto, None)[0].1,
+            ProtocolWhy::Initial
+        );
+
+        for why in [
+            ProtocolWhy::Locked,
+            ProtocolWhy::Initial,
+            ProtocolWhy::Scored,
+            ProtocolWhy::Fallback,
+        ] {
+            assert!(!why.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_protocol_is_part_of_the_stamp() {
+        let base = "direct-egress#reload=1000000001";
+        let q = stamp_with(base, Protocol::Quic);
+        let h = stamp_with(base, Protocol::Http2);
+        assert_ne!(q, h);
+        assert!(q.ends_with("#proto=quic") && h.ends_with("#proto=http2"));
+        assert_eq!(q, stamp_with(base, Protocol::Quic), "must be stable");
+
+        assert_eq!(q.split_once("#proto=").unwrap().0, base);
+    }
+
+    #[test]
+    fn desired_protocol_follows_the_policy() {
+        let s = sup();
+        let locked = CloudflaredCfg {
+            protocol: CfProtocol::Fixed(Protocol::Http2),
+            ..Default::default()
+        };
+        assert_eq!(s.desired_protocol(Egress::Direct, &locked), Protocol::Http2);
+
+        crate::cf_quality::forget(Egress::Direct);
+        assert_eq!(
+            s.desired_protocol(Egress::Direct, &CloudflaredCfg::default()),
+            Protocol::Quic
         );
     }
 
@@ -1442,7 +1988,7 @@ mod tests {
     fn tick_is_noop_without_token() {
 
         let s = sup();
-        if s.load_cf_cfg().0.is_some() {
+        if s.load_cf_cfg().token.is_some() {
             return;
         }
         s.tick();
@@ -1452,7 +1998,7 @@ mod tests {
     #[test]
     fn status_and_restart_without_token() {
         let s = sup();
-        if s.load_cf_cfg().0.is_some() {
+        if s.load_cf_cfg().token.is_some() {
             return;
         }
         let st = s.status();
@@ -1487,9 +2033,22 @@ mod tests {
             .try_lock()
             .expect("fresh supervisor lock is free");
 
+        for e in Egress::ALL {
+            s.with_proc(e, |p| {
+                p.ready_misses = 2;
+                p.unready_since = Some(Instant::now());
+            });
+        }
+
         let t0 = Instant::now();
         s.tick();
         assert!(t0.elapsed() < Duration::from_secs(1), "tick must not block");
+
+        for e in Egress::ALL {
+            let (misses, since) = s.with_proc(e, |p| (p.ready_misses, p.unready_since));
+            assert_eq!(misses, 0, "{} ready misses must be cleared", e.as_str());
+            assert!(since.is_none(), "{} downtime must restart", e.as_str());
+        }
         drop(held);
 
         assert!(s.start_lock.try_lock().is_ok());

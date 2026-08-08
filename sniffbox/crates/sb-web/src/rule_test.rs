@@ -51,7 +51,8 @@ pub async fn run(
     })
     .to_string();
 
-    let mut handle = tokio::task::spawn_blocking(move || probe.probe_relaxed(&req_json));
+    let fut = probe.probe_relaxed(&req_json);
+    tokio::pin!(fut);
 
     let hard = Instant::now() + HARD_DEADLINE;
     let mut soft: Option<Instant> = None;
@@ -63,8 +64,8 @@ pub async fn run(
         }
         let can_read = tail.as_ref().is_some_and(|t| !t.eof);
         tokio::select! {
-            r = &mut handle, if probe_out.is_none() => {
-                probe_out = Some(r.unwrap_or_else(|_| Ok(r#"{"ok":false,"error":"probe task failed"}"#.to_string())));
+            r = &mut fut, if probe_out.is_none() => {
+                probe_out = Some(r);
                 soft = Some(Instant::now() + GRACE);
             }
 
@@ -74,10 +75,7 @@ pub async fn run(
     }
     let probe_out = match probe_out {
         Some(v) => v,
-        None => {
-            handle.abort();
-            Ok(json!({ "ok": false, "error": "rule test timed out" }).to_string())
-        }
+        None => Ok(json!({ "ok": false, "error": "rule test timed out" }).to_string()),
     };
 
     let probe_out = probe_out?;

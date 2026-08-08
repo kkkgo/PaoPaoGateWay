@@ -120,6 +120,8 @@ max_rec=5000
 #cloudflared_token="eyJhIjoixxxxxxxx"
 # cloudflared replicas: yes=proxied only (default) / no=direct only / both=run both
 #cf_proxy=yes
+# cloudflared transport: auto=measure both and pick (default) / quic / http2
+#cf_protocol=auto
 
 # box adv tune
 #box=
@@ -171,6 +173,9 @@ max_rec=5000
     - `no`：**只跑直连副本**。适合你根本不想让隧道流量占用代理带宽、或者直连本来就足够稳的场景。
     - `both`：**跑双副本**，互为 Replica。这是可用性高的配置：代理挂了直连顶上，直连被阻断了代理顶上；代价是cloudflare并没有确定的算法一定分配到哪个副本，一般优先转发到 **用户到Cloudflare节点地理上最近** 的而不是延迟最低的，比如大多数境内访问默认直连是LAX，即使你代理是HKG，特别是电信用户，大概率可能走绕地球两圈的LAX。`mode=free`下`yes`/`both`都无效。
     分流参考：https://github.com/kkkgo/PaoPaoGateWay/discussions/215
+- 19 `cf_protocol`选项：cloudflared 用哪种传输方式连 Cloudflare 边缘，取值`auto`/`quic`/`http2`，留空或不写等于`auto`。
+    - `auto`（默认）：**智能测速评分选择**。综合评判稳定性、断流、吞吐和延迟，当某个协议明显更好的时候，会切换到评分更好的协议。评测间隔将根据线路状况和稳定性动态调整20分钟~6小时不等，但线路掉线将会重新判定。
+    - `quic` / `http2`：**锁死**，网关不再自己判断，也不做降级和打分。你确定自己的线路情况时用它。
 ## PPSUB 组合订阅使用指南
 
 #### 基本使用流程
@@ -271,6 +276,7 @@ IPv6支持静态路由到网关。详情参考文档：https://github.com/kkkgo/
 localnet="10.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16"
 ```
 同理，如果存在非标准的IPv6局域网段，可以定义localnet6。
+*注意：`localnet`/`localnet6`只用于声明非标准的局域网段。网关本机自身的地址（包括通过SLAAC动态获得、会随重拨变化的IPv6 GUA）已经由透明代理规则自动识别并排除，不需要也不应该把网关自己的地址写进这两个选项。*
 #### 指定`ppgw.ini`的下载地址：`ppgwurl.ini`
 如果你要指定ppgw.ini的下载地址而不是按上面的规则来寻找，比如你弄了一个带鉴权的http服务器提高安全性，防止配置泄露，你可以新建一个`ppgwurl.ini`如下：
 ```ini

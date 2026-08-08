@@ -272,6 +272,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_needs_the_greeting_first() {
+        use crate::socks5;
+
+        let (mut client, mut server) = duplex(256);
+        let srv = tokio::spawn(async move {
+            negotiate_method(&mut server, None).await?;
+            let got = read_request(&mut server).await?;
+            write_success(&mut server, "0.0.0.0:0".parse().unwrap()).await?;
+            Ok::<_, crate::OutboundErr>(got)
+        });
+        socks5::handshake_no_auth(&mut client).await.unwrap();
+        socks5::send_connect(&mut client, "1.2.3.4:443".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let (cmd, dest) = srv.await.unwrap().unwrap();
+        assert_eq!(cmd, SocksCmd::Connect);
+        assert_eq!(dest, DestAddr::Ip("1.2.3.4:443".parse().unwrap()));
+
+        let (mut client, mut server) = duplex(256);
+        let srv = tokio::spawn(async move {
+            negotiate_method(&mut server, None).await?;
+            read_request(&mut server).await
+        });
+        let _ = socks5::send_connect(&mut client, "1.2.3.4:443".parse().unwrap(), None).await;
+        assert!(
+            srv.await.unwrap().is_err(),
+            "skipping the greeting must not be mistaken for a valid request"
+        );
+    }
+
+    #[tokio::test]
     async fn read_request_connect_domain() {
         let (mut client, mut server) = duplex(64);
         let srv = tokio::spawn(async move { read_request(&mut server).await.unwrap() });

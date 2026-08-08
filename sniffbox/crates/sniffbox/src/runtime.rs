@@ -107,6 +107,8 @@ pub struct SharedState {
 
     openport_auth: ArcSwap<Option<Arc<(String, String)>>>,
 
+    openport_listen: ArcSwap<Vec<SocketAddr>>,
+
     pub node_dist: Arc<NodeDist>,
 
     pub socks_src_index: DashMap<u16, SocksSrc>,
@@ -182,6 +184,7 @@ impl SharedState {
             web_admin: admin_handle(AdminAcl::new(cfg.web.admin_cidr.nets().to_vec())),
             web_token: token_handle(derive_secret(&cfg.web.password)),
             openport_auth: ArcSwap::from_pointee(cfg.inbound_proxy.auth.clone().map(Arc::new)),
+            openport_listen: ArcSwap::from_pointee(Vec::new()),
             node_dist: Arc::new(NodeDist::new()),
             socks_src_index: DashMap::new(),
             close_registry: DashMap::new(),
@@ -229,6 +232,14 @@ impl SharedState {
 
     pub fn openport_auth(&self) -> Option<Arc<(String, String)>> {
         (**self.openport_auth.load()).clone()
+    }
+
+    pub fn set_openport_listen(&self, addrs: Vec<SocketAddr>) {
+        self.openport_listen.store(Arc::new(addrs));
+    }
+
+    pub fn openport_listen_count(&self) -> usize {
+        self.openport_listen.load().len()
     }
 
     pub fn proxy_allowed(&self, ip: std::net::IpAddr) -> bool {
@@ -439,6 +450,26 @@ impl sb_web::CloudflaredSource for WebCloudflared {
 
                     "edges": p.edges,
 
+                    "protocol": p.protocol.map(|x| x.as_str()),
+                    "protocolWhy": p.protocol_why.as_str(),
+
+                    "nextProbeMin": p.next_probe_min,
+
+                    "lastRound": p.last_round.as_ref().map(|r| serde_json::json!({
+                        "ageSec": r.age_secs(),
+
+                        "verdict": r.verdict.map(|x| x.as_str()),
+
+                        "arms": r.arms.iter().map(|a| serde_json::json!({
+                            "protocol": a.protocol.as_str(),
+                            "rateBps": a.rate_bps,
+                            "ttfbMs": a.ttfb_ms,
+                            "completed": a.completed,
+                            "edgeRttMs": a.edge_rtt_ms,
+                            "note": a.note,
+                        })).collect::<Vec<_>>(),
+                    })),
+
                     "bytes": { "up": up, "down": down, "total": up.saturating_add(down) },
 
                     "traffic": (p.egress == crate::cf_ctl::Egress::Proxied)
@@ -452,6 +483,8 @@ impl sb_web::CloudflaredSource for WebCloudflared {
             "enabled": st.enabled,
 
             "proxyMode": st.proxy_mode.as_str(),
+
+            "protocolMode": st.protocol.as_str(),
             "binary": st.binary,
             "version": st.version,
             "replicas": procs,
@@ -474,8 +507,8 @@ impl sb_web::CloudflaredSource for WebCloudflared {
 
 pub struct InfoStatic {
     pub mode: OutboundMode,
-    pub openport_enabled: bool,
     pub openport_port: u16,
+
     pub udp_enable: bool,
 
     pub net_rec: bool,
@@ -490,7 +523,6 @@ impl InfoStatic {
     pub fn from_cfg(cfg: &Config) -> Self {
         Self {
             mode: cfg.outbound.mode,
-            openport_enabled: cfg.inbound_proxy.enabled,
             openport_port: cfg.inbound_proxy.listen_port,
             udp_enable: cfg.inbound_proxy.udp,
             net_rec: cfg.stats.as_ref().is_some_and(|s| s.enabled),
@@ -589,6 +621,10 @@ fn env_bool(key: &str) -> bool {
     )
 }
 
+fn openport_effective(listen_count: usize, nft_open: Option<bool>) -> bool {
+    listen_count > 0 && nft_open != Some(false)
+}
+
 impl WebInfo {
 
     fn static_value(&self) -> serde_json::Value {
@@ -651,6 +687,8 @@ impl WebInfo {
         let fakeip_cidr = self.shared.fakeip.as_ref().map(|p| p.cidr().to_string());
         let route = self.shared.route.load();
 
+        let nft = crate::nft::read_facts();
+
         serde_json::json!({
             "version": crate::SNIFFBOX_VERSION,
             "clash_version": clash_version.as_ref().map(|v| &v.version),
@@ -674,9 +712,9 @@ impl WebInfo {
             "features": {
                 "dns_burn": env_bool("dns_burn"),
                 "net_rec": self.stat.net_rec,
-                "openport": self.stat.openport_enabled,
+                "openport": openport_effective(self.shared.openport_listen_count(), nft.openport_open),
                 "openport_port": self.stat.openport_port,
-                "udp_enable": self.stat.udp_enable,
+                "udp_enable": self.stat.udp_enable && nft.udp_open != Some(false),
                 "max_rec": self.shared.max_rec(),
                 "net_cleanday": self.shared.net_cleanday(),
             },
@@ -1639,5 +1677,32 @@ mod tests {
         state.reload(&c);
         assert!(state.web_admin().load().allows(lan));
         assert!(state.openport_auth().is_none());
+    }
+
+    #[test]
+    fn openport_effective_truth_table() {
+        for nft in [None, Some(true), Some(false)] {
+            assert!(
+                !openport_effective(0, nft),
+                "nothing bound is always off, nft={nft:?}"
+            );
+        }
+        assert!(openport_effective(1, Some(true)), "bound + nft accepts");
+        assert!(
+            openport_effective(2, None),
+            "unreadable nft must not be read as blocked"
+        );
+        assert!(
+            !openport_effective(1, Some(false)),
+            "bound but nft drops :1080"
+        );
+    }
+
+    #[test]
+    fn openport_listen_starts_empty_and_records_binds() {
+        let state = SharedState::new(&Config::default());
+        assert_eq!(state.openport_listen_count(), 0);
+        state.set_openport_listen(vec!["10.0.0.1:1080".parse().unwrap()]);
+        assert_eq!(state.openport_listen_count(), 1);
     }
 }

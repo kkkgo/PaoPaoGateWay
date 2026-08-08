@@ -29,7 +29,7 @@ repository   = "https://github.com/kkkgo/PaoPaoGateWay"
 
 tokio             = { version = "1", features = ["net", "io-util", "sync", "time", "signal", "macros", "rt-multi-thread", "fs"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
-futures-util      = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util      = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
@@ -57,11 +57,14 @@ ipnet           = { version = "2", features = ["serde"] }
 
 yaml-rust2      = "0.11"
 
-ureq            = { version = "3", default-features = false, features = ["rustls", "socks-proxy", "gzip", "brotli"] }
+wreq            = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "socks", "gzip", "brotli", "deflate", "zstd", "stream"] }
+
+wreq-util       = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation"] }
 
 regex-lite      = "0.1"
 
-rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+btls            = "0.5"
+tokio-btls      = "0.5"
 
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
