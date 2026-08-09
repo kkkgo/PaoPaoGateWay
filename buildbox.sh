@@ -1,33 +1,21 @@
 #!/bin/bash
 set -e
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends \
-    clang \
-    libclang-dev \
-    cmake \
-    perl \
-    git \
-    g++ \
-    curl \
-    ca-certificates
-rm -rf /var/lib/apt/lists/*
 
-MUSL_TC=x86_64-linux-musl-cross
-if [ ! -x "/opt/$MUSL_TC/bin/x86_64-linux-musl-g++" ]; then
-    curl -fsSL "https://musl.cc/$MUSL_TC.tgz" | tar xz -C /opt
-fi
-export PATH="/opt/$MUSL_TC/bin:$PATH"
-
+CROSS=x86_64-linux-musl
 TARGET=x86_64-unknown-linux-musl
-cd /box
-rustup target add "$TARGET"
 
-export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
-export CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++
-export AR_x86_64_unknown_linux_musl=x86_64-linux-musl-ar
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
-export BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl="--sysroot=/opt/$MUSL_TC/x86_64-linux-musl"
+if ! command -v "$CROSS-g++" >/dev/null 2>&1; then
+    echo "Error: $CROSS-g++ not found in PATH."
+    echo "This script expects the sliamb/rust-musl-builder image."
+    echo "Build it locally with:"
+    echo "    docker build -t sliamb/rust-musl-builder ./rust-musl-builder"
+    exit 1
+fi
+echo "toolchain: $("$CROSS-gcc" -dumpmachine) gcc $("$CROSS-gcc" -dumpversion)"
+
+cd /box
+# Already present in the image; only reached if someone runs this elsewhere.
+rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
 
 # Fetch latest clash-verge autobuild version; fall back to known stable version.
 version=$(curl -s https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/autobuild | grep -Eo "releases/download/autobuild/Clash.Verge_[^_]+" | cut -d"_" -f2 | head -n 1 || true)

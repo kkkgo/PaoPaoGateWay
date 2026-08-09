@@ -1,0 +1,12 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+#
+# sha256 of every source tarball the toolchain is built from. Consumed by
+# "sha256sum -c" in fetch-sources.sh, so the format is fixed.
+
+154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff  binutils-2.47.tar.xz
+e6738e29597f733270731aa90600f37ffdc045079dfc27ec7e8192cc81085c3e  gcc-16.2.0.tar.xz
+a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898  gmp-6.3.0.tar.xz
+b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01  mpfr-4.2.2.tar.xz
+91204cd32f164bd3b7c992d4a6a8ce6519511aadab30f78b6982d0bf8d73e931  mpc-1.4.1.tar.xz
+d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a  musl-1.2.6.tar.gz
+ca8f2a6884a4d62043e9ab93ac1ab15efc2b6630fe8f768b2ef2ffdf4b5e26df  linux-7.1.7.tar.xz

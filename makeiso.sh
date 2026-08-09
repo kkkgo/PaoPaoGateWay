@@ -10,13 +10,15 @@ if [ -f "$builddir""/sha.txt" ]; then
 fi
 
 rm -f "$builddir"/FILES/usr/bin/sniffbox
-docker pull rust:bookworm
+# Carries the musl cross toolchain and the C build deps; see ./rust-musl-builder.
+RUSTBUILDER=${RUSTBUILDER:-sliamb/rust-musl-builder}
+docker pull "$RUSTBUILDER"
 docker run --rm --name rustbuilder \
     -e SNIFFBOX_VERSION="$ppgwver" \
     -v "$builddir"/FILES/usr/bin/:/app/ \
     -v "$builddir"/buildbox.sh:/sh/buildbox.sh \
     -v "$builddir"/sniffbox:/box \
-    rust:bookworm bash /sh/buildbox.sh
+    "$RUSTBUILDER" bash /sh/buildbox.sh
 if [ -f "$builddir""/FILES/usr/bin/sniffbox" ]; then
     echo "sniffbox compilation OK."
 else

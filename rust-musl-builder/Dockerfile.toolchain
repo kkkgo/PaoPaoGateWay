@@ -1,0 +1,45 @@
+# Copyright (c) 2026, https://blog.03k.org. All rights reserved.
+#
+# The musl cross toolchains on their own, published as a separate image so that
+# they are built once per toolchain version instead of once per builder image.
+
+FROM debian:bookworm-slim AS base
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        bison \
+        flex \
+        texinfo \
+        gawk \
+        m4 \
+        file \
+        rsync \
+        xz-utils \
+        bzip2 \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fetch and verify sources once, share them with both toolchain stages.
+FROM base AS sources
+WORKDIR /toolchain-src
+COPY versions.env checksums.txt fetch-sources.sh ./
+RUN chmod +x fetch-sources.sh && ./fetch-sources.sh
+
+# Independent, so BuildKit builds them concurrently.
+FROM sources AS tc-x86-64
+COPY build-toolchain.sh ./
+RUN chmod +x build-toolchain.sh && ./build-toolchain.sh x86_64-linux-musl
+
+FROM sources AS tc-aarch64
+COPY build-toolchain.sh ./
+RUN chmod +x build-toolchain.sh && ./build-toolchain.sh aarch64-linux-musl
+
+FROM scratch
+COPY --from=tc-x86-64  /opt/x86_64-linux-musl  /opt/x86_64-linux-musl
+COPY --from=tc-aarch64 /opt/aarch64-linux-musl /opt/aarch64-linux-musl
+
+LABEL org.opencontainers.image.title="rust-musl-builder toolchain" \
+      org.opencontainers.image.description="musl cross toolchains (x86_64, aarch64) built from upstream source" \
+      org.opencontainers.image.source="https://github.com/kkkgo/PaoPaoGateWay"
