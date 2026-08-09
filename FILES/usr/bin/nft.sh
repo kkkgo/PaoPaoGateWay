@@ -150,10 +150,10 @@ table ip6 ppgw {
         chain ppgw_tproxy6 {
                 type filter hook prerouting priority mangle; policy accept;
                 meta l4proto != { tcp, udp } return
+$cf_tproxy_rule6
                 iif "lo" return
                 ip6 daddr @localnetwork6 return
                 fib daddr type local return
-$cf_tproxy_rule6
 $udp_rules6
                 meta l4proto tcp tproxy to [::1]:1081 meta mark set 1
         }
@@ -197,10 +197,10 @@ table ip ppgw {
         chain ppgw_tproxy {
                 type filter hook prerouting priority mangle; policy accept;
                 ip protocol != { tcp, udp } return
+$cf_tproxy_rule
                 iif "lo" return
                 ip daddr @localnetwork return
                 fib daddr type local return
-$cf_tproxy_rule
 $udp_rules
                 ip protocol tcp tproxy to 127.0.0.1:1081 meta mark set 1
         }
