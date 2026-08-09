@@ -10,7 +10,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 REPO=${REPO:-sliamb/rust-musl-builder}
-TC_IMAGE=$(TOOLCHAIN_REPO="$REPO" ./toolchain-image.sh)
+TC_IMAGE=$(TOOLCHAIN_REPO="$REPO" bash ./toolchain-image.sh)
+if [ -z "$TC_IMAGE" ]; then
+    echo "Error: toolchain-image.sh produced no output." >&2
+    exit 1
+fi
 
 if docker image inspect "$TC_IMAGE" >/dev/null 2>&1; then
     echo ">>> toolchain already built locally: $TC_IMAGE"

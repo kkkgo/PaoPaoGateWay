@@ -18,10 +18,16 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@main
     - name: Resolve image tags
-      # toolchain-image.sh is the single place the toolchain tag is derived.
       run: |
+        set -euo pipefail
         . ./rust-musl-builder/versions.env
-        echo "TC_IMAGE=$(./rust-musl-builder/toolchain-image.sh)" >> $GITHUB_ENV
+        TC_IMAGE=$(bash ./rust-musl-builder/toolchain-image.sh)
+        if [ -z "$TC_IMAGE" ]; then
+          echo "toolchain-image.sh produced no output" >&2
+          exit 1
+        fi
+        echo "resolved toolchain image: $TC_IMAGE"
+        echo "TC_IMAGE=$TC_IMAGE" >> $GITHUB_ENV
         echo "TC_TAG=gcc${GCC_VER}-musl${MUSL_VER}" >> $GITHUB_ENV
     - name: Free disk space
       # Two GCC source trees plus a kernel tree plus two build trees do not fit
@@ -38,6 +44,7 @@ jobs:
         password: ${{ secrets.DOCKERHUB_TOKEN }}
     - name: Build toolchain image if this recipe has not been published
       run: |
+        set -euo pipefail
         if docker buildx imagetools inspect "$TC_IMAGE" >/dev/null 2>&1; then
           echo "toolchain already published, reusing: $TC_IMAGE"
         else
