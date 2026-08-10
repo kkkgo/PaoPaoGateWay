@@ -129,6 +129,8 @@ pub fn cli_main() -> ExitCode {
         config = %parsed.source.describe(),
         "sniffbox starting"
     );
+
+    outbound::mark_start();
     raise_nofile();
     if cfg.inbound.tune_sysctl {
         tune_sysctls();

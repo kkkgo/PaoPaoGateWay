@@ -136,9 +136,12 @@ fn resolve_all(
     }
 
     let subdns: std::sync::Mutex<HashMap<String, Resolved>> = std::sync::Mutex::new(HashMap::new());
+
+    let unresolved = std::sync::atomic::AtomicUsize::new(0);
     let mut resolved = HashMap::new();
     std::thread::scope(|s| {
         let sub_ref = &subdns;
+        let unresolved = &unresolved;
         for j in &jobs {
             s.spawn(move || {
                 let tag = format!("[{}] subdns", j.name);
@@ -151,6 +154,15 @@ fn resolve_all(
                         crate::dohdot::resolve_via_servers_traced(domain, &j.specs, ipv6, dl)
                     },
                 );
+                let missing = j.domains.iter().filter(|d| !got.contains_key(*d)).count();
+                if missing > 0 {
+                    pp_warn(&format!(
+                        "[{}] subdns: {missing}/{} domain(s) unresolved",
+                        j.name,
+                        j.domains.len()
+                    ));
+                    unresolved.fetch_add(missing, std::sync::atomic::Ordering::Relaxed);
+                }
                 sub_ref.lock().unwrap().insert(j.name.clone(), got);
             });
         }
@@ -158,6 +170,8 @@ fn resolve_all(
         resolved =
             crate::dnsutil::resolve_domains_logged(LOG, "dns_burn", &domains, dns_servers, ipv6);
     });
+
+    mark_subdns_incomplete(unresolved.into_inner() > 0);
 
     let subdns = subdns
         .into_inner()
@@ -169,6 +183,15 @@ fn resolve_all(
         })
         .collect();
     (resolved, subdns)
+}
+
+fn mark_subdns_incomplete(incomplete: bool) {
+    const MARK: &str = "/tmp/ppsub_subdns_incomplete";
+    if incomplete {
+        let _ = std::fs::write(MARK, b"1\n");
+    } else {
+        let _ = std::fs::remove_file(MARK);
+    }
 }
 
 fn sub_domains(r: &SubResult) -> Vec<String> {

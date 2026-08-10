@@ -1,7 +1,8 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::cf_ctl::Egress;
@@ -36,6 +37,8 @@ const DNS_DIRECT: &str = "223.5.5.5:53";
 
 const EDGE_SRV: &str = "_v2-origintunneld._tcp.argotunnel.com";
 
+const PER_REGION: usize = 10;
+
 pub const BUILTIN_V4: &[&str] = &[
 
     "198.41.192.167",
@@ -60,6 +63,33 @@ pub const BUILTIN_V4: &[&str] = &[
     "198.41.200.43",
     "198.41.200.23",
 ];
+
+pub const BUILTIN_V6: &[&str] = &[
+
+    "2606:4700:a0::1",
+    "2606:4700:a0::2",
+    "2606:4700:a0::3",
+    "2606:4700:a0::4",
+    "2606:4700:a0::5",
+    "2606:4700:a0::6",
+    "2606:4700:a0::7",
+    "2606:4700:a0::8",
+    "2606:4700:a0::9",
+    "2606:4700:a0::10",
+
+    "2606:4700:a8::1",
+    "2606:4700:a8::2",
+    "2606:4700:a8::3",
+    "2606:4700:a8::4",
+    "2606:4700:a8::5",
+    "2606:4700:a8::6",
+    "2606:4700:a8::7",
+    "2606:4700:a8::8",
+    "2606:4700:a8::9",
+    "2606:4700:a8::10",
+];
+
+const V6_WIN_MIN: Duration = Duration::from_millis(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeRtt {
@@ -104,13 +134,33 @@ pub async fn pick_edges_proto(egress: Egress, proto: Protocol) -> Vec<EdgeRtt> {
 }
 
 pub async fn pick_edges_mode(egress: Egress, mode: EdgeMode) -> Vec<EdgeRtt> {
-    let started = Instant::now();
-    let builtin = builtin_candidates();
-    let mut best = measure(egress, builtin.clone(), mode).await;
-    if best.is_empty() && started.elapsed() < round_budget(egress) {
 
-        let tried: BTreeSet<IpAddr> = builtin.iter().copied().collect();
-        let fresh: Vec<IpAddr> = discover_edges(egress)
+    let deadline = Instant::now() + round_budget(egress);
+    let v6_ok = v6_usable(egress);
+
+    let builtin4 = builtin_candidates();
+    let mut got4 = measure(egress, builtin4.clone(), mode, deadline).await;
+
+    let builtin6 = if v6_ok {
+        builtin_v6_candidates()
+    } else {
+        Vec::new()
+    };
+    let mut got6 = Vec::new();
+    if !builtin6.is_empty() && !v6_recently_down(egress) && Instant::now() < deadline {
+        match measure_v6(egress, &builtin6, mode, deadline).await {
+            Some(v) => {
+                note_v6(egress, true);
+                got6 = v;
+            }
+            None => note_v6(egress, false),
+        }
+    }
+
+    if got4.is_empty() && got6.is_empty() && Instant::now() < deadline {
+
+        let tried: BTreeSet<IpAddr> = builtin4.iter().chain(builtin6.iter()).copied().collect();
+        let fresh: Vec<IpAddr> = discover_edges(egress, v6_ok)
             .await
             .into_iter()
             .filter(|ip| !tried.contains(ip))
@@ -127,11 +177,13 @@ pub async fn pick_edges_mode(egress: Egress, mode: EdgeMode) -> Vec<EdgeRtt> {
                 n = fresh.len(),
                 "cf edge: builtin list unreachable; probing newly discovered addresses"
             );
-            best = measure(egress, fresh, mode).await;
+            for r in measure(egress, fresh, mode, deadline).await {
+                if r.ip.is_ipv4() { &mut got4 } else { &mut got6 }.push(r);
+            }
         }
     }
-    best.sort_by_key(|e| e.rtt);
-    best.truncate(PICK);
+
+    let best = pick_family(got4, got6);
     if best.is_empty() {
         tracing::warn!(
             egress = egress.as_str(),
@@ -140,11 +192,98 @@ pub async fn pick_edges_mode(egress: Egress, mode: EdgeMode) -> Vec<EdgeRtt> {
     } else {
         tracing::info!(
             egress = egress.as_str(),
+            family = if best[0].ip.is_ipv4() { "v4" } else { "v6" },
             picks = %fmt_picks(&best),
             "cf edge: picked fastest edges"
         );
     }
     best
+}
+
+fn pick_family(mut v4: Vec<EdgeRtt>, mut v6: Vec<EdgeRtt>) -> Vec<EdgeRtt> {
+    v4.sort_by_key(|e| e.rtt);
+    v4.truncate(PICK);
+    v6.sort_by_key(|e| e.rtt);
+    v6.truncate(PICK);
+    match (v4.first().map(|e| e.rtt), v6.first().map(|e| e.rtt)) {
+        (Some(a), Some(b)) if v6_clearly_faster(b, a) => v6,
+        (Some(_), _) => v4,
+        (None, _) => v6,
+    }
+}
+
+fn v6_clearly_faster(v6: Duration, v4: Duration) -> bool {
+    v6 + V6_WIN_MIN <= v4 && v6.as_micros() * 4 <= v4.as_micros() * 3
+}
+
+fn v6_usable(egress: Egress) -> bool {
+    match egress {
+        Egress::Proxied => false,
+        Egress::Direct => has_global_v6_route(),
+    }
+}
+
+fn has_global_v6_route() -> bool {
+    let Ok(sock) = std::net::UdpSocket::bind("[::]:0") else {
+        return false;
+    };
+    let probe: SocketAddr = match BUILTIN_V6[0].parse::<Ipv6Addr>() {
+        Ok(ip) => SocketAddr::new(IpAddr::V6(ip), EDGE_PORT),
+        Err(_) => return false,
+    };
+    if sock.connect(probe).is_err() {
+        return false;
+    }
+    match sock.local_addr() {
+        Ok(SocketAddr::V6(a)) => is_global_v6(a.ip()),
+        _ => false,
+    }
+}
+
+fn is_global_v6(ip: &Ipv6Addr) -> bool {
+    !(ip.is_loopback() || ip.is_unspecified() || ip.is_unicast_link_local() || ip.is_unique_local())
+}
+
+async fn measure_v6(
+    egress: Egress,
+    all: &[IpAddr],
+    mode: EdgeMode,
+    deadline: Instant,
+) -> Option<Vec<EdgeRtt>> {
+    let canary: Vec<IpAddr> = all.iter().copied().step_by(PER_REGION).take(2).collect();
+    let mut out = measure(egress, canary.clone(), mode, deadline).await;
+    if out.is_empty() {
+        tracing::debug!(
+            egress = egress.as_str(),
+            "cf edge: no IPv6 answer from the canaries; skipping the rest of the v6 list"
+        );
+        return None;
+    }
+    let rest: Vec<IpAddr> = all
+        .iter()
+        .copied()
+        .filter(|ip| !canary.contains(ip))
+        .collect();
+    out.extend(measure(egress, rest, mode, deadline).await);
+    Some(out)
+}
+
+static V6_DOWN_UNTIL: Mutex<[Option<Instant>; 2]> = Mutex::new([None, None]);
+
+const V6_DOWN_TTL: Duration = Duration::from_secs(300);
+
+fn v6_recently_down(egress: Egress) -> bool {
+    let g = V6_DOWN_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    g[egress.idx()].is_some_and(|until| Instant::now() < until)
+}
+
+fn note_v6(egress: Egress, reachable: bool) {
+    let mut g = V6_DOWN_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    g[egress.idx()] = (!reachable).then(|| Instant::now() + V6_DOWN_TTL);
+}
+
+pub fn edge_arg(ip: IpAddr) -> String {
+    SocketAddr::new(ip, EDGE_PORT).to_string()
 }
 
 fn fmt_picks(picks: &[EdgeRtt]) -> String {
@@ -170,11 +309,24 @@ fn builtin_candidates() -> Vec<IpAddr> {
         .collect()
 }
 
-async fn measure(egress: Egress, candidates: Vec<IpAddr>, mode: EdgeMode) -> Vec<EdgeRtt> {
+fn builtin_v6_candidates() -> Vec<IpAddr> {
+    BUILTIN_V6
+        .iter()
+        .filter_map(|s| s.parse::<Ipv6Addr>().ok())
+        .map(IpAddr::V6)
+        .collect()
+}
+
+async fn measure(
+    egress: Egress,
+    candidates: Vec<IpAddr>,
+    mode: EdgeMode,
+    deadline: Instant,
+) -> Vec<EdgeRtt> {
     if mode == EdgeMode::TcpOnly {
-        return measure_with(egress, &candidates, false).await;
+        return measure_with(egress, &candidates, false, deadline).await;
     }
-    let quic = measure_with(egress, &candidates, true).await;
+    let quic = measure_with(egress, &candidates, true, deadline).await;
     if !quic.is_empty() || mode == EdgeMode::QuicOnly {
         return quic;
     }
@@ -182,7 +334,7 @@ async fn measure(egress: Egress, candidates: Vec<IpAddr>, mode: EdgeMode) -> Vec
         egress = egress.as_str(),
         "cf edge: no QUIC answer from any candidate; falling back to TCP connect timing"
     );
-    measure_with(egress, &candidates, false).await
+    measure_with(egress, &candidates, false, deadline).await
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -217,9 +369,13 @@ pub async fn edge_rtts(egress: Egress) -> EdgeRtts {
     EdgeRtts { quic, http2 }
 }
 
-async fn measure_with(egress: Egress, candidates: &[IpAddr], quic: bool) -> Vec<EdgeRtt> {
+async fn measure_with(
+    egress: Egress,
+    candidates: &[IpAddr],
+    quic: bool,
+    deadline: Instant,
+) -> Vec<EdgeRtt> {
     let mut out = Vec::new();
-    let deadline = Instant::now() + round_budget(egress);
     for chunk in candidates.chunks(CONCURRENCY) {
         if Instant::now() >= deadline {
             break;
@@ -365,7 +521,7 @@ async fn udp_roundtrip_socks5(dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>
     Some(buf[off..n].to_vec())
 }
 
-async fn discover_edges(egress: Egress) -> Vec<IpAddr> {
+async fn discover_edges(egress: Egress, v6: bool) -> Vec<IpAddr> {
     let mut hosts: Vec<String> = Vec::new();
     for (server, via) in dns_plan(egress) {
         if let Some(list) = dns_srv(server, via).await
@@ -383,13 +539,21 @@ async fn discover_edges(egress: Egress) -> Vec<IpAddr> {
     let mut seen: BTreeSet<IpAddr> = BTreeSet::new();
     for host in hosts {
         for (server, via) in dns_plan(egress) {
-            if let Some(ips) = dns_a(server, via, &host).await {
+            if let Some(ips) = dns_addrs(server, via, &host, v6).await {
                 seen.extend(ips);
                 break;
             }
         }
     }
     seen.into_iter().collect()
+}
+
+async fn dns_addrs(server: &str, via: Egress, host: &str, v6: bool) -> Option<Vec<IpAddr>> {
+    let mut out = dns_a(server, via, host).await.unwrap_or_default();
+    if v6 && let Some(v) = dns_aaaa(server, via, host).await {
+        out.extend(v);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 pub async fn resolve_a(egress: Egress, host: &str) -> Option<IpAddr> {
@@ -431,6 +595,14 @@ async fn dns_a(server: &str, via: Egress, host: &str) -> Option<Vec<IpAddr>> {
     (!v4.is_empty()).then_some(v4)
 }
 
+async fn dns_aaaa(server: &str, via: Egress, host: &str) -> Option<Vec<IpAddr>> {
+    let q = sb_dns::message::build_query(dns_id(), host, sb_dns::message::TYPE_AAAA).ok()?;
+    let resp = dns_exchange(server, via, &q).await?;
+    let parsed = sb_dns::message::parse_response(&resp).ok()?;
+    let v6: Vec<IpAddr> = parsed.v6.into_iter().map(IpAddr::V6).collect();
+    (!v6.is_empty()).then_some(v6)
+}
+
 async fn dns_exchange(server: &str, via: Egress, query: &[u8]) -> Option<Vec<u8>> {
     let dst: SocketAddr = server.parse().ok()?;
     match via {
@@ -464,6 +636,106 @@ mod tests {
 
         let uniq: BTreeSet<_> = ips.iter().collect();
         assert_eq!(uniq.len(), ips.len());
+    }
+
+    #[test]
+    fn builtin_v6_list_is_sane() {
+        let ips = builtin_v6_candidates();
+        assert_eq!(ips.len(), BUILTIN_V6.len(), "every v6 builtin must parse");
+        assert_eq!(ips.len(), BUILTIN_V4.len(), "one v6 address per v4 address");
+        let r1 = ips[..PER_REGION].iter().all(|ip| match ip {
+            IpAddr::V6(v) => v.segments()[..3] == [0x2606, 0x4700, 0x00a0],
+            _ => false,
+        });
+        let r2 = ips[PER_REGION..].iter().all(|ip| match ip {
+            IpAddr::V6(v) => v.segments()[..3] == [0x2606, 0x4700, 0x00a8],
+            _ => false,
+        });
+        assert!(r1 && r2, "region1 then region2, matching region.md");
+        let uniq: BTreeSet<_> = ips.iter().collect();
+        assert_eq!(uniq.len(), ips.len());
+
+        let canary: Vec<IpAddr> = ips.iter().copied().step_by(PER_REGION).take(2).collect();
+        assert_eq!(canary, vec![ips[0], ips[PER_REGION]]);
+    }
+
+    #[test]
+    fn edge_arg_brackets_ipv6() {
+        assert_eq!(
+            edge_arg("198.41.192.7".parse().unwrap()),
+            "198.41.192.7:7844"
+        );
+        assert_eq!(
+            edge_arg("2606:4700:a0::1".parse().unwrap()),
+            "[2606:4700:a0::1]:7844"
+        );
+    }
+
+    #[test]
+    fn pick_family_never_mixes_families() {
+        let mk = |ip: &str, ms: u64| EdgeRtt {
+            ip: ip.parse().unwrap(),
+            rtt: Duration::from_millis(ms),
+            quic: true,
+        };
+        let v4 = vec![
+            mk("198.41.192.7", 100),
+            mk("198.41.192.27", 110),
+            mk("198.41.200.13", 120),
+            mk("198.41.200.23", 130),
+        ];
+        let v6 = vec![mk("2606:4700:a0::1", 20), mk("2606:4700:a8::1", 21)];
+        let picked = pick_family(v4.clone(), v6.clone());
+        assert!(
+            picked.iter().all(|e| e.ip.is_ipv6()),
+            "v6 won, so every pick must be v6"
+        );
+        let picked = pick_family(v4.clone(), Vec::new());
+        assert!(picked.iter().all(|e| e.ip.is_ipv4()));
+
+        let picked = pick_family(Vec::new(), v6);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().all(|e| e.ip.is_ipv6()));
+        assert!(pick_family(Vec::new(), Vec::new()).is_empty());
+
+        let picked = pick_family(v4, Vec::new());
+        assert_eq!(picked.len(), PICK);
+        assert!(picked.windows(2).all(|w| w[0].rtt <= w[1].rtt));
+    }
+
+    #[test]
+    fn v6_must_win_by_a_clear_margin() {
+        let ms = Duration::from_millis;
+        assert!(!v6_clearly_faster(ms(100), ms(100)), "a tie keeps v4");
+        assert!(!v6_clearly_faster(ms(190), ms(200)), "10ms is not enough");
+        assert!(
+            !v6_clearly_faster(ms(180), ms(200)),
+            "20ms but only 10% — noise-sized on a long path"
+        );
+        assert!(v6_clearly_faster(ms(20), ms(200)), "10x faster wins");
+        assert!(v6_clearly_faster(ms(150), ms(200)), "25% and 50ms wins");
+
+        assert!(!v6_clearly_faster(ms(2), ms(8)));
+    }
+
+    #[test]
+    fn only_the_direct_replica_probes_v6() {
+        assert!(
+            !v6_usable(Egress::Proxied),
+            "pinned v6 edges would break the tunnel on the next node switch"
+        );
+        assert_eq!(v6_usable(Egress::Direct), has_global_v6_route());
+    }
+
+    #[test]
+    fn link_local_and_ula_do_not_count_as_v6() {
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert!(is_global_v6(&v6("2606:4700:a0::1")));
+        assert!(is_global_v6(&v6("2001:db8::1")));
+        assert!(!is_global_v6(&v6("::1")));
+        assert!(!is_global_v6(&v6("::")));
+        assert!(!is_global_v6(&v6("fe80::1")));
+        assert!(!is_global_v6(&v6("fd00::1")));
     }
 
     #[test]
@@ -605,12 +877,60 @@ mod tests {
     async fn measure_unreachable_returns_empty_within_budget() {
         let dead: Vec<IpAddr> = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
         let t0 = Instant::now();
-        let got = measure(Egress::Direct, dead, EdgeMode::Auto).await;
+        let deadline = t0 + ROUND_BUDGET;
+        let got = measure(Egress::Direct, dead, EdgeMode::Auto, deadline).await;
         assert!(got.is_empty());
         assert!(
             t0.elapsed() < ROUND_BUDGET + Duration::from_secs(2),
             "probing must stay inside its budget, took {:?}",
             t0.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_spent_deadline_stops_probing_immediately() {
+        let dead: Vec<IpAddr> = (1..=20)
+            .map(|i| format!("192.0.2.{i}").parse().unwrap())
+            .collect();
+        let t0 = Instant::now();
+        let got = measure(Egress::Direct, dead, EdgeMode::QuicOnly, t0).await;
+        assert!(got.is_empty());
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "an expired deadline must skip every batch, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_canary_failure_skips_the_rest_of_the_list() {
+        let all: Vec<IpAddr> = (1..=20)
+            .map(|i| format!("2001:db8::{i:x}").parse().unwrap())
+            .collect();
+        let t0 = Instant::now();
+        let got = measure_v6(Egress::Direct, &all, EdgeMode::QuicOnly, t0 + ROUND_BUDGET).await;
+        assert!(got.is_none(), "canary failure must be distinguishable");
+
+        assert!(
+            t0.elapsed() < PROBE_TIMEOUT * 2,
+            "the canary must short-circuit the rest, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_unreachable_v6_family_is_remembered_for_a_while() {
+        let e = Egress::Direct;
+        note_v6(e, true);
+        assert!(!v6_recently_down(e), "a reachable family is never skipped");
+        note_v6(e, false);
+        assert!(v6_recently_down(e), "the negative result must stick");
+
+        V6_DOWN_UNTIL.lock().unwrap()[e.idx()] = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!v6_recently_down(e));
+
+        note_v6(e, false);
+        assert!(!v6_recently_down(Egress::Proxied));
+        note_v6(e, true);
     }
 }

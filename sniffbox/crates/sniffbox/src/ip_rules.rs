@@ -99,14 +99,14 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            match_group("2606:4700:a0::1".parse().unwrap()),
-            Some("cloudflared")
-        );
-        assert_eq!(
-            match_group("2606:4700:a8::10".parse().unwrap()),
-            Some("cloudflared")
-        );
+        for ip in crate::cf_edge::BUILTIN_V6 {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                match_group(ip),
+                Some("cloudflared"),
+                "builtin v6 edge {ip} must fall inside the cloudflared group"
+            );
+        }
 
         assert_eq!(match_group("104.16.0.1".parse().unwrap()), None);
         assert_eq!(match_group("198.41.128.1".parse().unwrap()), None);

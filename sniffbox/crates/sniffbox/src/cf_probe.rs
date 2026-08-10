@@ -271,7 +271,7 @@ pub(crate) fn build_argv(
     ];
     if let Some(ip) = edge {
         argv.push("--edge".into());
-        argv.push(format!("{ip}:{}", crate::cf_edge::EDGE_PORT));
+        argv.push(crate::cf_edge::edge_arg(ip));
     }
     argv.push("--metrics".into());
     argv.push(metrics.to_string());

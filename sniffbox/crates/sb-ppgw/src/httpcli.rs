@@ -97,17 +97,44 @@ pub fn secure_client() -> &'static Client {
 
 #[derive(Debug)]
 struct PinnedResolver {
+    host: Option<String>,
     ips: Vec<IpAddr>,
 }
 
 impl Resolve for PinnedResolver {
-    fn resolve(&self, _name: Name) -> Resolving {
-        let addrs: Vec<SocketAddr> = self.ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
-        Box::pin(ready(if addrs.is_empty() {
-            Err("no pinned address".into())
-        } else {
+    fn resolve(&self, name: Name) -> Resolving {
+        let pinned = match &self.host {
+            None => true,
+            Some(h) => name.as_str().eq_ignore_ascii_case(h),
+        };
+        if pinned {
+            let addrs: Vec<SocketAddr> =
+                self.ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
+            return Box::pin(ready(if addrs.is_empty() {
+                Err("no pinned address".into())
+            } else {
+                Ok(Box::new(addrs.into_iter()) as Addrs)
+            }));
+        }
+
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+
+            let ips = tokio::task::spawn_blocking(move || crate::download::resolve_all(&host))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    e.to_string().into()
+                })?;
+            if ips.is_empty() {
+                return Err("redirect host not found".into());
+            }
+            let addrs: Vec<SocketAddr> = ips
+                .into_iter()
+                .take(16)
+                .map(|ip| SocketAddr::new(ip, 0))
+                .collect();
             Ok(Box::new(addrs.into_iter()) as Addrs)
-        }))
+        })
     }
 }
 
@@ -144,8 +171,15 @@ impl Resolve for DnsServerResolver {
     }
 }
 
+pub fn client_for_host_ips(host: &str, ips: Vec<IpAddr>) -> Client {
+    build(base_builder(false).dns_resolver(PinnedResolver {
+        host: Some(host.to_ascii_lowercase()),
+        ips,
+    }))
+}
+
 pub fn client_for_ips(ips: Vec<IpAddr>) -> Client {
-    build(base_builder(false).dns_resolver(PinnedResolver { ips }))
+    build(base_builder(false).dns_resolver(PinnedResolver { host: None, ips }))
 }
 
 pub fn client_with_dns(server: SocketAddr, ipv6: bool) -> Client {
@@ -171,9 +205,14 @@ pub async fn read_body_bounded(
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut truncated = false;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| HttpErr::Request(e.to_string()))?;
-        buf.extend_from_slice(&chunk);
+    loop {
+        let Some(chunk) = (match tokio::time::timeout(BODY_STALL, stream.next()).await {
+            Ok(c) => c,
+            Err(_) => return Err(stalled()),
+        }) else {
+            break;
+        };
+        buf.extend_from_slice(&chunk.map_err(|e| HttpErr::Request(e.to_string()))?);
         if buf.len() as u64 > limit {
             truncated = true;
             buf.truncate(limit as usize);
@@ -181,6 +220,12 @@ pub async fn read_body_bounded(
         }
     }
     Ok((buf, truncated))
+}
+
+pub const BODY_STALL: Duration = Duration::from_secs(20);
+
+pub fn stalled() -> HttpErr {
+    HttpErr::Request(format!("stalled: no data for {}s", BODY_STALL.as_secs()))
 }
 
 pub fn status_ok(code: u16, expected: &str) -> bool {
@@ -200,7 +245,23 @@ pub async fn check_url_connectivity(
     proxy: &str,
     expected: &str,
 ) -> Result<(bool, u16), HttpErr> {
-    let mut rb = insecure_client().get(target).timeout(PROBE_TIMEOUT);
+    check_url_connectivity_via(target, proxy, None, expected, PROBE_TIMEOUT).await
+}
+
+pub async fn check_url_connectivity_via(
+    target: &str,
+    proxy: &str,
+    pin: Option<IpAddr>,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(bool, u16), HttpErr> {
+    let mut rb = match pin {
+        Some(ip) => {
+            client_for_host_ips(&crate::dnsutil::url_hostname(target), vec![ip]).get(target)
+        }
+        None => insecure_client().get(target),
+    }
+    .timeout(timeout);
     if let Some(p) = proxy_for(proxy)? {
         rb = rb.proxy(p);
     }
@@ -210,6 +271,68 @@ pub async fn check_url_connectivity(
         .map_err(|e| HttpErr::Request(e.to_string()))?;
     let code = resp.status().as_u16();
     Ok((status_ok(code, expected), code))
+}
+
+pub async fn head_status_via(
+    target: &str,
+    proxy: &str,
+    pin: Option<IpAddr>,
+    timeout: Duration,
+) -> Result<(u16, Option<String>), HttpErr> {
+    let client = match pin {
+        Some(ip) => build(no_redirect(base_builder(false).dns_resolver(
+            PinnedResolver {
+                host: Some(crate::dnsutil::url_hostname(target).to_ascii_lowercase()),
+                ips: vec![ip],
+            },
+        ))),
+        None => head_client().clone(),
+    };
+
+    let mut rb = download_identity(client.head(target)).timeout(timeout);
+    if let Some(p) = proxy_for(proxy)? {
+        rb = rb.proxy(p);
+    }
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| HttpErr::Request(e.to_string()))?;
+    let location = resp
+        .headers()
+        .get(wreq::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    Ok((resp.status().as_u16(), location))
+}
+
+pub fn head_status_via_blocking(
+    target: &str,
+    proxy: &str,
+    pin: Option<IpAddr>,
+    timeout: Duration,
+) -> Result<(u16, Option<String>), HttpErr> {
+    crate::rt::block_on(head_status_via(target, proxy, pin, timeout))
+}
+
+fn no_redirect(b: ClientBuilder) -> ClientBuilder {
+    b.redirect(redirect::Policy::none())
+}
+
+fn head_client() -> &'static Client {
+    static C: OnceLock<Client> = OnceLock::new();
+    C.get_or_init(|| build(no_pool(no_redirect(base_builder(false)))))
+}
+
+pub fn check_url_connectivity_via_blocking(
+    target: &str,
+    proxy: &str,
+    pin: Option<IpAddr>,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(bool, u16), HttpErr> {
+    crate::rt::block_on(check_url_connectivity_via(
+        target, proxy, pin, expected, timeout,
+    ))
 }
 
 pub fn check_url_connectivity_blocking(
@@ -223,6 +346,46 @@ pub fn check_url_connectivity_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pinned_resolver_only_pins_its_own_host() {
+        let pinned: IpAddr = "203.0.113.7".parse().unwrap();
+        let r = PinnedResolver {
+            host: Some("a.invalid".into()),
+            ips: vec![pinned],
+        };
+        let addrs: Vec<SocketAddr> = r
+            .resolve(Name::new("a.invalid".into()))
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, vec![SocketAddr::new(pinned, 0)]);
+
+        let addrs: Vec<SocketAddr> = r
+            .resolve(Name::new("A.INVALID".into()))
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, vec![SocketAddr::new(pinned, 0)]);
+
+        let other = r.resolve(Name::new("b.invalid".into())).await;
+        let got: Vec<SocketAddr> = other.map(|a| a.collect()).unwrap_or_default();
+        assert!(
+            !got.contains(&SocketAddr::new(pinned, 0)),
+            "a different host must never inherit the pin: {got:?}"
+        );
+
+        let blind = PinnedResolver {
+            host: None,
+            ips: vec![pinned],
+        };
+        let addrs: Vec<SocketAddr> = blind
+            .resolve(Name::new("b.invalid".into()))
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, vec![SocketAddr::new(pinned, 0)]);
+    }
 
     #[test]
     fn status_ok_semantics() {

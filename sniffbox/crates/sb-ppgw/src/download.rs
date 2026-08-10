@@ -232,6 +232,134 @@ impl Downloader {
         }
     }
 
+    pub async fn stream_to_file(&self, proxy: &str, ips: &[IpAddr]) -> Result<u64, HttpErr> {
+        let have = std::fs::metadata(&self.output)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let (_client, resp) = self.open_stream(proxy, ips, have).await?;
+        let code = resp.status().as_u16();
+
+        if code == 416 {
+            let _ = std::fs::remove_file(&self.output);
+            return Err(HttpErr::Request(
+                "range not satisfiable; partial discarded".into(),
+            ));
+        }
+        if code >= 400 {
+            return Err(HttpErr::Request(format!("status {code}")));
+        }
+        let resuming = code == 206 && have > 0;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(resuming)
+            .truncate(!resuming)
+            .open(&self.output)?;
+        if resuming {
+            log_get(&format!("resuming {} from {have} bytes", self.output));
+        }
+        let mut total = if resuming { have } else { 0 };
+
+        use futures_util::StreamExt;
+        use std::io::Write as _;
+        let mut stream = resp.bytes_stream();
+        loop {
+            let next = match tokio::time::timeout(httpcli::BODY_STALL, stream.next()).await {
+                Ok(c) => c,
+                Err(_) => return Err(httpcli::stalled()),
+            };
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|e| HttpErr::Request(e.to_string()))?;
+            file.write_all(&chunk)?;
+            total += chunk.len() as u64;
+            if total > MAX_BODY {
+                return Err(HttpErr::Request(format!("body exceeds {MAX_BODY} bytes")));
+            }
+        }
+        file.flush()?;
+        Ok(total)
+    }
+
+    pub fn stream_to_file_blocking(&self, proxy: &str, ips: &[IpAddr]) -> Result<u64, HttpErr> {
+        crate::rt::block_on(self.stream_to_file(proxy, ips))
+    }
+
+    async fn open_stream(
+        &self,
+        proxy: &str,
+        ips: &[IpAddr],
+        from: u64,
+    ) -> Result<(wreq::Client, wreq::Response), HttpErr> {
+        let build = |client: wreq::Client| {
+            let mut rb = httpcli::download_identity(client.get(&self.url)).timeout(self.timeout);
+            if from > 0 {
+                rb = rb.header("Range", format!("bytes={from}-"));
+            }
+            (client, rb)
+        };
+        let host = crate::dnsutil::url_hostname(&self.url);
+        if ips.is_empty() {
+            let (client, mut rb) = build(httpcli::insecure_client().clone());
+            if let Some(p) = httpcli::proxy_for(proxy)? {
+                rb = rb.proxy(p);
+            }
+            let resp = rb
+                .send()
+                .await
+                .map_err(|e| HttpErr::Request(e.to_string()))?;
+            return Ok((client, resp));
+        }
+        if let [ip] = ips {
+            let (client, rb) = build(httpcli::client_for_host_ips(&host, vec![*ip]));
+            let resp = rb
+                .send()
+                .await
+                .map_err(|e| HttpErr::Request(e.to_string()))?;
+            return Ok((client, resp));
+        }
+
+        let n = ips.len();
+        let mut set = tokio::task::JoinSet::new();
+        for &ip in ips {
+            let (url, timeout, host) = (self.url.clone(), self.timeout, host.clone());
+            set.spawn(async move {
+                let client = httpcli::client_for_host_ips(&host, vec![ip]);
+                let mut rb = httpcli::download_identity(client.get(&url)).timeout(timeout);
+                if from > 0 {
+                    rb = rb.header("Range", format!("bytes={from}-"));
+                }
+                (
+                    ip,
+                    rb.send()
+                        .await
+                        .map(|r| (client, r))
+                        .map_err(|e| e.to_string()),
+                )
+            });
+        }
+        let mut last = String::from("no answer");
+        let mut fails = 0usize;
+        while let Some(joined) = set.join_next().await {
+            let Ok((ip, res)) = joined else { continue };
+            match res {
+                Ok((client, resp)) => {
+                    log_get(&format!("streaming from {ip} (raced {n} IP)"));
+                    set.abort_all();
+                    return Ok((client, resp));
+                }
+                Err(e) => {
+                    fails += 1;
+                    log_get_warn(&format!("{ip} failed: {e}"));
+                    last = e;
+                    if fails == n {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(HttpErr::Request(last))
+    }
+
     async fn attempt(&self, proxy: &str) -> Result<SubInfo, HttpErr> {
         let mut rb = httpcli::insecure_client().get(&self.url);
         if let Some(p) = httpcli::proxy_for(proxy)? {
@@ -248,7 +376,7 @@ async fn fetch(
     ip: IpAddr,
     timeout: Duration,
 ) -> Result<(Vec<u8>, Option<String>), HttpErr> {
-    let client = httpcli::client_for_ips(vec![ip]);
+    let client = httpcli::client_for_host_ips(&crate::dnsutil::url_hostname(url), vec![ip]);
     send(client.get(url), url, timeout).await
 }
 
@@ -280,6 +408,29 @@ async fn send(
         return Err(HttpErr::Request(format!("body exceeds {MAX_BODY} bytes")));
     }
     Ok((body, userinfo))
+}
+
+pub fn resolve_all(host: &str) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    let ipv6 = crate::dnsutil::ipv6_enabled();
+    let mut out: Vec<IpAddr> = Vec::new();
+    if let Some(ip) = crate::dnsutil::lookup_hosts(host, ipv6) {
+        out.push(ip);
+    }
+    let mut servers = configured_dns_servers();
+    for s in crate::fallback::servers(&servers) {
+        servers.push(s);
+    }
+    for ip in resolve_concurrent(host, &servers, ipv6) {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out.retain(|ip| crate::fallback::is_usable_node_ip(*ip));
+    out.truncate(MAX_RACE_IPS);
+    out
 }
 
 fn system_resolve_all(host: &str, ipv6: bool) -> Vec<IpAddr> {
@@ -458,5 +609,109 @@ mod tests {
             "winner should write correct content to disk"
         );
         let _ = std::fs::remove_file(&out);
+    }
+
+    fn serve_once(
+        ip: &str,
+        reply: impl FnOnce(Option<u64>) -> Vec<u8> + Send + 'static,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(format!("{ip}:0")).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let from = req.split("range: bytes=").nth(1).and_then(|r| {
+                    r.split('-')
+                        .next()
+                        .and_then(|d| d.trim().parse::<u64>().ok())
+                });
+                let _ = s.write_all(&reply(from));
+            }
+        });
+        (port, h)
+    }
+
+    fn tmp_out(tag: &str) -> (std::path::PathBuf, String) {
+        let p = std::env::temp_dir().join(format!("ppgw_{tag}_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let s = p.to_string_lossy().into_owned();
+        (p, s)
+    }
+
+    #[test]
+    fn stream_to_file_writes_the_whole_body() {
+        let (port, srv) = serve_once("127.0.0.2", |from| {
+            assert_eq!(from, None, "nothing on disk means no Range header");
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec()
+        });
+        let (out, out_s) = tmp_out("stream_full");
+        let dl = Downloader::new(&format!("http://testhost:{port}/"), &out_s);
+        let n = dl
+            .stream_to_file_blocking("", &["127.0.0.2".parse().unwrap()])
+            .expect("download");
+        let _ = srv.join();
+        assert_eq!(n, 5);
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn stream_to_file_resumes_from_a_partial() {
+        let (port, srv) = serve_once("127.0.0.2", |from| {
+            assert_eq!(from, Some(3), "must ask for the rest, not the whole file");
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-6/7\r\n\
+              Content-Length: 4\r\nConnection: close\r\n\r\nlow!"
+                .to_vec()
+        });
+        let (out, out_s) = tmp_out("stream_resume");
+        std::fs::write(&out, b"yel").expect("seed partial");
+        let dl = Downloader::new(&format!("http://testhost:{port}/"), &out_s);
+        let n = dl
+            .stream_to_file_blocking("", &["127.0.0.2".parse().unwrap()])
+            .expect("download");
+        let _ = srv.join();
+        assert_eq!(n, 7, "the count covers what was already on disk");
+        assert_eq!(std::fs::read(&out).unwrap(), b"yellow!");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_server_ignoring_range_restarts_the_file() {
+        let (port, srv) = serve_once("127.0.0.2", |from| {
+            assert_eq!(from, Some(3));
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nyellow!".to_vec()
+        });
+        let (out, out_s) = tmp_out("stream_norange");
+        std::fs::write(&out, b"yel").expect("seed partial");
+        let dl = Downloader::new(&format!("http://testhost:{port}/"), &out_s);
+        let n = dl
+            .stream_to_file_blocking("", &["127.0.0.2".parse().unwrap()])
+            .expect("download");
+        let _ = srv.join();
+        assert_eq!(n, 7);
+        assert_eq!(std::fs::read(&out).unwrap(), b"yellow!");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn an_unsatisfiable_range_discards_the_partial() {
+        let (port, srv) = serve_once("127.0.0.2", |_| {
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
+        let (out, out_s) = tmp_out("stream_416");
+        std::fs::write(&out, b"way too long").expect("seed partial");
+        let dl = Downloader::new(&format!("http://testhost:{port}/"), &out_s);
+        let err = dl
+            .stream_to_file_blocking("", &["127.0.0.2".parse().unwrap()])
+            .expect_err("416 must fail");
+        let _ = srv.join();
+        assert!(err.to_string().contains("range"), "{err}");
+        assert!(!out.exists(), "the bad partial must not survive");
     }
 }

@@ -1,6 +1,7 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use std::io;
+use std::net::IpAddr;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -107,19 +108,38 @@ impl Egress {
 
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 
+const MONITOR_INTERVAL_PENDING: Duration = Duration::from_secs(5);
+
 const STARTUP_GRACE: Duration = Duration::from_secs(60);
 
-const DOWNLOAD_RETRY_PROXY: Duration = Duration::from_secs(300);
+const DOWNLOAD_BACKOFF: [Duration; 8] = [
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(180),
+    Duration::from_secs(240),
+    Duration::from_secs(300),
+];
 
-const DOWNLOAD_RETRY_DIRECT: Duration = Duration::from_secs(60);
+const EGRESS_DOWN_FORCE_AFTER: Duration = Duration::from_secs(600);
 
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
-const READY_URL: &str = "http://cp.cloudflare.com/generate_204";
+const DOWNLOAD_TIMEOUT_PROBATION: Duration = Duration::from_secs(60);
+
+const READY_EXPECT: &str = "200-399";
+
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
+
+const PARTIAL_MAX_AGE: Duration = Duration::from_secs(3600);
 
 const HEALTH_SOCKS5: &str = "socks5h://127.0.0.1:1079";
 
@@ -221,9 +241,13 @@ struct Global {
 
     last_download: Option<Instant>,
 
+    download_fails: u32,
+
     last_update: Option<Instant>,
 
     link_ok: bool,
+
+    egress_down_since: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -569,18 +593,14 @@ impl CloudflaredSupervisor {
     }
 
     fn link_ready(&self, egress: Egress) -> bool {
-        match sb_ppgw::httpcli::check_url_connectivity_blocking(READY_URL, egress.proxy_arg(), "0")
-        {
-            Ok((ok, _)) => ok,
-            Err(e) => {
-                tracing::debug!(
-                    ?e,
-                    egress = egress.as_str(),
-                    "cloudflared: link probe failed"
-                );
-                false
-            }
-        }
+        let pin = match egress {
+            Egress::Proxied => None,
+            Egress::Direct => match sb_ppgw::download::resolve_all(download_host()).first() {
+                Some(ip) => Some(*ip),
+                None => return false,
+            },
+        };
+        probe_download(&download_url(), egress.proxy_arg(), pin).0
     }
 
     fn running(&self, egress: Egress) -> bool {
@@ -754,24 +774,7 @@ impl CloudflaredSupervisor {
             return;
         }
 
-        if self.started.elapsed() < STARTUP_GRACE {
-            tracing::debug!("cloudflared: still in startup grace; defer");
-            for (egress, _) in &plan {
-                self.note(*egress, "waiting for system to settle");
-            }
-            return;
-        }
-
         if !Path::new(CF_BIN).is_file() {
-            if !self.proxy_chores_possible() {
-                tracing::debug!(
-                    "cloudflared binary missing and no proxy to download it; waiting for the proxy"
-                );
-                for (egress, _) in &plan {
-                    self.note(*egress, "waiting for the proxy to download cloudflared");
-                }
-                return;
-            }
             let state = self.ensure_binary();
             if state != BinaryState::Ready {
                 for (egress, _) in &plan {
@@ -779,6 +782,14 @@ impl CloudflaredSupervisor {
                 }
                 return;
             }
+        }
+
+        if self.started.elapsed() < STARTUP_GRACE {
+            tracing::debug!("cloudflared: still in startup grace; defer");
+            for (egress, _) in &plan {
+                self.note(*egress, "waiting for system to settle");
+            }
+            return;
         }
 
         let changed = if self.proxy_chores_possible() {
@@ -894,7 +905,7 @@ impl CloudflaredSupervisor {
             self.kill_one(egress);
             let edge_args: Vec<String> = edges
                 .iter()
-                .map(|e| format!("{}:{}", e.ip, crate::cf_edge::EDGE_PORT))
+                .map(|e| crate::cf_edge::edge_arg(e.ip))
                 .collect();
             let pid = match spawn_cf(token, egress, proto, &edge_args, &self.logs) {
                 Ok(pid) => pid,
@@ -961,50 +972,134 @@ impl CloudflaredSupervisor {
         g.last_update.is_none_or(|t| t.elapsed() >= UPDATE_INTERVAL)
     }
 
-    fn download_retry(&self) -> Duration {
-        match self.mode {
-            OutboundMode::Free => DOWNLOAD_RETRY_DIRECT,
-            _ => DOWNLOAD_RETRY_PROXY,
+    fn download_wait(&self) -> Option<Duration> {
+        let g = self.global.lock().unwrap_or_else(|e| e.into_inner());
+        let last = g.last_download?;
+        download_backoff(g.download_fails).checked_sub(last.elapsed())
+    }
+
+    fn next_tick_delay(&self) -> Duration {
+        if Path::new(CF_BIN).is_file() || Egress::ALL.into_iter().any(|e| self.running(e)) {
+            return MONITOR_INTERVAL;
         }
+        self.download_wait()
+            .unwrap_or(Duration::ZERO)
+            .clamp(MONITOR_INTERVAL_PENDING, MONITOR_INTERVAL)
     }
 
     fn ensure_binary(&self) -> BinaryState {
         if Path::new(CF_BIN).is_file() {
+
+            sweep_partial();
             return BinaryState::Ready;
         }
 
-        let healthy = self.link_ready(Egress::Proxied);
-        let retry = self.download_retry();
-        {
-            let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
-            if !healthy {
-                g.link_ok = false;
-                tracing::debug!("cloudflared: egress not usable yet; skip the download attempt");
-                return BinaryState::EgressDown;
+        let arms = self.download_arms(false);
+        if let Err(state) = self.throttle(!arms.is_empty()) {
+            return state;
+        }
+
+        let arms = if arms.is_empty() {
+            self.download_arms(true)
+        } else {
+            arms
+        };
+        let url = download_url();
+
+        let proxy_tried = arms.iter().any(|a| matches!(a, DownloadArm::Proxied));
+        let had = partial_len();
+        for arm in &arms {
+            let budget = arm_budget(arm, proxy_tried);
+            tracing::warn!(
+                %url,
+                arm = arm.label(),
+                budget_s = budget.as_secs(),
+                "cloudflared binary missing; downloading now"
+            );
+            match download_binary(&url, arm, budget) {
+                Ok(version) => {
+                    let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
+                    g.download_fails = 0;
+                    tracing::info!(
+                        bin = CF_BIN,
+                        arm = arm.label(),
+                        %version,
+                        "cloudflared downloaded"
+                    );
+                    return BinaryState::Ready;
+                }
+                Err(e) => {
+                    tracing::warn!(?e, %url, arm = arm.label(), "cloudflared download failed")
+                }
             }
+        }
+
+        let progressed = partial_len() > had;
+        let next = {
+            let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
+            g.download_fails = if progressed {
+                0
+            } else {
+                g.download_fails.saturating_add(1)
+            };
+            download_backoff(g.download_fails)
+        };
+        tracing::warn!(
+            arms = arms.len(),
+            progressed,
+            bytes = partial_len(),
+            retry_secs = next.as_secs(),
+            "cloudflared download did not finish; will retry"
+        );
+        BinaryState::DownloadFailed
+    }
+
+    fn throttle(&self, healthy: bool) -> Result<(), BinaryState> {
+        let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
+        let retry = download_backoff(g.download_fails);
+        if !healthy {
+            g.link_ok = false;
+            let down_for = g
+                .egress_down_since
+                .get_or_insert_with(Instant::now)
+                .elapsed();
+            let forced = down_for >= EGRESS_DOWN_FORCE_AFTER
+                && g.last_download.is_none_or(|t| t.elapsed() >= retry);
+            if !forced {
+                tracing::debug!("cloudflared: egress not usable yet; skip the download attempt");
+                return Err(BinaryState::EgressDown);
+            }
+            tracing::warn!(
+                down_s = down_for.as_secs(),
+                "cloudflared: no egress passed the probe for a long time; \
+                 trying the download anyway (the probe itself may be wrong)"
+            );
+        } else {
+            g.egress_down_since = None;
             let just_became_usable = !g.link_ok;
             g.link_ok = true;
-            if !just_became_usable
-                && let Some(last) = g.last_download
+            if just_became_usable {
+                g.download_fails = 0;
+            } else if let Some(last) = g.last_download
                 && last.elapsed() < retry
             {
-                return BinaryState::DownloadFailed;
-            }
-            g.last_download = Some(Instant::now());
-        }
-        let url = format!("{CF_RELEASE_BASE}{}", cf_asset());
-        tracing::warn!(%url, "cloudflared binary missing; egress is up — downloading now");
-        match download_binary(&url) {
-            Ok(()) => {
-                tracing::info!(bin = CF_BIN, version = %cf_version(), "cloudflared downloaded");
-                BinaryState::Ready
-            }
-            Err(e) => {
-                tracing::warn!(?e, %url, retry_secs = retry.as_secs(),
-                    "cloudflared download failed; will retry");
-                BinaryState::DownloadFailed
+                return Err(BinaryState::DownloadFailed);
             }
         }
+        g.last_download = Some(Instant::now());
+        Ok(())
+    }
+
+    fn download_arms(&self, force: bool) -> Vec<DownloadArm> {
+        let url = download_url();
+        let mut arms = Vec::new();
+        if self.proxy_chores_possible() && (force || probe_download(&url, HEALTH_SOCKS5, None).0) {
+            arms.push(DownloadArm::Proxied);
+        }
+        if let Some(arm) = direct_arm(&url) {
+            arms.push(arm);
+        }
+        arms
     }
 
     fn run_update(&self) -> bool {
@@ -1070,6 +1165,11 @@ impl CloudflaredSupervisor {
         }
         Ok(())
     }
+}
+
+fn download_backoff(fails: u32) -> Duration {
+    let last = DOWNLOAD_BACKOFF.len() - 1;
+    DOWNLOAD_BACKOFF[(fails.saturating_sub(1) as usize).min(last)]
 }
 
 fn want_egress(egress: Egress, mode: CfProxyMode, outbound: OutboundMode) -> bool {
@@ -1420,20 +1520,205 @@ pub(crate) fn drop_to_cf(uid: u32, gid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn download_binary(url: &str) -> io::Result<()> {
-    let tmp = format!("{CF_BIN}.download");
-    sb_ppgw::download::Downloader::new(url, &tmp)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .via_proxy(HEALTH_SOCKS5)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let verdict = verify_elf(&tmp);
-    if let Err(e) = verdict {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DownloadArm {
+
+    Proxied,
+
+    Direct { url: String, ips: Vec<IpAddr> },
+}
+
+impl DownloadArm {
+    fn label(&self) -> &'static str {
+        match self {
+            DownloadArm::Proxied => "proxy",
+            DownloadArm::Direct { .. } => "direct",
+        }
     }
-    set_mode(&tmp, 0o755)?;
+}
+
+fn download_url() -> String {
+    format!("{CF_RELEASE_BASE}{}", cf_asset())
+}
+
+fn probe_download(url: &str, proxy: &str, pin: Option<IpAddr>) -> (bool, Option<String>) {
+    match sb_ppgw::httpcli::head_status_via_blocking(url, proxy, pin, READY_TIMEOUT) {
+        Ok((code, location)) => {
+            let ok = sb_ppgw::httpcli::status_ok(code, READY_EXPECT);
+            if ok {
+                tracing::debug!(code, proxy, "cloudflared: the download URL is reachable");
+            } else {
+                tracing::debug!(code, proxy, "cloudflared: download probe got a bad status");
+            }
+            (ok, location.filter(|_| ok))
+        }
+        Err(e) => {
+            tracing::debug!(?e, proxy, "cloudflared: download probe failed");
+            (false, None)
+        }
+    }
+}
+
+fn download_host() -> &'static str {
+    "github.com"
+}
+
+fn arm_budget(arm: &DownloadArm, proxy_tried: bool) -> Duration {
+    match arm {
+        DownloadArm::Direct { .. } if !proxy_tried => DOWNLOAD_TIMEOUT_PROBATION,
+        _ => DOWNLOAD_TIMEOUT,
+    }
+}
+
+fn direct_arm(url: &str) -> Option<DownloadArm> {
+    let ips = sb_ppgw::download::resolve_all(download_host());
+    let first = *ips.first()?;
+    let (ok, location) = probe_download(url, "", Some(first));
+    if !ok {
+        tracing::debug!("cloudflared: the direct path cannot even HEAD the asset; skipping it");
+        return None;
+    }
+    let Some(loc) = location else {
+        return Some(DownloadArm::Direct {
+            url: url.to_string(),
+            ips,
+        });
+    };
+    let host = sb_ppgw::dnsutil::url_hostname(&loc);
+    let cdn = sb_ppgw::download::resolve_all(&host);
+    if cdn.is_empty() {
+        tracing::debug!(%host, "cloudflared: cannot resolve the redirect target; direct arm skipped");
+        return None;
+    }
+    tracing::debug!(%host, n = cdn.len(), "cloudflared: direct arm will race the redirect target");
+    Some(DownloadArm::Direct { url: loc, ips: cdn })
+}
+
+fn download_binary(url: &str, arm: &DownloadArm, budget: Duration) -> io::Result<String> {
+
+    #[cfg(test)]
+    {
+        let _ = (url, arm, budget);
+        Err(io::Error::other("downloads are disabled in unit tests"))
+    }
+    #[cfg(not(test))]
+    {
+        download_binary_inner(url, arm, budget)
+    }
+}
+
+#[cfg(not(test))]
+fn download_binary_inner(url: &str, arm: &DownloadArm, budget: Duration) -> io::Result<String> {
+    let tmp = partial_path();
+    discard_stale_partial(&tmp);
+    let (url, proxy, ips): (&str, &str, &[IpAddr]) = match arm {
+        DownloadArm::Proxied => (url, HEALTH_SOCKS5, &[]),
+
+        DownloadArm::Direct { url, ips } => (url, "", ips),
+    };
+    sb_ppgw::download::Downloader::new(url, &tmp)
+        .timeout(budget)
+        .stream_to_file_blocking(proxy, ips)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let verdict = verify_elf(&tmp).and_then(|()| {
+        set_mode(&tmp, 0o755)?;
+        verify_runs(&tmp)
+    });
+    let version = match verdict {
+        Ok(v) => v,
+        Err(e) => {
+
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
     std::fs::rename(&tmp, CF_BIN)?;
-    Ok(())
+    Ok(version)
+}
+
+fn partial_path() -> String {
+    format!("{CF_BIN}.download")
+}
+
+fn partial_len() -> u64 {
+    std::fs::metadata(partial_path())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+fn discard_stale_partial(tmp: &str) {
+    if !Path::new(tmp).exists() {
+        return;
+    }
+    let fresh = std::fs::metadata(tmp)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|age| age < PARTIAL_MAX_AGE).unwrap_or(true))
+        .unwrap_or(false);
+    if !fresh {
+        tracing::info!(tmp, "cloudflared: discarding a stale partial download");
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+fn sweep_partial() {
+    let tmp = partial_path();
+    if Path::new(&tmp).exists() {
+        let bytes = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        tracing::info!(
+            tmp,
+            bytes,
+            "cloudflared: binary is in place; removing the leftover partial download"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn verify_runs(path: &str) -> io::Result<String> {
+
+    let root = unsafe { libc::geteuid() } == 0;
+    run_version(path, root.then(|| Egress::Direct.uid_gid()))
+}
+
+fn run_version(path: &str, drop: Option<(u32, u32)>) -> io::Result<String> {
+    let mut cmd = Command::new(path);
+    cmd.arg("--version")
+        .current_dir("/tmp")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some((uid, gid)) = drop {
+
+        unsafe {
+            cmd.pre_exec(move || drop_to_cf(uid, gid));
+        }
+    }
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + VERSION_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(st) => break st,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "--version"));
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    if !status.success() {
+        return Err(io::Error::other(format!("--version exited {status}")));
+    }
+
+    let mut out = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        use std::io::Read;
+        let _ = o.read_to_string(&mut out);
+    }
+    let line = out.lines().next().unwrap_or("").trim().to_string();
+    if line.is_empty() {
+        return Err(io::Error::other("--version printed nothing"));
+    }
+    Ok(line)
 }
 
 fn verify_elf(path: &str) -> io::Result<()> {
@@ -1519,9 +1804,9 @@ pub fn spawn_monitor(
         crate::cf_quality::spawn_rescoring(Arc::clone(&sup), shutdown.clone());
     }
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(MONITOR_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+
+            let nap = sup.next_tick_delay();
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => {
@@ -1529,7 +1814,7 @@ pub fn spawn_monitor(
                         return;
                     }
                 }
-                _ = tick.tick() => {
+                _ = tokio::time::sleep(nap) => {
                     let sup = Arc::clone(&sup);
 
                     let _ = tokio::task::spawn_blocking(move || sup.tick()).await;
@@ -1661,36 +1946,89 @@ mod tests {
             sb_ppgw::procinfo::clash_pid().is_some(),
             "clash modes must gate on the clash process"
         );
-
-        assert_eq!(DOWNLOAD_RETRY_PROXY, Duration::from_secs(300));
-        assert_eq!(DOWNLOAD_RETRY_DIRECT, Duration::from_secs(60));
-        for (mode, want) in [
-            (OutboundMode::Free, DOWNLOAD_RETRY_DIRECT),
-            (OutboundMode::Socks5, DOWNLOAD_RETRY_PROXY),
-            (OutboundMode::Ovpn, DOWNLOAD_RETRY_PROXY),
-            (OutboundMode::Yaml, DOWNLOAD_RETRY_PROXY),
-            (OutboundMode::Suburl, DOWNLOAD_RETRY_PROXY),
-        ] {
-            let s = CloudflaredSupervisor::new(ConfigSource::Production, mode, None);
-            assert_eq!(s.download_retry(), want, "{mode:?}");
-        }
     }
 
     #[test]
-    fn missing_binary_without_egress_is_not_an_attempt() {
-        if Path::new(CF_BIN).is_file() {
-            return;
-        }
-        let s = CloudflaredSupervisor::new(ConfigSource::Production, OutboundMode::Free, None);
-        assert_eq!(s.ensure_binary(), BinaryState::EgressDown);
-        let g = s.global.lock().unwrap();
-        assert!(
-            g.last_download.is_none(),
-            "a skipped attempt must not start the backoff window"
+    fn the_download_backoff_is_a_ladder() {
+        let s = |n| Duration::from_secs(n);
+        assert_eq!(
+            DOWNLOAD_BACKOFF.to_vec(),
+            vec![s(10), s(20), s(30), s(60), s(120), s(180), s(240), s(300)]
         );
+
+        assert_eq!(download_backoff(0), s(10));
+        assert_eq!(download_backoff(1), s(10));
+        assert_eq!(download_backoff(4), s(60));
+        assert_eq!(download_backoff(8), s(300));
+
+        assert_eq!(download_backoff(9), s(300));
+        assert_eq!(download_backoff(u32::MAX), s(300));
         assert!(
-            !g.link_ok,
-            "egress stays marked down so recovery triggers a retry"
+            DOWNLOAD_BACKOFF.windows(2).all(|w| w[0] <= w[1]),
+            "the ladder must be monotonic"
+        );
+
+        let early: Duration = DOWNLOAD_BACKOFF[..4].iter().sum();
+        assert!(early <= s(120), "the first four retries took {early:?}");
+    }
+
+    #[test]
+    fn the_monitor_tightens_its_period_while_the_binary_is_missing() {
+        assert!(
+            MONITOR_INTERVAL_PENDING < DOWNLOAD_BACKOFF[0],
+            "the tick must be finer than the first rung, else the rung is unobservable"
+        );
+        let s = CloudflaredSupervisor::new(ConfigSource::Production, OutboundMode::Free, None);
+        let want = if Path::new(CF_BIN).is_file() {
+            MONITOR_INTERVAL
+        } else {
+            MONITOR_INTERVAL_PENDING
+        };
+        assert_eq!(s.next_tick_delay(), want);
+
+        {
+            let mut g = s.global.lock().unwrap();
+            g.last_download = Some(Instant::now());
+            g.download_fails = 8;
+        }
+        let d = s.next_tick_delay();
+        assert!(d <= MONITOR_INTERVAL, "never nap longer than usual: {d:?}");
+        assert!(d >= MONITOR_INTERVAL_PENDING);
+    }
+
+    #[test]
+    fn the_backoff_only_counts_real_attempts() {
+        let s = CloudflaredSupervisor::new(ConfigSource::Production, OutboundMode::Free, None);
+
+        assert_eq!(s.throttle(false), Err(BinaryState::EgressDown));
+        {
+            let g = s.global.lock().unwrap();
+            assert!(
+                g.last_download.is_none(),
+                "a skipped attempt must not start the backoff window"
+            );
+            assert!(
+                !g.link_ok,
+                "egress stays marked down so recovery triggers a retry"
+            );
+        }
+
+        assert_eq!(s.throttle(true), Ok(()));
+        {
+            let g = s.global.lock().unwrap();
+            assert!(g.last_download.is_some());
+            assert!(g.link_ok);
+        }
+
+        assert_eq!(s.throttle(true), Err(BinaryState::DownloadFailed));
+
+        assert_eq!(s.throttle(false), Err(BinaryState::EgressDown));
+        s.global.lock().unwrap().download_fails = 5;
+        assert_eq!(s.throttle(true), Ok(()));
+        assert_eq!(
+            s.global.lock().unwrap().download_fails,
+            0,
+            "a recovered link starts a fresh ladder"
         );
     }
 
@@ -1734,6 +2072,242 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_hits_the_exact_url_we_download() {
+        let url = download_url();
+        assert_eq!(url, format!("{CF_RELEASE_BASE}{}", cf_asset()));
+        assert!(url.contains(download_host()), "{url}");
+        assert!(url.starts_with("https://"), "TLS or it proves nothing");
+        assert!(url.ends_with(cf_asset()), "the arch-specific asset: {url}");
+        assert_eq!(READY_TIMEOUT, Duration::from_secs(5));
+
+        for code in [200u16, 204, 301, 302, 307, 399] {
+            assert!(sb_ppgw::httpcli::status_ok(code, READY_EXPECT), "{code}");
+        }
+        for code in [400u16, 403, 404, 500, 502] {
+            assert!(!sb_ppgw::httpcli::status_ok(code, READY_EXPECT), "{code}");
+        }
+    }
+
+    #[test]
+    fn the_direct_arm_downloads_from_the_redirect_target() {
+        let cdn = "https://objects.githubusercontent.com/release-assets/cloudflared";
+        let arm = DownloadArm::Direct {
+            url: cdn.to_string(),
+            ips: vec!["203.0.113.7".parse().unwrap()],
+        };
+        let DownloadArm::Direct { url, ips } = &arm else {
+            panic!("built a direct arm");
+        };
+        assert_eq!(
+            url, cdn,
+            "the arm carries the redirect target, not the origin"
+        );
+        assert_ne!(
+            sb_ppgw::dnsutil::url_hostname(url),
+            download_host(),
+            "the CDN host is a different host — that is the whole point"
+        );
+        assert_eq!(ips.len(), 1);
+    }
+
+    #[test]
+    fn the_direct_arm_requires_a_working_head() {
+        let src = include_str!("cf_ctl.rs");
+        let direct = src
+            .split("\nfn direct_arm(url: &str)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("direct_arm exists");
+        assert!(
+            !direct.contains("force"),
+            "force must never reach the direct arm; body was:\n{direct}"
+        );
+        assert!(
+            direct.contains("if !ok {") && direct.contains("return None;"),
+            "a failed HEAD must skip the arm entirely; body was:\n{direct}"
+        );
+
+        let arms = method_body(src, "fn download_arms(&self, force: bool)");
+        assert!(
+            arms.contains("force || probe_download(&url, HEALTH_SOCKS5, None).0"),
+            "the proxy arm keeps its escape hatch; body was:\n{arms}"
+        );
+    }
+
+    #[test]
+    fn the_stall_guard_fires_well_before_the_total_timeout() {
+        let stall = sb_ppgw::httpcli::BODY_STALL;
+        assert!(
+            stall * 3 <= DOWNLOAD_TIMEOUT,
+            "stall {stall:?} vs total {DOWNLOAD_TIMEOUT:?}"
+        );
+        assert!(READY_TIMEOUT < stall);
+
+        const SLOW_LINK_BPS: u64 = 70 * 1024;
+        const ASSET_BYTES: u64 = 40 * 1024 * 1024;
+        assert!(
+            DOWNLOAD_TIMEOUT.as_secs() * SLOW_LINK_BPS >= ASSET_BYTES,
+            "a {}s budget only covers {} MB at 70 KB/s",
+            DOWNLOAD_TIMEOUT.as_secs(),
+            DOWNLOAD_TIMEOUT.as_secs() * SLOW_LINK_BPS / 1_048_576
+        );
+    }
+
+    #[test]
+    fn the_two_download_arms_are_named_apart() {
+        assert_eq!(DownloadArm::Proxied.label(), "proxy");
+        let direct = DownloadArm::Direct {
+            url: download_url(),
+            ips: Vec::new(),
+        };
+        assert_eq!(direct.label(), "direct");
+    }
+
+    #[test]
+    fn a_stale_partial_is_dropped_and_a_fresh_one_is_kept() {
+        let dir = std::env::temp_dir().join(format!("cfpartial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fresh = dir.join("fresh.download");
+        let stale = dir.join("stale.download");
+        std::fs::write(&fresh, b"partial").expect("write");
+        std::fs::write(&stale, b"partial").expect("write");
+        backdate(&stale, PARTIAL_MAX_AGE + Duration::from_secs(60));
+
+        discard_stale_partial(fresh.to_str().unwrap());
+        assert!(fresh.exists(), "a fresh partial is what resume runs on");
+        discard_stale_partial(stale.to_str().unwrap());
+        assert!(!stale.exists(), "a stale partial must be dropped");
+
+        discard_stale_partial(dir.join("nope").to_str().unwrap());
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    fn backdate(path: &std::path::Path, age: Duration) {
+        let when = std::time::SystemTime::now() - age;
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs() as i64;
+        let tv = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let c = std::ffi::CString::new(path.to_str().expect("utf-8")).expect("no NUL");
+
+        let rc = unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed: {}", io::Error::last_os_error());
+    }
+
+    #[test]
+    fn a_downloaded_binary_must_actually_run() {
+        let dir = std::env::temp_dir().join(format!("cfverify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        set_mode(dir.to_str().unwrap(), 0o755).expect("chmod dir");
+        let mk = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).expect("write");
+            set_mode(p.to_str().unwrap(), 0o755).expect("chmod");
+            p
+        };
+
+        let good = mk("good", "#!/bin/sh\necho 'cloudflared version 1.2.3'\n");
+        assert_eq!(
+            verify_runs(good.to_str().unwrap()).expect("must run"),
+            "cloudflared version 1.2.3"
+        );
+
+        let mute = mk("mute", "#!/bin/sh\nexit 0\n");
+        assert!(verify_runs(mute.to_str().unwrap()).is_err());
+
+        let angry = mk("angry", "#!/bin/sh\necho nope\nexit 3\n");
+        assert!(verify_runs(angry.to_str().unwrap()).is_err());
+
+        let junk = mk("junk", "\x7fELF not really\n");
+        assert!(verify_runs(junk.to_str().unwrap()).is_err());
+
+        assert!(verify_runs(dir.join("absent").to_str().unwrap()).is_err());
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn downloads_are_disabled_in_unit_tests() {
+        let arm = DownloadArm::Direct {
+            url: download_url(),
+            ips: vec!["203.0.113.7".parse().unwrap()],
+        };
+        let err =
+            download_binary(&download_url(), &arm, DOWNLOAD_TIMEOUT).expect_err("must be refused");
+        assert!(err.to_string().contains("disabled"), "{err}");
+        let err = download_binary(&download_url(), &DownloadArm::Proxied, DOWNLOAD_TIMEOUT)
+            .expect_err("ditto");
+        assert!(err.to_string().contains("disabled"), "{err}");
+    }
+
+    #[test]
+    fn a_stand_in_direct_arm_only_gets_a_short_lease() {
+        let direct = DownloadArm::Direct {
+            url: download_url(),
+            ips: vec!["203.0.113.7".parse().unwrap()],
+        };
+
+        assert_eq!(
+            arm_budget(&direct, false),
+            DOWNLOAD_TIMEOUT_PROBATION,
+            "a stand-in must hand control back so the proxy can take over"
+        );
+
+        assert_eq!(arm_budget(&direct, true), DOWNLOAD_TIMEOUT);
+
+        assert_eq!(arm_budget(&DownloadArm::Proxied, true), DOWNLOAD_TIMEOUT);
+        assert!(
+            DOWNLOAD_TIMEOUT_PROBATION < DOWNLOAD_TIMEOUT,
+            "a lease that is not shorter is not a lease"
+        );
+
+        assert!(DOWNLOAD_TIMEOUT_PROBATION > sb_ppgw::httpcli::BODY_STALL);
+
+        assert!(DOWNLOAD_TIMEOUT_PROBATION.as_secs() * 51 * 1024 >= 1024 * 1024);
+    }
+
+    #[test]
+    fn making_progress_does_not_climb_the_backoff_ladder() {
+
+        let slices = 39_278_667u64.div_ceil(DOWNLOAD_TIMEOUT_PROBATION.as_secs() * 51 * 1024);
+        let punished: u64 = (1..slices)
+            .map(|n| download_backoff(n as u32).as_secs())
+            .sum();
+        let forgiven: u64 = (1..slices).map(|_| DOWNLOAD_BACKOFF[0].as_secs()).sum();
+        assert!(
+            punished > 3 * forgiven,
+            "punishing progress costs {punished}s of waiting vs {forgiven}s — that is the trap"
+        );
+
+        let s = CloudflaredSupervisor::new(ConfigSource::Production, OutboundMode::Free, None);
+        let bump = |progressed: bool| {
+            let mut g = s.global.lock().unwrap();
+            g.download_fails = if progressed {
+                0
+            } else {
+                g.download_fails.saturating_add(1)
+            };
+            g.download_fails
+        };
+        assert_eq!(bump(false), 1);
+        assert_eq!(bump(false), 2);
+        assert_eq!(bump(true), 0, "a slice that moved bytes is not a failure");
+        assert_eq!(bump(false), 1);
+    }
+
+    #[test]
     fn binary_state_notes_are_distinct() {
         assert_eq!(
             BinaryState::EgressDown.note(),
@@ -1744,6 +2318,23 @@ mod tests {
             "cloudflared binary missing (download failed)"
         );
         assert!(BinaryState::Ready.note().is_empty());
+    }
+
+    #[test]
+    fn the_binary_download_is_not_held_back_by_the_startup_grace() {
+        let src = include_str!("cf_ctl.rs");
+        let body = method_body(src, "fn tick_locked(&self)");
+
+        let download = body
+            .find("let state = self.ensure_binary();")
+            .expect("tick_locked downloads the binary when it is missing");
+        let grace = body
+            .find("self.started.elapsed() < STARTUP_GRACE")
+            .expect("tick_locked defers starts during the grace period");
+        assert!(
+            download < grace,
+            "the download must not sit behind the startup grace"
+        );
     }
 
     fn method_body<'a>(src: &'a str, sig: &str) -> &'a str {
@@ -1769,8 +2360,32 @@ mod tests {
 
         assert!(
             tick.contains("if !Path::new(CF_BIN).is_file() {")
-                && tick.contains("if !self.proxy_chores_possible() {"),
-            "the download path must be gated too"
+                && tick.contains("let state = self.ensure_binary();"),
+            "tick_locked must still download the binary when it is missing"
+        );
+        assert_eq!(
+            tick.matches("proxy_chores_possible").count(),
+            2,
+            "only the two update checks may gate on the proxy; the download must not"
+        );
+
+        let arms = method_body(src, "fn download_arms(&self, force: bool)");
+        assert!(
+            arms.contains("self.proxy_chores_possible()"),
+            "the proxy arm is offered only when the proxy is ready"
+        );
+        assert!(
+            arms.contains("direct_arm(&url)"),
+            "the direct arm must not be conditioned on the proxy; body was:\n{arms}"
+        );
+        let direct = src
+            .split("\nfn direct_arm(url: &str)")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("direct_arm exists");
+        assert!(
+            !direct.contains("proxy_chores_possible") && !direct.contains("proxy_stamp"),
+            "the direct arm waits for nothing; body was:\n{direct}"
         );
         let start = method_body(src, "fn start_replica(&self");
         assert!(

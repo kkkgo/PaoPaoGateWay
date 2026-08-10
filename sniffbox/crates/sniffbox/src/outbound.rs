@@ -13,6 +13,27 @@ use tokio::net::TcpStream;
 
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+static OUTBOUND_WARMED: AtomicBool = AtomicBool::new(false);
+
+const COLD_START_PATIENCE: Duration = Duration::from_secs(30);
+
+const COLD_START_WINDOW: Duration = Duration::from_secs(120);
+
+fn cold_start_patience(started: Duration) -> Option<Duration> {
+    (!OUTBOUND_WARMED.load(Ordering::Relaxed) && started < COLD_START_WINDOW)
+        .then_some(COLD_START_PATIENCE)
+}
+
+fn process_started() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    *T0.get_or_init(std::time::Instant::now)
+}
+
+pub fn mark_start() {
+    let _ = process_started();
+}
+
 pub struct DirectOutbound {
     pub resolver: Arc<Resolver>,
 
@@ -132,6 +153,37 @@ impl Outbound {
         dest: SocketAddr,
         domain: Option<&str>,
     ) -> io::Result<TcpStream> {
+        let first = self.connect_once(dest, domain).await;
+        if first.is_ok() {
+            OUTBOUND_WARMED.store(true, Ordering::Relaxed);
+            return first;
+        }
+        let Some(patience) = cold_start_patience(process_started().elapsed()) else {
+            return first;
+        };
+        let deadline = std::time::Instant::now() + patience;
+        let mut backoff = Duration::from_millis(200);
+        let mut last = first;
+        tracing::debug!(
+            %dest,
+            "outbound not up yet; holding the client while it warms up instead of failing it"
+        );
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(backoff.min(Duration::from_secs(1))).await;
+            backoff *= 2;
+            match self.connect_once(dest, domain).await {
+                Ok(s) => {
+                    OUTBOUND_WARMED.store(true, Ordering::Relaxed);
+                    tracing::info!(%dest, "outbound became usable; first connection served");
+                    return Ok(s);
+                }
+                Err(e) => last = Err(e),
+            }
+        }
+        last
+    }
+
+    async fn connect_once(&self, dest: SocketAddr, domain: Option<&str>) -> io::Result<TcpStream> {
         match self {
             Outbound::Socks5(pool) => pool.connect(dest, domain).await.map_err(io::Error::other),
             Outbound::Direct(d) => {
@@ -159,6 +211,49 @@ impl Outbound {
                 .map_err(io::Error::other)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_start_tests {
+    use super::*;
+
+    #[test]
+    fn patience_only_during_a_cold_start() {
+        let saved = OUTBOUND_WARMED.load(Ordering::Relaxed);
+
+        OUTBOUND_WARMED.store(false, Ordering::Relaxed);
+        assert_eq!(
+            cold_start_patience(Duration::from_secs(5)),
+            Some(COLD_START_PATIENCE),
+            "never connected + just booted → hold the client"
+        );
+
+        assert_eq!(
+            cold_start_patience(COLD_START_WINDOW + Duration::from_secs(1)),
+            None
+        );
+
+        OUTBOUND_WARMED.store(true, Ordering::Relaxed);
+        assert_eq!(cold_start_patience(Duration::from_secs(5)), None);
+        assert_eq!(cold_start_patience(Duration::ZERO), None);
+
+        OUTBOUND_WARMED.store(saved, Ordering::Relaxed);
+    }
+
+    const MEASURED_GAP: Duration = Duration::from_secs(24);
+
+    #[test]
+    fn patience_covers_the_measured_gap() {
+        assert!(
+            COLD_START_PATIENCE >= MEASURED_GAP,
+            "patience {COLD_START_PATIENCE:?} must cover the {MEASURED_GAP:?} nft→clash gap"
+        );
+        assert!(COLD_START_PATIENCE <= Duration::from_secs(45));
+        assert!(
+            COLD_START_WINDOW > COLD_START_PATIENCE * 2,
+            "the window must fit more than one patient attempt"
+        );
     }
 }
 
@@ -263,11 +358,15 @@ mod tests {
         let gate = ob.tun_ready().expect("ovpn has a gate");
         assert!(!gate.load(Ordering::Relaxed));
         let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 443);
+
+        let saved = OUTBOUND_WARMED.load(Ordering::Relaxed);
+        OUTBOUND_WARMED.store(true, Ordering::Relaxed);
         let start = std::time::Instant::now();
         let err = ob
             .connect_tcp(dest, Some("example.com"))
             .await
             .expect_err("tun down → reject");
+        OUTBOUND_WARMED.store(saved, Ordering::Relaxed);
         assert_eq!(err.kind(), io::ErrorKind::NetworkUnreachable);
 
         assert!(start.elapsed() < Duration::from_millis(500));

@@ -608,9 +608,12 @@ get_conf() {
             ppgw -ppsub "$file_down_tmp" -output "$ppsub_output" >"$PPGWTTY" 2>&1
             if pidof clash >/dev/null 2>&1; then
                 rm -f /tmp/ppsub_reload_pending
+            elif [ ! -f /tmp/ppsub_subdns_incomplete ]; then
+                rm -f /tmp/ppsub_reload_pending
+                log "ppsub: subdns fully resolved without the proxy; no reload needed." succ
             elif [ ! -f /tmp/ppsub_reload_pending ]; then
                 : >/tmp/ppsub_reload_pending
-                log "Clash not up during ppsub; reload in 30s to complete subdns via proxy." warn
+                log "Clash not up and subdns incomplete; reload in 30s to retry via proxy." warn
                 (sleep 30; pidof clash >/dev/null 2>&1 && /usr/bin/ppg.sh reload >"$PPGWTTY" 2>&1) </dev/null >/dev/null 2>&1 &
             fi
             if grep -q "proxies:" "$ppsub_output"; then
