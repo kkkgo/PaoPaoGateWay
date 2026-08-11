@@ -37,6 +37,7 @@ pub struct PpgwFlags {
     pub timeout: i64,
     pub genhost: String,
     pub clash_up: bool,
+    pub ppsub_retry: bool,
 }
 
 impl Default for PpgwFlags {
@@ -76,6 +77,7 @@ impl Default for PpgwFlags {
             timeout: 0,
             genhost: String::new(),
             clash_up: false,
+            ppsub_retry: false,
         }
     }
 }
@@ -134,6 +136,7 @@ pub fn parse(argv: &[String]) -> Result<PpgwFlags, GoFlagErr> {
             "dns_burn" => f.dns_burn = bool_val(key, &inline)?,
             "clash-ready" => f.clash_ready = bool_val(key, &inline)?,
             "clash-up" => f.clash_up = bool_val(key, &inline)?,
+            "ppsub-retry" => f.ppsub_retry = bool_val(key, &inline)?,
             "testProxy" => f.test_proxy = bool_val(key, &inline)?,
 
             "port" => f.port = int_val(key, &value!())?,

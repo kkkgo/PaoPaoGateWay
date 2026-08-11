@@ -1,11 +1,22 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+use super::state::LEGACY_MARK;
 use super::{LOG, SubResult, UserInfo, pp_log, pp_step, pp_warn, ystr};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use yaml_rust2::Yaml;
 
-type Resolved = HashMap<String, Vec<IpAddr>>;
+pub(crate) type Resolved = HashMap<String, Vec<IpAddr>>;
+
+#[derive(Default)]
+pub(crate) struct Resolution {
+
+    pub burn: Resolved,
+
+    pub subdns: HashMap<String, Resolved>,
+
+    pub failed: HashMap<String, HashMap<String, Vec<String>>>,
+}
 
 struct SubdnsJob {
     name: String,
@@ -13,18 +24,24 @@ struct SubdnsJob {
     domains: Vec<String>,
 }
 
-pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) -> Vec<Yaml> {
-    let dns_servers = collect_dns_servers(ex_dns);
-    let ipv6 = crate::dnsutil::ipv6_enabled();
+pub(crate) fn build_proxies(
+    sub_results: &[SubResult],
+    res: &Resolution,
+    dns_burn: bool,
+) -> Vec<Yaml> {
     let mut all: Vec<Yaml> = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
     let mut userinfo: Option<(UserInfo, String)> = None;
+    let resolved = &res.burn;
 
-    let (resolved, subdns) = if dns_burn {
-        resolve_all(sub_results, &dns_servers, ipv6)
-    } else {
-        (HashMap::new(), HashMap::new())
-    };
+    let subdns: HashMap<String, Resolved> = res
+        .subdns
+        .iter()
+        .map(|(name, got)| {
+            let uniq = subtract_known(got.clone(), resolved, &format!("[{name}] subdns"));
+            (name.clone(), uniq)
+        })
+        .collect();
 
     for r in sub_results {
         if !r.success {
@@ -41,7 +58,7 @@ pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) 
             }
             all.push(p.clone());
             if dns_burn {
-                burn_proxy(p, &resolved, &mut used, &mut all);
+                burn_proxy(p, resolved, &mut used, &mut all);
             }
         }
     }
@@ -86,11 +103,11 @@ pub fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) 
     result
 }
 
-fn resolve_all(
+pub(crate) fn resolve_all(
     sub_results: &[SubResult],
     dns_servers: &[String],
     ipv6: bool,
-) -> (Resolved, HashMap<String, Resolved>) {
+) -> Resolution {
 
     let mut domains: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -135,23 +152,37 @@ fn resolve_all(
         ));
     }
 
+    type Failed = HashMap<String, HashMap<String, Vec<String>>>;
     let subdns: std::sync::Mutex<HashMap<String, Resolved>> = std::sync::Mutex::new(HashMap::new());
 
-    let unresolved = std::sync::atomic::AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Failed> = std::sync::Mutex::new(HashMap::new());
     let mut resolved = HashMap::new();
     std::thread::scope(|s| {
         let sub_ref = &subdns;
-        let unresolved = &unresolved;
+        let failed_ref = &failed;
         for j in &jobs {
             s.spawn(move || {
                 let tag = format!("[{}] subdns", j.name);
+                let per_domain: std::sync::Mutex<HashMap<String, Vec<String>>> =
+                    std::sync::Mutex::new(HashMap::new());
                 let got = crate::resolvepool::resolve_batch(
                     LOG,
                     &tag,
                     &j.domains,
                     crate::resolvepool::Budget::subdns(),
                     |domain, dl| {
-                        crate::dohdot::resolve_via_servers_traced(domain, &j.specs, ipv6, dl)
+                        let (outcome, specs) = crate::dohdot::resolve_via_servers_detailed(
+                            domain, &j.specs, ipv6, dl, true,
+                        );
+                        let bad: Vec<String> = specs
+                            .into_iter()
+                            .filter(|s| !s.ok)
+                            .map(|s| s.spec)
+                            .collect();
+                        if !bad.is_empty() {
+                            per_domain.lock().unwrap().insert(domain.to_string(), bad);
+                        }
+                        outcome
                     },
                 );
                 let missing = j.domains.iter().filter(|d| !got.contains_key(*d)).count();
@@ -161,7 +192,15 @@ fn resolve_all(
                         j.name,
                         j.domains.len()
                     ));
-                    unresolved.fetch_add(missing, std::sync::atomic::Ordering::Relaxed);
+                }
+                let per_domain = per_domain.into_inner().unwrap();
+                if !per_domain.is_empty() {
+                    let holes: usize = per_domain.values().map(|v| v.len()).sum();
+                    pp_warn(&format!(
+                        "[{}] subdns: {holes} (domain, DNS) pair(s) unanswered by the sub's own DNS",
+                        j.name
+                    ));
+                    failed_ref.lock().unwrap().insert(j.name.clone(), per_domain);
                 }
                 sub_ref.lock().unwrap().insert(j.name.clone(), got);
             });
@@ -171,30 +210,16 @@ fn resolve_all(
             crate::dnsutil::resolve_domains_logged(LOG, "dns_burn", &domains, dns_servers, ipv6);
     });
 
-    mark_subdns_incomplete(unresolved.into_inner() > 0);
+    let _ = std::fs::remove_file(LEGACY_MARK);
 
-    let subdns = subdns
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .map(|(name, got)| {
-            let uniq = subtract_known(got, &resolved, &format!("[{name}] subdns"));
-            (name, uniq)
-        })
-        .collect();
-    (resolved, subdns)
-}
-
-fn mark_subdns_incomplete(incomplete: bool) {
-    const MARK: &str = "/tmp/ppsub_subdns_incomplete";
-    if incomplete {
-        let _ = std::fs::write(MARK, b"1\n");
-    } else {
-        let _ = std::fs::remove_file(MARK);
+    Resolution {
+        burn: resolved,
+        subdns: subdns.into_inner().unwrap(),
+        failed: failed.into_inner().unwrap(),
     }
 }
 
-fn sub_domains(r: &SubResult) -> Vec<String> {
+pub(crate) fn sub_domains(r: &SubResult) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for p in &r.proxies {
@@ -235,7 +260,7 @@ fn burn_proxy(
     }
 }
 
-fn emit_subdns_nodes(
+pub(crate) fn emit_subdns_nodes(
     r: &SubResult,
     unique: &HashMap<String, Vec<IpAddr>>,
     used: &mut HashSet<String>,
@@ -295,7 +320,7 @@ pub(crate) fn subtract_known(
     out
 }
 
-fn sub_dns_servers(raw_yaml: &str) -> Vec<String> {
+pub(crate) fn sub_dns_servers(raw_yaml: &str) -> Vec<String> {
     let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(raw_yaml) else {
         return Vec::new();
     };
@@ -330,7 +355,7 @@ fn generate_subdns_node_name(base: &str, ip: &str, used: &HashSet<String>) -> St
     }
 }
 
-fn collect_dns_servers(ex_dns: &str) -> Vec<String> {
+pub(crate) fn collect_dns_servers(ex_dns: &str) -> Vec<String> {
     let mut servers = Vec::new();
     let dns_ip = std::env::var("dns_ip").unwrap_or_default();
     let dns_port = std::env::var("dns_port").unwrap_or_default();
@@ -360,6 +385,16 @@ fn format_expire(expire: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process_proxies(sub_results: &[SubResult], dns_burn: bool, ex_dns: &str) -> Vec<Yaml> {
+        let res = if dns_burn {
+            let dns_servers = collect_dns_servers(ex_dns);
+            resolve_all(sub_results, &dns_servers, crate::dnsutil::ipv6_enabled())
+        } else {
+            Resolution::default()
+        };
+        build_proxies(sub_results, &res, dns_burn)
+    }
 
     fn subdns_burn_one(
         r: &SubResult,

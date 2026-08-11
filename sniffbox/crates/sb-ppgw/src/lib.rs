@@ -85,6 +85,8 @@ pub enum Subcommand {
     Genhost,
 
     ClashUp,
+
+    PpsubRetry,
     Usage,
 }
 
@@ -111,6 +113,7 @@ impl Subcommand {
             Subcommand::ClashReady => "clash-ready",
             Subcommand::Genhost => "genhost",
             Subcommand::ClashUp => "clash-up",
+            Subcommand::PpsubRetry => "ppsub-retry",
             Subcommand::Usage => "usage",
         }
     }
@@ -139,6 +142,9 @@ pub fn select(f: &PpgwFlags) -> Subcommand {
     }
     if f.clash_up {
         return Subcommand::ClashUp;
+    }
+    if f.ppsub_retry {
+        return Subcommand::PpsubRetry;
     }
     if !f.genhost.is_empty() {
         return Subcommand::Genhost;
@@ -236,6 +242,7 @@ fn execute(sub: Subcommand, f: &PpgwFlags, io: &mut Io) -> i32 {
         Subcommand::ClashReady => cmd_clash_ready(f),
         Subcommand::Genhost => cmd_genhost(f, io),
         Subcommand::ClashUp => clashup::cmd_clash_up(io),
+        Subcommand::PpsubRetry => ppsub::retry::run(io),
         Subcommand::Usage => {
             let _ = write!(io.err, "{}", usage());
             0
@@ -614,6 +621,7 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                     "{}clash already running, rule-set prefetch skipped (clash owns them now)",
                     term::green("[PaoPaoGW RuleSet]")
                 );
+
                 return 0;
             }
 
@@ -628,6 +636,9 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                 rep.removed,
                 rep.backfilled,
             );
+
+            ppsub::state::refresh_output_hash(&f.output);
+            spawn_gap_fill(io);
             0
         }
         Err(e) => {
@@ -637,6 +648,51 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                 term::red("[PaoPaoGW PPSub]")
             );
             1
+        }
+    }
+}
+
+fn spawn_gap_fill(io: &mut Io) {
+    use std::os::unix::process::CommandExt;
+
+    if ppsub::state::dir_overridden() {
+        return;
+    }
+    let Some(st) = ppsub::state::RetryState::load(&ppsub::state::state_file()) else {
+        return;
+    };
+    if !st.pending() || st.clash_socks5 {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg0("ppgw")
+        .arg("-ppsub-retry")
+        .stdin(std::process::Stdio::null());
+
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            let _ = writeln!(
+                io.out,
+                "{}gaps left and clash is not up yet — background gap-fill scheduled (pid {})",
+                term::orange("[PaoPaoGW PPSub]"),
+                child.id()
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                io.out,
+                "{}cannot schedule background gap-fill: {e}",
+                term::red("[PaoPaoGW PPSub]")
+            );
         }
     }
 }
@@ -706,6 +762,9 @@ pub fn usage() -> String {
     s.push_str("  -input <f> [-input <f>...] -output <f>   Merge YAML\n");
     s.push_str(
         "  -ppsub <f> -output <f>             Subscription engine (rule-set prefetch + format detection)\n",
+    );
+    s.push_str(
+        "  -ppsub-retry                       Fill last -ppsub run's gaps once clash is up (self-spawned)\n",
     );
     s
 }

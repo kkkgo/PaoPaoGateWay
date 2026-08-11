@@ -43,6 +43,12 @@ pub enum DnsSpec {
     Dot(String, u16),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecOutcome {
+    pub spec: String,
+    pub ok: bool,
+}
+
 pub fn parse_dns_spec(raw: &str) -> Option<DnsSpec> {
     let s = raw.trim().split('#').next().unwrap_or("").trim();
     if s.is_empty()
@@ -124,11 +130,22 @@ pub fn resolve_via_servers_traced(
     ipv6: bool,
     dl: Deadline,
 ) -> Outcome {
+    resolve_via_servers_detailed(domain, specs, ipv6, dl, true).0
+}
+
+pub fn resolve_via_servers_detailed(
+    domain: &str,
+    specs: &[String],
+    ipv6: bool,
+    dl: Deadline,
+    fallback: bool,
+) -> (Outcome, Vec<SpecOutcome>) {
     let mut set = BTreeSet::new();
     let mut trace: Vec<String> = Vec::new();
-    let parsed: Vec<(String, DnsSpec)> = specs
+    let mut per_spec: Vec<SpecOutcome> = Vec::new();
+    let parsed: Vec<(String, String, DnsSpec)> = specs
         .iter()
-        .filter_map(|s| parse_dns_spec(s).map(|p| (spec_label(s), p)))
+        .filter_map(|s| parse_dns_spec(s).map(|p| (s.clone(), spec_label(s), p)))
         .collect();
 
     let boot = bootstrap_servers(specs);
@@ -137,47 +154,64 @@ pub fn resolve_via_servers_traced(
 
     let socks = !parsed.is_empty() && clash_socks5_ready();
 
-    let pending: Vec<(String, std::sync::mpsc::Receiver<Vec<IpAddr>>)> = parsed
+    let pending: Vec<(String, String, std::sync::mpsc::Receiver<Vec<IpAddr>>)> = parsed
         .iter()
-        .map(|(label, spec)| {
+        .map(|(raw, label, spec)| {
             let (domain, spec, boot) = (domain.to_string(), spec.clone(), boot.to_vec());
             (
+                raw.clone(),
                 label.clone(),
                 spawn_bounded(move || resolve_via(&domain, &spec, ipv6, &boot, socks, dl)),
             )
         })
         .collect();
-    for (label, rx) in pending {
+    for (raw, label, rx) in pending {
         let Some(wait) = dl.clamp(HARD_TIMEOUT) else {
             trace.push(format!("{label}=skipped(budget)"));
+            per_spec.push(SpecOutcome {
+                spec: raw,
+                ok: false,
+            });
             continue;
         };
-        match rx.recv_timeout(wait) {
-            Ok(ips) => trace.push(format!("{label}={}", absorb(ips, &mut set))),
-            Err(_) => trace.push(format!("{label}=timeout")),
-        }
+        let kept = match rx.recv_timeout(wait) {
+            Ok(ips) => {
+                let (kept, tag) = absorb(ips, &mut set);
+                trace.push(format!("{label}={tag}"));
+                kept
+            }
+            Err(_) => {
+                trace.push(format!("{label}=timeout"));
+                0
+            }
+        };
+        per_spec.push(SpecOutcome {
+            spec: raw,
+            ok: kept > 0,
+        });
     }
 
-    if set.is_empty() {
+    if fallback && set.is_empty() {
         for addr in crate::fallback::servers(&udp_specs(specs)) {
             if dl.expired() {
                 trace.push(format!("fb:{addr}=skipped(budget)"));
                 break;
             }
             let ips = crate::dnsutil::resolve_host_via(domain, addr, ipv6);
-            trace.push(format!("fb:{addr}={}", absorb(ips, &mut set)));
+            let (_, tag) = absorb(ips, &mut set);
+            trace.push(format!("fb:{addr}={tag}"));
             if !set.is_empty() {
                 break;
             }
         }
     }
-    Outcome::new(set.into_iter().collect(), trace)
+    (Outcome::new(set.into_iter().collect(), trace), per_spec)
 }
 
-fn absorb(ips: Vec<IpAddr>, set: &mut BTreeSet<IpAddr>) -> String {
+fn absorb(ips: Vec<IpAddr>, set: &mut BTreeSet<IpAddr>) -> (usize, String) {
     let total = ips.len();
     if total == 0 {
-        return "none".to_string();
+        return (0, "none".to_string());
     }
     let mut kept = 0usize;
     for ip in ips {
@@ -186,11 +220,12 @@ fn absorb(ips: Vec<IpAddr>, set: &mut BTreeSet<IpAddr>) -> String {
             kept += 1;
         }
     }
-    if kept < total {
+    let tag = if kept < total {
         format!("{kept}/{total}ip")
     } else {
         format!("{kept}ip")
-    }
+    };
+    (kept, tag)
 }
 
 fn spec_label(spec: &str) -> String {
@@ -202,12 +237,17 @@ fn spec_label(spec: &str) -> String {
     }
 }
 
-fn bootstrap_all(parsed: &[(String, DnsSpec)], boot: &[SocketAddr], ipv6: bool, dl: Deadline) {
+fn bootstrap_all(
+    parsed: &[(String, String, DnsSpec)],
+    boot: &[SocketAddr],
+    ipv6: bool,
+    dl: Deadline,
+) {
     let hosts: Vec<String> = {
         let mut seen = HashSet::new();
         parsed
             .iter()
-            .filter_map(|(_, spec)| match spec {
+            .filter_map(|(_, _, spec)| match spec {
                 DnsSpec::Doh(url) => Some(crate::dnsutil::url_hostname(url)),
                 DnsSpec::Dot(host, _) => Some(host.clone()),
                 DnsSpec::Udp(_) => None,
@@ -321,10 +361,14 @@ where
 
 pub fn clash_socks5_ready() -> bool {
     static READY: OnceLock<bool> = OnceLock::new();
-    *READY.get_or_init(|| match CLASH_SOCKS5_ADDR.parse::<SocketAddr>() {
+    *READY.get_or_init(clash_socks5_probe)
+}
+
+pub fn clash_socks5_probe() -> bool {
+    match CLASH_SOCKS5_ADDR.parse::<SocketAddr>() {
         Ok(addr) => socks5_ready_at(addr),
         Err(_) => false,
-    })
+    }
 }
 
 fn socks5_ready_at(addr: SocketAddr) -> bool {
@@ -355,7 +399,13 @@ fn resolve_via(
 ) -> Vec<IpAddr> {
     match spec {
         DnsSpec::Udp(addr) => crate::dnsutil::resolve_host_via(domain, *addr, ipv6),
-        DnsSpec::Dot(host, port) => resolve_dot(domain, host, *port, ipv6, boot, dl),
+        DnsSpec::Dot(host, port) => {
+            let ips = resolve_dot(domain, host, *port, ipv6, boot, dl);
+            if !ips.is_empty() || !socks || dl.expired() {
+                return ips;
+            }
+            dot_via_socks5(domain, host, *port, ipv6)
+        }
         DnsSpec::Doh(url) => {
             let host = crate::dnsutil::url_hostname(url);
             let ips = doh_resolve(&host, url, domain, ipv6, boot, dl);
@@ -557,6 +607,36 @@ fn dot_query(domain: &str, host: &str, addr: SocketAddr, ipv6: bool) -> Option<V
     crate::rt::block_on(dot_query_async(domain, host, addr, ipv6))
 }
 
+fn dot_via_socks5(domain: &str, host: &str, port: u16, ipv6: bool) -> Vec<IpAddr> {
+    crate::rt::block_on(async {
+        let Some(tcp) = socks5_tunnel(host, port).await else {
+            return Vec::new();
+        };
+        dot_exchange(domain, host, tcp, ipv6)
+            .await
+            .unwrap_or_default()
+    })
+}
+
+async fn socks5_tunnel(host: &str, port: u16) -> Option<tokio::net::TcpStream> {
+    let addr: SocketAddr = CLASH_SOCKS5_ADDR.parse().ok()?;
+    let mut tcp = tokio::time::timeout(DOT_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let dst = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+    let handshake = async {
+        sb_outbound::socks5::handshake_no_auth(&mut tcp)
+            .await
+            .ok()?;
+        sb_outbound::socks5::send_connect(&mut tcp, dst, Some(host))
+            .await
+            .ok()
+    };
+    tokio::time::timeout(TIMEOUT, handshake).await.ok()??;
+    Some(tcp)
+}
+
 async fn dot_query_async(
     domain: &str,
     host: &str,
@@ -567,6 +647,13 @@ async fn dot_query_async(
         .await
         .ok()?
         .ok()?;
+    dot_exchange(domain, host, tcp, ipv6).await
+}
+
+async fn dot_exchange<S>(domain: &str, host: &str, stream: S, ipv6: bool) -> Option<Vec<IpAddr>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut cfg = dot_connector().configure().ok()?;
 
     cfg.set_verify_hostname(false);
@@ -574,7 +661,7 @@ async fn dot_query_async(
         cfg.set_use_server_name_indication(false);
     }
     let ssl = cfg.into_ssl(host).ok()?;
-    let mut tls = tokio_btls::SslStream::new(ssl, tcp).ok()?;
+    let mut tls = tokio_btls::SslStream::new(ssl, stream).ok()?;
     tokio::time::timeout(TIMEOUT, std::pin::Pin::new(&mut tls).connect())
         .await
         .ok()?
@@ -590,11 +677,14 @@ async fn dot_query_async(
     Some(out)
 }
 
-async fn dot_one(
-    tls: &mut tokio_btls::SslStream<tokio::net::TcpStream>,
+async fn dot_one<S>(
+    tls: &mut tokio_btls::SslStream<S>,
     domain: &str,
     qtype: u16,
-) -> Option<message::DnsResponse> {
+) -> Option<message::DnsResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let id = next_id();
@@ -854,6 +944,57 @@ mod tests {
             stop,
             handle: Some(handle),
         }
+    }
+
+    #[test]
+    fn detailed_reports_each_dns_server_separately() {
+        let good = mock_dns(Ipv4Addr::new(104, 16, 0, 9));
+        let good_spec = format!("127.0.0.1:{}", good.port);
+
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_spec = format!("127.0.0.1:{}", dead.local_addr().unwrap().port());
+        drop(dead);
+
+        let specs = vec![good_spec.clone(), dead_spec.clone()];
+        let (outcome, per_spec) =
+            resolve_via_servers_detailed("mixed.test", &specs, false, test_dl(), false);
+        assert_eq!(
+            outcome.ips,
+            vec!["104.16.0.9".parse::<IpAddr>().unwrap()],
+            "the answering server's IP survives: {}",
+            outcome.trace
+        );
+        assert_eq!(
+            per_spec,
+            vec![
+                SpecOutcome {
+                    spec: good_spec,
+                    ok: true
+                },
+                SpecOutcome {
+                    spec: dead_spec,
+                    ok: false
+                },
+            ],
+            "per-server verdicts must be reported in spec order"
+        );
+    }
+
+    #[test]
+    fn fallback_off_skips_public_dns() {
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_spec = format!("127.0.0.1:{}", dead.local_addr().unwrap().port());
+        drop(dead);
+        let specs = vec![dead_spec];
+
+        let (outcome, _) =
+            resolve_via_servers_detailed("nothing.invalid", &specs, false, test_dl(), false);
+        assert!(
+            !outcome.trace.contains("fb:"),
+            "no public fallback should be attempted: {}",
+            outcome.trace
+        );
+        assert!(outcome.ips.is_empty(), "{:?}", outcome.ips);
     }
 
     #[test]

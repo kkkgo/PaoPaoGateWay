@@ -83,7 +83,7 @@ pub fn download_subscription(sub: &SubProvider) -> SubResult {
     }
 }
 
-fn extract_proxies(data: &str, sub_name: &str) -> Vec<Yaml> {
+pub(crate) fn extract_proxies(data: &str, sub_name: &str) -> Vec<Yaml> {
     let mut out = Vec::new();
     let Ok(docs) = YamlLoader::load_from_str(data) else {
         return out;

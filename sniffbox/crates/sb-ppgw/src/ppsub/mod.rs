@@ -2,8 +2,10 @@
 
 mod groups;
 pub(crate) mod proxies;
+pub mod retry;
 mod rules;
-mod sub;
+pub(crate) mod state;
+pub(crate) mod sub;
 
 pub use groups::SMART_HIDE_NODE;
 
@@ -74,7 +76,7 @@ pub const SS_IN_PORT: i64 = 8080;
 
 const SS_CIPHERS: [&str; 2] = ["2022-blake3-aes-128-gcm", "aes-128-gcm"];
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct UserInfo {
     pub total: i64,
     pub upload: i64,
@@ -138,9 +140,6 @@ pub fn process_ppsub(
         serde_json::from_str(&content).map_err(|e| PpsubErr::Config(e.to_string()))?;
 
     let subs = parse_subs(&cfg);
-    let node_groups = parse_node_groups(&cfg);
-    let rule_sets = parse_rules(&cfg);
-    let ss_in = parse_shadowsocks_in(&cfg);
 
     pp_log(&format!(
         "config={config_file} output={output_file} dns_burn={dns_burn}"
@@ -151,8 +150,8 @@ pub fn process_ppsub(
     pp_log(&format!(
         "parsed: {} subscription(s), {} node-group(s), {} rule-set(s)",
         subs.len(),
-        node_groups.len(),
-        rule_sets.len()
+        parse_node_groups(&cfg).len(),
+        parse_rules(&cfg).len()
     ));
 
     pp_step(&format!(
@@ -183,7 +182,43 @@ pub fn process_ppsub(
         "Step 2/4: processing proxy nodes{}",
         if dns_burn { " (dns_burn ON)" } else { "" }
     ));
-    let all_proxies = proxies::process_proxies(&sub_results, dns_burn, ex_dns);
+    let resolution = if dns_burn {
+        let dns_servers = proxies::collect_dns_servers(ex_dns);
+        proxies::resolve_all(&sub_results, &dns_servers, crate::dnsutil::ipv6_enabled())
+    } else {
+        proxies::Resolution::default()
+    };
+
+    let buf = emit_config(&cfg, &sub_results, &resolution, dns_burn, None)?;
+    let bytes = buf.len();
+    std::fs::write(output_file, buf)
+        .map_err(|e| PpsubErr::Write(output_file.to_string(), e.to_string()))?;
+    pp_log(&format!("wrote {output_file} ({bytes} bytes)"));
+
+    save_retry_state(
+        config_file,
+        output_file,
+        dns_burn,
+        ex_dns,
+        &subs,
+        &sub_results,
+        &resolution,
+    );
+    Ok(())
+}
+
+pub(crate) fn emit_config(
+    cfg: &serde_json::Value,
+    sub_results: &[SubResult],
+    resolution: &proxies::Resolution,
+    dns_burn: bool,
+    reuse: Option<&Yaml>,
+) -> Result<String, PpsubErr> {
+    let node_groups = parse_node_groups(cfg);
+    let rule_sets = parse_rules(cfg);
+    let ss_in = parse_shadowsocks_in(cfg);
+
+    let all_proxies = proxies::build_proxies(sub_results, resolution, dns_burn);
     pp_log(&format!("merged {} proxy node(s)", all_proxies.len()));
 
     pp_step(&format!(
@@ -191,22 +226,34 @@ pub fn process_ppsub(
         node_groups.len()
     ));
     let (proxy_groups, proxy_providers) =
-        groups::generate_proxy_groups(&node_groups, &all_proxies, &sub_results);
+        groups::generate_proxy_groups(&node_groups, &all_proxies, sub_results);
     pp_log(&format!(
         "generated {} proxy-group(s), {} proxy-provider(s)",
         proxy_groups.len(),
         proxy_providers.len()
     ));
 
-    pp_step(&format!(
-        "Step 4/4: processing {} rule-set(s)",
-        rule_sets.len()
-    ));
-    let (rule_list, rule_providers) = rules::process_rules(&rule_sets, &proxy_groups)?;
+    let (rule_list, rule_providers) = match reuse {
+        Some(prev) => {
+            pp_step("Step 4/4: reusing rules from the previous config (no rule download)");
+            reuse_rules(prev)
+        }
+        None => {
+            pp_step(&format!(
+                "Step 4/4: processing {} rule-set(s)",
+                rule_sets.len()
+            ));
+            let (list, providers) = rules::process_rules(&rule_sets, &proxy_groups)?;
+            (
+                Yaml::Array(list.into_iter().map(Yaml::String).collect()),
+                Yaml::Hash(providers),
+            )
+        }
+    };
     pp_log(&format!(
         "produced {} rule(s), {} rule-provider(s)",
-        rule_list.len(),
-        rule_providers.len()
+        rule_list.as_vec().map(|v| v.len()).unwrap_or(0),
+        rule_providers.as_hash().map(|h| h.len()).unwrap_or(0),
     ));
 
     let mut all_proxies = all_proxies;
@@ -224,12 +271,13 @@ pub fn process_ppsub(
     if !proxy_providers.is_empty() {
         root.insert(ystr("proxy-providers"), Yaml::Hash(proxy_providers));
     }
-    root.insert(
-        ystr("rules"),
-        Yaml::Array(rule_list.into_iter().map(Yaml::String).collect()),
-    );
-    if !rule_providers.is_empty() {
-        root.insert(ystr("rule-providers"), Yaml::Hash(rule_providers));
+    root.insert(ystr("rules"), rule_list);
+    if rule_providers
+        .as_hash()
+        .map(|h| !h.is_empty())
+        .unwrap_or(false)
+    {
+        root.insert(ystr("rule-providers"), rule_providers);
     }
     if let Some(ss) = &ss_in {
         pp_log(&format!(
@@ -244,11 +292,100 @@ pub fn process_ppsub(
     YamlEmitter::new(&mut buf)
         .dump(&Yaml::Hash(root))
         .map_err(|e| PpsubErr::Emit(format!("{e:?}")))?;
-    let bytes = buf.len();
-    std::fs::write(output_file, buf)
-        .map_err(|e| PpsubErr::Write(output_file.to_string(), e.to_string()))?;
-    pp_log(&format!("wrote {output_file} ({bytes} bytes)"));
-    Ok(())
+    Ok(buf)
+}
+
+fn reuse_rules(prev: &Yaml) -> (Yaml, Yaml) {
+    let rules = match &prev["rules"] {
+        Yaml::Array(a) => Yaml::Array(a.clone()),
+        _ => Yaml::Array(Vec::new()),
+    };
+    let providers = match &prev["rule-providers"] {
+        Yaml::Hash(h) => Yaml::Hash(h.clone()),
+        _ => Yaml::Hash(Hash::new()),
+    };
+    (rules, providers)
+}
+
+fn save_retry_state(
+    config_file: &str,
+    output_file: &str,
+    dns_burn: bool,
+    ex_dns: &str,
+    subs: &[SubProvider],
+    sub_results: &[SubResult],
+    res: &proxies::Resolution,
+) {
+    use state::{DomainState, RetryState, SubState};
+
+    let _ = std::fs::create_dir_all(state::cache_dir());
+    let config_copy = format!("{}/config.json", state::cache_dir());
+    if std::fs::copy(config_file, &config_copy).is_err() {
+        pp_warn("retry state: cannot cache ppsub config, background gap-fill disabled");
+        return;
+    }
+
+    let mut st = RetryState {
+        config: config_copy,
+        output: output_file.to_string(),
+        output_hash: state::file_hash(output_file),
+        dns_burn,
+        ex_dns: ex_dns.to_string(),
+        clash_socks5: crate::dohdot::clash_socks5_ready(),
+        ..Default::default()
+    };
+
+    for (sub, r) in subs.iter().zip(sub_results.iter()) {
+        let mut ss = SubState {
+            name: sub.name.clone(),
+            url: sub.url.clone(),
+            forced: sub.is_forced,
+            ok: r.success,
+            userinfo: r.userinfo.clone(),
+            ..Default::default()
+        };
+        if r.success {
+            let path = state::cache_path(&sub.name);
+            if std::fs::write(&path, &r.raw_yaml).is_ok() {
+                ss.cache = path;
+            }
+            ss.specs = proxies::sub_dns_servers(&r.raw_yaml);
+            let empty = std::collections::HashMap::new();
+            let got = res.subdns.get(&r.name).unwrap_or(&empty);
+            let failed = res.failed.get(&r.name);
+            for d in proxies::sub_domains(r) {
+                let ips = got
+                    .get(&d)
+                    .map(|v| v.iter().map(|ip| ip.to_string()).collect())
+                    .unwrap_or_default();
+                let failed_specs = failed.and_then(|f| f.get(&d)).cloned().unwrap_or_default();
+                ss.domains.insert(d, DomainState { ips, failed_specs });
+            }
+
+            if dns_burn {
+                for d in proxies::sub_domains(r) {
+                    st.burn.entry(d.clone()).or_insert_with(|| {
+                        res.burn
+                            .get(&d)
+                            .map(|v| v.iter().map(|ip| ip.to_string()).collect())
+                            .unwrap_or_default()
+                    });
+                }
+            }
+        }
+        st.subs.push(ss);
+    }
+
+    if let Err(e) = st.save(&state::state_file()) {
+        pp_warn(&format!("retry state: write failed: {e}"));
+        return;
+    }
+    let (bad_subs, bad_specs, bad_burn) = st.gaps();
+    if st.pending() {
+        pp_warn(&format!(
+            "gaps left: {bad_subs} subscription(s) undownloaded, {bad_specs} (domain, DNS) pair(s) unanswered, {bad_burn} domain(s) unresolved by dns_burn"
+        ));
+    }
 }
 
 fn group_references_smart_hide(proxy_groups: &[Yaml]) -> bool {
@@ -414,6 +551,69 @@ fn parse_rules(cfg: &serde_json::Value) -> Vec<RuleSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emit_config_reuses_rules_without_downloading() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+              "subs": [{"name":"S","url":"http://x/s"}],
+              "node-groups": [{"name":"HK","keywords":["HK"]}],
+              "rules": [{"priority":1,"type":"rules","name":"blocked","url":"http://127.0.0.1:1/x"}]
+            }"#,
+        )
+        .unwrap();
+        let prev_text = "proxies: []\nrules:\n  - 'DOMAIN,a.com,HK'\n  - 'MATCH,DIRECT'\nrule-providers:\n  ads:\n    type: http\n    url: http://x/ads.yaml\n";
+        let prev = &yaml_rust2::YamlLoader::load_from_str(prev_text).unwrap()[0];
+
+        let mut h = yaml_rust2::yaml::Hash::new();
+        h.insert(ystr("name"), ystr("S_HK01"));
+        h.insert(ystr("server"), ystr("1.2.3.4"));
+        h.insert(ystr("type"), ystr("ss"));
+        let sub_results = vec![SubResult {
+            name: "S".into(),
+            success: true,
+            proxies: vec![Yaml::Hash(h)],
+            userinfo: None,
+            raw_yaml: String::new(),
+            error: String::new(),
+        }];
+
+        let started = std::time::Instant::now();
+        let out = emit_config(
+            &cfg,
+            &sub_results,
+            &proxies::Resolution::default(),
+            false,
+            Some(prev),
+        )
+        .expect("emit");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "reuse path must not touch the network, took {:?}",
+            started.elapsed()
+        );
+
+        let doc = &yaml_rust2::YamlLoader::load_from_str(&out).unwrap()[0];
+        let rules: Vec<&str> = doc["rules"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        assert_eq!(
+            rules,
+            vec!["DOMAIN,a.com,HK", "MATCH,DIRECT"],
+            "rules must come from the previous config verbatim"
+        );
+        assert_eq!(
+            doc["rule-providers"]["ads"]["url"].as_str(),
+            Some("http://x/ads.yaml"),
+            "rule-providers must be carried over too"
+        );
+
+        assert_eq!(doc["proxies"][0]["name"].as_str(), Some("S_HK01"));
+        assert_eq!(doc["proxy-groups"][0]["name"].as_str(), Some("HK"));
+    }
 
     #[test]
     fn parse_node_group_subs_nil_vs_empty() {
