@@ -37,42 +37,100 @@ ppgwout() {
 
 ppgw() { /usr/bin/sniffbox ppgw "$@"; }
 
+PPGW_INI=/tmp/ppgw.ini
+PPGW_ENV=/tmp/ppgw.env
+SNIFFBOX_SNAPSHOT=/tmp/sniffbox_running.ini
+
 set_default() {
     eval "case \${$1} in '') $1=\"$2\" ;; esac"
 }
 
 apply_defaults() {
-    set_default test_node_url "http://cp.cloudflare.com/generate_204"
-    set_default fall_direct "no"
-    set_default ext_node "Traffic|Expire| GB|Days|Date"
-    set_default down_url "download_url_not_found"
-    set_default dns_ip "223.5.5.5"
-    set_default dns_port "53"
-    set_default udp_enable "no"
-    set_default fake_cidr "7.0.0.0/8"
-    set_default openport "no"
-    set_default mode "free"
+    if [ -z "$gw" ]; then
+        gw=$(ip route show | grep "default via" | head -1 | grep -Eo "$IPREX4" | head -1)
+    fi
     set_default socks5_ip "$gw"
-    set_default socks5_port "7890"
-    set_default yamlfile "custom.yaml"
-    set_default ovpnfile "custom.ovpn"
-    set_default dns_burn "yes"
-    set_default ex_dns "223.5.5.5:53,1.0.0.1:53"
-    set_default subtime "1d"
+    set_default down_url "download_url_not_found"
     set_default tomorrow "tomorrow"
-    set_default cf_proxy "yes"
-    case "$cf_proxy" in
-    yes | no | both) ;;
-    *) cf_proxy="yes" ;;
-    esac
+}
+
+load_ini() {
+    if [ ! -f "$PPGW_INI" ]; then
+        if ppgw -ini-export /dev/null >"$PPGW_ENV.boot" 2>/dev/null; then
+            . "$PPGW_ENV.boot"
+            apply_defaults
+        fi
+        rm -f "$PPGW_ENV.boot"
+        return 1
+    fi
+    ppgw -ini-export "$PPGW_INI" >"$PPGW_ENV.new" 2>"$PPGW_ENV.err"
+    ini_rc=$?
+    if [ -s "$PPGW_ENV.err" ]; then
+        while read -r ini_err_line; do ppgwecho "$ini_err_line"; done <"$PPGW_ENV.err"
+    fi
+    rm -f "$PPGW_ENV.err"
+    if [ "$ini_rc" = "0" ]; then
+        mv "$PPGW_ENV.new" "$PPGW_ENV"
+    else
+        rm -f "$PPGW_ENV.new"
+        log "Bad ppgw.ini, keep last known good config." warn
+        [ -f "$PPGW_ENV" ] || return 1
+    fi
+    . "$PPGW_ENV"
+    apply_defaults
+    return 0
+}
+
+capture_old_all() {
+    old_fake_cidr=$fake_cidr
+    old_openport=$openport
+    old_openport_auth=$openport_auth
+    old_clash_web_password=$clash_web_password
+    old_net_rec=$net_rec
+    old_max_rec=$max_rec
+    old_net_cleanday=$net_cleanday
+    old_box=$box
+    old_udp_enable=$udp_enable
+    old_dns_ip=$dns_ip
+    old_dns_port=$dns_port
+    old_pplog=$pplog
+    old_pplog_uuid=$pplog_uuid
+    old_admin_cidr=$admin_cidr
+    old_proxy_cidr=$proxy_cidr
+    old_socks5_ip=$socks5_ip
+    old_socks5_port=$socks5_port
+    old_socks5_username=$socks5_username
+    old_socks5_password=$socks5_password
+    old_mode=$mode
+    old_cloudflared_token=$cloudflared_token
+    old_cf_proxy=$cf_proxy
+}
+
+capture_old_box() {
+    old_fake_cidr=$fake_cidr
+    old_udp_enable=$udp_enable
+    old_net_rec=$net_rec
+    old_pplog=$pplog
+    old_pplog_uuid=$pplog_uuid
+    old_mode=$mode
+    old_socks5_ip=$socks5_ip
+    old_socks5_port=$socks5_port
+    old_socks5_username=$socks5_username
+    old_socks5_password=$socks5_password
+}
+
+load_baseline() {
+    load_ini
+    capture_old_all
+    if [ -f "$SNIFFBOX_SNAPSHOT" ]; then
+        . "$SNIFFBOX_SNAPSHOT" 2>"$PPGWTTY"
+        apply_defaults
+        capture_old_box
+        load_ini
+    fi
 }
 
 log_cf_proxy() {
-    raw_cf_proxy=$(grep -E "^[ ]*cf_proxy[ ]*=" /tmp/ppgw.ini 2>/dev/null | tail -1 |
-        sed -e 's/^[ ]*cf_proxy[ ]*=[ ]*//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-    if [ -n "$raw_cf_proxy" ] && [ "$raw_cf_proxy" != "$cf_proxy" ]; then
-        log "Unknown cf_proxy=[""$raw_cf_proxy""], treat as yes (proxied replica only)." warn
-    fi
     if [ "$cf_proxy" = "no" ]; then
         log "[CLOUDFLARED] : token set, cf_proxy=no (direct replica only, uid 7845)" succ
     elif [ "$mode" = "free" ]; then
@@ -278,10 +336,7 @@ load_clash() {
             ulimit -SHn 1048576
             log "ulimit:"$(ulimit -n)
         fi
-        if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>"$PPGWTTY"
-        fi
-        apply_defaults
+        load_ini
         closeall_flag="no"
         is_reload=0
         log "[MODE]:""$mode"" [VERSION] :""$(clash -v)" succ
@@ -390,10 +445,7 @@ load_ovpn() {
         done </tmp/ovpn_remote.list
 
         sed -r "/^dev /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
-        if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>"$PPGWTTY"
-            apply_defaults
-        fi
+        load_ini
         if [ -n "$ovpn_username" ]; then
             sed -r "/^auth-user-pass /d" /tmp/ppgw.ovpn.down >/tmp/paopao.ovpn
             sed -i "/^service /d" /tmp/paopao.ovpn
@@ -414,10 +466,8 @@ load_ovpn() {
 }
 
 gen_hash() {
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>"$PPGWTTY"
-        str="ppgw""$fake_cidr""$dns_ip""$dns_port""$openport""$openport_auth""$clash_web_password""$mode""$udp_enable""$socks5_ip""$socks5_port""$socks5_username""$socks5_password""$ovpnfile""$ovpn_username""$ovpn_password""$yamlfile""$suburl""$subtime""$subcron""$fast_node""$test_node_url""$ext_node""$fall_direct""$dns_burn""$ex_dns""$net_rec""$max_rec""$net_cleanday""$pplog""$pplog_uuid""$admin_cidr""$proxy_cidr""$cloudflared_token""$cf_proxy"
-        echo "$str" | md5sum | grep -Eo "[a-z0-9]{32}" | head -1
+    if load_ini; then
+        md5sum "$PPGW_ENV" | grep -Eo "[a-z0-9]{32}" | head -1
     else
         echo "INI does not exist"
     fi
@@ -497,10 +547,7 @@ get_conf() {
         cp /www/ppsub.json "$file_down_tmp"
         log "Load local ppsub.json" succ
     else
-        if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>"$PPGWTTY"
-            apply_defaults
-        fi
+        load_ini
         echo "127.0.0.1 localhost" >/etc/hosts
         if echo "$down_url" | grep -qE "^http://paopao\.dns([:/]|$)"; then
             dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
@@ -563,9 +610,6 @@ get_conf() {
     if [ "$down_type" = "yaml" ]; then
         if grep -q "proxies:" "$file_down_tmp"; then
             cp "$file_down_tmp" "$file_down"
-            if [ -f /www/ppgw.ini ]; then
-                . /www/ppgw.ini
-            fi
             if [ "$fast_node" = "yes" ]; then
                 if grep -oq "proxy-providers:" "$file_down"; then
                     sed 's/\r/\n/g' "$file_down" | grep -v "\- RULE-SET" | sed "s/rule-providers:/rule-disable-providers:/g" | sed "s/rules:/ru-disable-les:/g" >"/tmp/paopao_custom.yaml"
@@ -597,8 +641,7 @@ get_conf() {
             if [ -f "$ppsub_cpy" ]; then
                 rm "$ppsub_cpy"
             fi
-            . /tmp/ppgw.ini 2>"$PPGWTTY"
-            apply_defaults
+            load_ini
             if [ "$dns_burn" != "no" ]; then
                 export dns_burn="yes"
                 export ex_dns="$ex_dns"
@@ -629,7 +672,7 @@ try_conf() {
         . /www/ppgwurl.ini
         if [ -n "$ppgwurl" ]; then
             get_conf "$ppgwurl" "ini"
-            return 0
+            return $?
         fi
     fi
 
@@ -717,8 +760,7 @@ reload_gw() {
         log "[SYSCTL] Turn on net.ipv4.conf.all.route_localnet..." warn
         sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1
     fi
-    . /tmp/ppgw.ini 2>"$PPGWTTY"
-    apply_defaults
+    load_ini
 
     if [ -n "$mode" ]; then
         log "[MODE] : ""$mode" succ
@@ -840,53 +882,13 @@ reload_gw() {
 
 if [ "$1" = "reload" ]; then
     log "Force reload gateway..." warn
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>"$PPGWTTY"
-        apply_defaults
-    fi
-    old_fake_cidr=$fake_cidr
-    old_udp_enable=$udp_enable
-    old_net_rec=$net_rec
-    old_pplog=$pplog
-    old_pplog_uuid=$pplog_uuid
-    old_mode=$mode
-    old_socks5_ip=$socks5_ip
-    old_socks5_port=$socks5_port
-    old_socks5_username=$socks5_username
-    old_socks5_password=$socks5_password
-    old_box=$box
-    old_clash_web_password=$clash_web_password
-    old_dns_ip=$dns_ip
-    old_dns_port=$dns_port
-    old_openport_auth=$openport_auth
-    old_admin_cidr=$admin_cidr
-    old_proxy_cidr=$proxy_cidr
-    old_max_rec=$max_rec
-    old_net_cleanday=$net_cleanday
-    old_cf_proxy=$cf_proxy
-
-    if [ -f /tmp/sniffbox_running.ini ]; then
-        . /tmp/sniffbox_running.ini 2>"$PPGWTTY"
-        apply_defaults
-        old_fake_cidr=$fake_cidr
-        old_udp_enable=$udp_enable
-        old_net_rec=$net_rec
-        old_pplog=$pplog
-        old_pplog_uuid=$pplog_uuid
-        old_mode=$mode
-        old_socks5_ip=$socks5_ip
-        old_socks5_port=$socks5_port
-        old_socks5_username=$socks5_username
-        old_socks5_password=$socks5_password
-        if [ -f /tmp/ppgw.ini ]; then . /tmp/ppgw.ini 2>"$PPGWTTY"; apply_defaults; fi
-    fi
+    load_baseline
 
     if ! try_conf "ppgw.ini" "ini"; then
         log "Cannot get ppgw.ini, abort reload." warn
         exit 1
     fi
-    . /tmp/ppgw.ini 2>"$PPGWTTY"
-    apply_defaults
+    load_ini
 
     # Detect sniffbox changes and reload.
     need_cold_reload=0
@@ -967,48 +969,7 @@ last_yaml_hash="empty"
 last_ovpn_hash="empty"
 hc_fail_streak=0
 while true; do
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>"$PPGWTTY"
-        apply_defaults
-        old_fake_cidr=$fake_cidr
-        old_openport=$openport
-        old_openport_auth=$openport_auth
-        old_clash_web_password=$clash_web_password
-        old_net_rec=$net_rec
-        old_max_rec=$max_rec
-        old_net_cleanday=$net_cleanday
-        old_box=$box
-        old_udp_enable=$udp_enable
-        old_dns_ip=$dns_ip
-        old_dns_port=$dns_port
-        old_pplog=$pplog
-        old_pplog_uuid=$pplog_uuid
-        old_admin_cidr=$admin_cidr
-        old_proxy_cidr=$proxy_cidr
-        old_socks5_ip=$socks5_ip
-        old_socks5_port=$socks5_port
-        old_socks5_username=$socks5_username
-        old_socks5_password=$socks5_password
-        old_mode=$mode
-        old_cloudflared_token=$cloudflared_token
-        old_cf_proxy=$cf_proxy
-        if [ -f /tmp/sniffbox_running.ini ]; then
-            . /tmp/sniffbox_running.ini 2>"$PPGWTTY"
-            apply_defaults
-            old_fake_cidr=$fake_cidr
-            old_udp_enable=$udp_enable
-            old_net_rec=$net_rec
-            old_pplog=$pplog
-            old_pplog_uuid=$pplog_uuid
-            old_mode=$mode
-            old_socks5_ip=$socks5_ip
-            old_socks5_port=$socks5_port
-            old_socks5_username=$socks5_username
-            old_socks5_password=$socks5_password
-            . /tmp/ppgw.ini 2>"$PPGWTTY"
-            apply_defaults
-        fi
-    fi
+    load_baseline
     if ! try_conf "ppgw.ini" "ini"; then
         log "Failed to get ppgw.ini, retry later." warn
         sleep 30
@@ -1020,10 +981,7 @@ while true; do
     if [ "$hash" != "$last_hash" ]; then
         if echo "$hash" | grep -Eqo "[a-z0-9]{32}"; then
             log "The hash has changed, reload gateway." warn
-            if [ -f /tmp/ppgw.ini ]; then
-                . /tmp/ppgw.ini 2>"$PPGWTTY"
-                apply_defaults
-            fi
+            load_ini
             need_kill_clash=0
             need_cold_reload=0
             cold_reload_done=0
@@ -1109,9 +1067,7 @@ while true; do
             continue
         fi
     fi
-    if [ -f /tmp/ppgw.ini ]; then
-        . /tmp/ppgw.ini 2>"$PPGWTTY"
-        apply_defaults
+    if load_ini; then
         if box_hot_changed; then
             log "The box config has changed, hot reload box." warn
             hot_reload_box
@@ -1234,14 +1190,9 @@ while true; do
         sleep_count=$((sleep_count + 1))
     fi
     if [ "$mode" = "suburl" ]; then
-        if [ -f /tmp/ppgw.ini ]; then
-            . /tmp/ppgw.ini 2>"$PPGWTTY"
-            apply_defaults
-        fi
-        # ppgw apply subtime/subcron
+        load_ini
         current_hour=$(date +%H)
         current_date=$(date +%Y-%m-%d)
-        subcron=$(grep -E "^subcron[ ]*=" /tmp/ppgw.ini | grep -Eo "(1[0-9]|2[0-3]|[0-9])" | tail -1)
         if echo "$subcron" | grep -Eqo '^(1[0-9]|2[0-3]|[0-9])$'; then
             ppgw_subtime=6000
             if [ "$current_hour" -lt "$subcron" ]; then

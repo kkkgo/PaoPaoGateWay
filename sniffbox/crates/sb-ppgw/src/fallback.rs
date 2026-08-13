@@ -106,25 +106,9 @@ fn fake_cidr() -> &'static (Ipv4Addr, u32) {
 }
 
 fn ini_value(path: &str, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    ini_value_in(&text, key)
-}
-
-fn ini_value_in(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        if k.trim() != key {
-            continue;
-        }
-        let v = v.trim().trim_matches(['"', '\'']).trim();
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    None
+    crate::inienv::Ini::read_lossy(path)
+        .get(key)
+        .map(str::to_string)
 }
 
 fn parse_v4_cidr(s: &str) -> Option<(Ipv4Addr, u32)> {
@@ -221,16 +205,19 @@ mod tests {
 
     #[test]
     fn ini_value_parsing() {
-        let ini =
-            "# comment\nudp_enable=true\nfake_cidr = \"28.0.0.0/8\"  # inline\nmax_rec=5000\n";
-        assert_eq!(
-            ini_value_in(ini, "fake_cidr").as_deref(),
-            Some("28.0.0.0/8")
-        );
-        assert_eq!(ini_value_in(ini, "udp_enable").as_deref(), Some("true"));
-        assert_eq!(ini_value_in(ini, "absent"), None);
+        let path = std::env::temp_dir().join(format!("ppgw_fb_ini_{}.ini", std::process::id()));
+        std::fs::write(
+            &path,
+            "# comment\nudp_enable=true\nfake_cidr=7.0.0.0/8\nfake_cidr=\"28.0.0.0/8\"  # inline\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
 
-        assert_eq!(ini_value_in("fake_cidr=\n", "fake_cidr"), None);
+        assert_eq!(ini_value(p, "fake_cidr").as_deref(), Some("28.0.0.0/8"));
+        assert_eq!(ini_value(p, "udp_enable").as_deref(), Some("true"));
+        assert_eq!(ini_value(p, "absent"), None);
+        assert_eq!(ini_value("/nonexistent/ppgw.ini", "fake_cidr"), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

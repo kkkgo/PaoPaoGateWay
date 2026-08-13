@@ -38,6 +38,7 @@ pub struct PpgwFlags {
     pub genhost: String,
     pub clash_up: bool,
     pub ppsub_retry: bool,
+    pub ini_export: String,
 }
 
 impl Default for PpgwFlags {
@@ -78,6 +79,7 @@ impl Default for PpgwFlags {
             genhost: String::new(),
             clash_up: false,
             ppsub_retry: false,
+            ini_export: String::new(),
         }
     }
 }
@@ -166,6 +168,7 @@ pub fn parse(argv: &[String]) -> Result<PpgwFlags, GoFlagErr> {
             "ex_dns" => f.ex_dns = value!(),
             "healthcheck" => f.healthcheck = value!(),
             "genhost" => f.genhost = value!(),
+            "ini-export" => f.ini_export = value!(),
             other => return Err(GoFlagErr::Unknown(other.to_string())),
         }
         i += 1;

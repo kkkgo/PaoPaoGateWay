@@ -11,6 +11,7 @@ pub mod goflag;
 pub mod hashutil;
 pub mod health;
 pub mod httpcli;
+pub mod inienv;
 pub mod nodes;
 pub mod ppsub;
 pub mod privsep;
@@ -87,6 +88,8 @@ pub enum Subcommand {
     ClashUp,
 
     PpsubRetry,
+
+    IniExport,
     Usage,
 }
 
@@ -114,6 +117,7 @@ impl Subcommand {
             Subcommand::Genhost => "genhost",
             Subcommand::ClashUp => "clash-up",
             Subcommand::PpsubRetry => "ppsub-retry",
+            Subcommand::IniExport => "ini-export",
             Subcommand::Usage => "usage",
         }
     }
@@ -145,6 +149,9 @@ pub fn select(f: &PpgwFlags) -> Subcommand {
     }
     if f.ppsub_retry {
         return Subcommand::PpsubRetry;
+    }
+    if !f.ini_export.is_empty() {
+        return Subcommand::IniExport;
     }
     if !f.genhost.is_empty() {
         return Subcommand::Genhost;
@@ -243,6 +250,7 @@ fn execute(sub: Subcommand, f: &PpgwFlags, io: &mut Io) -> i32 {
         Subcommand::Genhost => cmd_genhost(f, io),
         Subcommand::ClashUp => clashup::cmd_clash_up(io),
         Subcommand::PpsubRetry => ppsub::retry::run(io),
+        Subcommand::IniExport => cmd_ini_export(f, io),
         Subcommand::Usage => {
             let _ = write!(io.err, "{}", usage());
             0
@@ -740,6 +748,21 @@ fn cmd_genhost(f: &PpgwFlags, io: &mut Io) -> i32 {
     0
 }
 
+fn cmd_ini_export(f: &PpgwFlags, io: &mut Io) -> i32 {
+    let ini = match inienv::Ini::read(&f.ini_export) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = writeln!(io.err, "{}{e}", term::red("[PaoPaoGW INI]"));
+            return 1;
+        }
+    };
+    for w in ini.warnings() {
+        let _ = writeln!(io.err, "{}{w}", term::red("[PaoPaoGW INI]"));
+    }
+    let _ = write!(io.out, "{}", ini.export());
+    0
+}
+
 pub fn usage() -> String {
     let mut s = String::new();
     s.push_str("ppgw (sniffbox multi-call) — PaoPaoGateWay CLI replacement\n");
@@ -765,6 +788,9 @@ pub fn usage() -> String {
     );
     s.push_str(
         "  -ppsub-retry                       Fill last -ppsub run's gaps once clash is up (self-spawned)\n",
+    );
+    s.push_str(
+        "  -ini-export <ini>                  Normalize ppgw.ini to sourceable assignments (all keys)\n",
     );
     s
 }

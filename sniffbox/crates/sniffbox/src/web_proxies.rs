@@ -413,21 +413,10 @@ pub(crate) fn read_test_url(ini: &Path) -> String {
 
 fn parse_test_url(txt: &str) -> String {
 
-    let mut found: Option<String> = None;
-    for line in txt.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("test_node_url") else {
-            continue;
-        };
-        let Some(val) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let v = val.trim().trim_matches('"').trim();
-        if !v.is_empty() {
-            found = Some(v.to_string());
-        }
-    }
-    found.unwrap_or_else(|| DEFAULT_TEST_URL.to_string())
+    sb_ppgw::inienv::Ini::parse_lossy(txt)
+        .get("test_node_url")
+        .unwrap_or(DEFAULT_TEST_URL)
+        .to_string()
 }
 
 fn clash_get(sock: &Path, path: &str) -> std::io::Result<Vec<u8>> {
@@ -675,9 +664,10 @@ mod tests {
             "http://a/204"
         );
         assert_eq!(parse_test_url("test_node_url=http://b/204"), "http://b/204");
+
         assert_eq!(
             parse_test_url("  test_node_url = \"http://c\" "),
-            "http://c"
+            DEFAULT_TEST_URL
         );
         assert_eq!(parse_test_url("other=1"), DEFAULT_TEST_URL);
         assert_eq!(parse_test_url("test_node_url="), DEFAULT_TEST_URL);
@@ -691,7 +681,7 @@ mod tests {
 
         assert_eq!(
             parse_test_url("test_node_url=\"http://a\"\ntest_node_url="),
-            "http://a"
+            DEFAULT_TEST_URL
         );
     }
 

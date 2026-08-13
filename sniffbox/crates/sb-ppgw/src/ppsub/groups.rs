@@ -1,6 +1,6 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use super::{NodeGroup, SubResult, ystr};
+use super::{NodeGroup, SubResult, pp_log, pp_warn, ystr};
 use regex_lite::Regex;
 use std::collections::HashMap;
 use yaml_rust2::Yaml;
@@ -75,22 +75,32 @@ fn filtered(group: &NodeGroup, all: &[Yaml], objects: bool) -> (Vec<String>, Vec
     (names, objs)
 }
 
-fn check_sub_dependencies(subs: &Option<Vec<String>>, sub_results: &[SubResult]) -> bool {
-    let Some(subs) = subs else {
-        return true;
+const BUILTIN_TARGETS: [&str; 2] = ["DIRECT", "REJECT"];
+
+fn check_sub_dependencies<'a>(
+    group: &'a NodeGroup,
+    sub_results: &[SubResult],
+) -> (bool, Vec<&'a str>) {
+    let Some(subs) = &group.subs else {
+        return (true, Vec::new());
     };
-    if subs.is_empty() || (subs.len() == 1 && subs[0] == "all") {
-        return true;
+    if subs.is_empty() || subs.iter().any(|s| s == "all") {
+        return (true, Vec::new());
     }
+    let mut any_ok = false;
+    let mut missing = Vec::new();
     for name in subs {
-        if name == "all" {
-            continue;
-        }
-        if !sub_results.iter().any(|r| r.name == *name && r.success) {
-            return false;
+        if sub_results.iter().any(|r| r.name == *name && r.success) {
+            any_ok = true;
+        } else {
+            missing.push(name.as_str());
         }
     }
-    true
+    let has_builtin = group
+        .include
+        .iter()
+        .any(|i| BUILTIN_TARGETS.contains(&i.as_str()));
+    (any_ok || has_builtin, missing)
 }
 
 pub fn generate_proxy_groups(
@@ -106,10 +116,24 @@ pub fn generate_proxy_groups(
 
     for g in node_groups {
         group_map.insert(g.name.clone(), g);
-        if !check_sub_dependencies(&g.subs, sub_results) {
+        let (pass, missing) = check_sub_dependencies(g, sub_results);
+        if !pass {
+            pp_warn(&format!(
+                "node group [{}] dropped: none of its subscription(s) [{}] downloaded",
+                g.name,
+                missing.join(", ")
+            ));
             continue;
         }
         let (names, _) = filtered(g, all, false);
+        if !missing.is_empty() {
+            pp_log(&format!(
+                "node group [{}] kept with {} node(s): subscription(s) [{}] missing",
+                g.name,
+                names.len(),
+                missing.join(", ")
+            ));
+        }
         group_direct.insert(g.name.clone(), names);
         potential.push(g.name.clone());
         if g.use_pre_proxy {
@@ -136,6 +160,10 @@ pub fn generate_proxy_groups(
                 continue;
             }
             let g = group_map[name];
+
+            if g.use_pre_proxy && !g.pre_proxy_group.is_empty() {
+                continue;
+            }
             for inc in &g.include {
                 if inc == "DIRECT" || inc == "REJECT" {
                     is_valid.insert(name.clone(), true);
@@ -153,7 +181,14 @@ pub fn generate_proxy_groups(
 
     let mut groups_out: Vec<Yaml> = Vec::new();
     for g in node_groups {
-        if !group_direct.contains_key(&g.name) || !*is_valid.get(&g.name).unwrap_or(&false) {
+        if !group_direct.contains_key(&g.name) {
+            continue;
+        }
+        if !*is_valid.get(&g.name).unwrap_or(&false) {
+            pp_warn(&format!(
+                "node group [{}] dropped: no matching node, and no usable include",
+                g.name
+            ));
             continue;
         }
         let mut pg = Hash::new();
@@ -292,6 +327,86 @@ mod tests {
         let mut g = group(name, kw, &[], None);
         g.include = include;
         g
+    }
+
+    fn sub_res(name: &str, success: bool) -> SubResult {
+        SubResult {
+            name: name.to_string(),
+            success,
+            proxies: Vec::new(),
+            userinfo: None,
+            raw_yaml: String::new(),
+            error: String::new(),
+        }
+    }
+
+    fn names_of(out: &[Yaml]) -> Vec<String> {
+        out.iter()
+            .filter_map(|g| g["name"].as_str().map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn one_failed_sub_no_longer_kills_the_whole_group() {
+
+        let all = vec![node("A_HK"), node("A_JP"), node("C_SG")];
+        let sr = vec![sub_res("A", true), sub_res("B", false)];
+        let g = group(
+            "tmdb",
+            &[],
+            &[],
+            Some(vec!["A".to_string(), "B".to_string()]),
+        );
+        let (out, _) = generate_proxy_groups(&[g], &all, &sr);
+        assert_eq!(names_of(&out), vec!["tmdb"]);
+        let proxies: Vec<&str> = out[0]["proxies"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+
+        assert_eq!(proxies, vec!["A_HK", "A_JP"]);
+    }
+
+    #[test]
+    fn every_sub_failed_but_include_builtin_keeps_group() {
+        let all = vec![node("A_HK")];
+        let sr = vec![sub_res("B", false)];
+        let mut g = group("tmdb", &[], &[], Some(vec!["B".to_string()]));
+        g.include = vec!["DIRECT".to_string()];
+        let (out, _) = generate_proxy_groups(&[g], &all, &sr);
+        assert_eq!(names_of(&out), vec!["tmdb"]);
+        let proxies: Vec<&str> = out[0]["proxies"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+        assert_eq!(proxies, vec!["DIRECT"]);
+    }
+
+    #[test]
+    fn every_sub_failed_and_nothing_to_stand_on_drops_group() {
+        let all = vec![node("A_HK")];
+        let sr = vec![sub_res("B", false)];
+        let g = group("tmdb", &[], &[], Some(vec!["B".to_string()]));
+        let (out, _) = generate_proxy_groups(&[g], &all, &sr);
+        assert!(names_of(&out).is_empty());
+    }
+
+    #[test]
+    fn pre_proxy_group_is_never_rescued_into_an_empty_provider() {
+
+        let all = vec![node("A_HK")];
+        let sr = vec![sub_res("B", false)];
+        let mut g = group("ai", &[], &[], Some(vec!["B".to_string()]));
+        g.include = vec!["DIRECT".to_string()];
+        g.use_pre_proxy = true;
+        g.pre_proxy_group = "ALL".to_string();
+        let (out, providers) = generate_proxy_groups(&[g], &all, &sr);
+        assert!(names_of(&out).is_empty());
+        assert!(providers.is_empty(), "no empty inline provider emitted");
     }
 
     #[test]

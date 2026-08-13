@@ -279,7 +279,7 @@ mod tests {
     fn flow(scheme: Option<&str>, domain: Option<&str>) -> String {
         fmt_flow(
             "10.10.10.202".parse().unwrap(),
-            "43.132.107.47:443".parse().unwrap(),
+            "44.33.22.11:443".parse().unwrap(),
             scheme,
             domain,
             false,
@@ -288,8 +288,8 @@ mod tests {
 
     #[test]
     fn flow_plain_ip_when_no_domain() {
-        assert_eq!(flow(None, None), "10.10.10.202 -> 43.132.107.47:443");
-        assert_eq!(flow(Some("bt"), None), "10.10.10.202 -> 43.132.107.47:443");
+        assert_eq!(flow(None, None), "10.10.10.202 -> 44.33.22.11:443");
+        assert_eq!(flow(Some("bt"), None), "10.10.10.202 -> 44.33.22.11:443");
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
     fn flow_udp_marker_before_arrow() {
         let s = fmt_flow(
             "10.10.10.202".parse().unwrap(),
-            "43.132.107.47:443".parse().unwrap(),
+            "44.33.22.11:443".parse().unwrap(),
             Some("quic"),
             Some("a.com"),
             true,

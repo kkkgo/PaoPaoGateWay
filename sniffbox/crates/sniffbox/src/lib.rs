@@ -68,8 +68,13 @@ impl ConfigSource {
 
     pub fn write_running_snapshot(&self) {
         if let ConfigSource::Production = self {
-            match std::fs::copy(production::PPGW_INI, production::RUNNING_SNAPSHOT) {
-                Ok(_) => tracing::info!(
+            let text = production::running_snapshot_text(production::PPGW_INI);
+
+            let tmp = format!("{}.new", production::RUNNING_SNAPSHOT);
+            match std::fs::write(&tmp, text)
+                .and_then(|()| std::fs::rename(&tmp, production::RUNNING_SNAPSHOT))
+            {
+                Ok(()) => tracing::info!(
                     path = production::RUNNING_SNAPSHOT,
                     "wrote running-config snapshot"
                 ),

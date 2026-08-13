@@ -1,7 +1,7 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use super::{PpsubErr, RuleSet, pp_log, pp_warn, ystr};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use yaml_rust2::yaml::Hash;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -19,6 +19,7 @@ pub fn process_rules(
 
     let mut all_rules: Vec<String> = Vec::new();
     let mut defined: Vec<(String, Yaml)> = Vec::new();
+    let mut dropped: BTreeMap<String, usize> = BTreeMap::new();
 
     for rs in sets {
         if rs.typ == "rule-set" {
@@ -61,10 +62,20 @@ pub fn process_rules(
                 continue;
             }
             if !validate_rule(rule, &group_names) {
+
+                if let Some(t) = rule_target(rule) {
+                    *dropped.entry(t).or_insert(0usize) += 1;
+                }
                 continue;
             }
             all_rules.push(rule.to_string());
         }
+    }
+
+    for (target, n) in &dropped {
+        pp_warn(&format!(
+            "dropped {n} rule(s) targeting [{target}]: no such proxy group"
+        ));
     }
 
     let mut used: HashSet<String> = HashSet::new();
@@ -124,10 +135,10 @@ fn build_provider(rs: &RuleSet) -> Yaml {
     Yaml::Hash(p)
 }
 
-fn validate_rule(rule: &str, group_names: &HashSet<String>) -> bool {
+fn rule_target(rule: &str) -> Option<String> {
     let parts: Vec<&str> = rule.split(',').collect();
     if parts.len() < 2 {
-        return true;
+        return None;
     }
     const OPTS: [&str; 5] = ["no-resolve", "src", "dst", "no-redir", "not"];
     let mut idx = parts.len() as i64 - 1;
@@ -139,14 +150,17 @@ fn validate_rule(rule: &str, group_names: &HashSet<String>) -> bool {
         idx -= 1;
     }
     if idx < 1 {
-        return true;
+        return None;
     }
-    let target = parts[idx as usize].trim();
+    Some(parts[idx as usize].trim().to_string())
+}
+
+fn validate_rule(rule: &str, group_names: &HashSet<String>) -> bool {
+    let Some(target) = rule_target(rule) else {
+        return true;
+    };
     const BUILTIN: [&str; 4] = ["DIRECT", "REJECT", "PROXY", "proxies"];
-    if BUILTIN.contains(&target) {
-        return true;
-    }
-    group_names.contains(target)
+    BUILTIN.contains(&target.as_str()) || group_names.contains(&target)
 }
 
 fn download_rules(url: &str) -> Result<Vec<String>, String> {

@@ -5,7 +5,6 @@ use crate::config::{
     LogCfg, OutboundCfg, OutboundMode, ReportCfg, RouteCfg, SocksCfg, StatsCfg, WebCfg,
 };
 use ipnet::Ipv4Net;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
@@ -186,22 +185,18 @@ pub fn ini_value(key: &str) -> Option<String> {
 
 #[derive(Default)]
 struct PpgwIni {
-    kv: HashMap<String, String>,
+    kv: sb_ppgw::inienv::Ini,
 }
 
 impl PpgwIni {
     fn load(path: &str) -> Self {
-        let kv = std::fs::read_to_string(path)
-            .map(|t| parse_ppgw(&t))
-            .unwrap_or_default();
-        Self { kv }
+        Self {
+            kv: sb_ppgw::inienv::Ini::read_lossy(path),
+        }
     }
 
     fn str(&self, key: &str) -> Option<&str> {
-        self.kv
-            .get(key)
-            .map(String::as_str)
-            .filter(|s| !s.is_empty())
+        self.kv.get(key)
     }
 
     fn bool(&self, key: &str) -> Option<bool> {
@@ -278,21 +273,8 @@ impl PpgwIni {
     }
 }
 
-fn parse_ppgw(text: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-
-        let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
-        out.insert(k.trim().to_string(), v);
-    }
-    out
+pub fn running_snapshot_text(path: &str) -> String {
+    sb_ppgw::inienv::Ini::read_lossy(path).export()
 }
 
 fn parse_yesno(s: &str) -> Option<bool> {
@@ -309,8 +291,30 @@ mod tests {
 
     fn ppgw(text: &str) -> PpgwIni {
         PpgwIni {
-            kv: parse_ppgw(text),
+            kv: sb_ppgw::inienv::Ini::parse_lossy(text),
         }
+    }
+
+    #[test]
+    fn defaults_agree_with_inienv_key_table() {
+        use sb_ppgw::inienv::default_of;
+        let cfg = build(&PpgwIni::default());
+        assert_eq!(default_of("mode"), Some("free"));
+        assert_eq!(cfg.outbound.mode, crate::config::OutboundMode::Free);
+        assert_eq!(default_of("fake_cidr"), Some("7.0.0.0/8"));
+        assert_eq!(cfg.dns.unwrap().fake_cidr.to_string(), "7.0.0.0/8");
+        assert_eq!(default_of("clash_web_password"), Some("clashpass"));
+        assert_eq!(cfg.web.password, "clashpass");
+        assert_eq!(default_of("max_rec"), Some("5000"));
+        assert_eq!(cfg.stats.as_ref().unwrap().max_rec, 5000);
+        assert_eq!(default_of("net_rec"), Some("no"));
+        assert!(!cfg.stats.as_ref().unwrap().enabled);
+        assert_eq!(default_of("udp_enable"), Some("no"));
+        assert!(!cfg.inbound.udp);
+        assert_eq!(default_of("cf_proxy"), Some("yes"));
+        assert_eq!(cfg.cloudflared.proxy, crate::config::CfProxyMode::Yes);
+        assert_eq!(default_of("cf_protocol"), Some("auto"));
+        assert_eq!(cfg.cloudflared.protocol, crate::config::CfProtocol::Auto);
     }
 
     #[test]
