@@ -69,6 +69,10 @@ impl NodeHist {
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
+
+    pub fn last(&self) -> Option<Option<u32>> {
+        self.samples.back().copied()
+    }
 }
 
 #[derive(Default)]
@@ -138,6 +142,13 @@ impl GroupState {
 
     fn push(&mut self, node: &str, sample: Option<u32>) {
         self.hist.entry(node.to_string()).or_default().push(sample);
+    }
+
+    fn latest_ok(&self, node: &str) -> bool {
+        self.hist
+            .get(node)
+            .and_then(NodeHist::last)
+            .is_some_and(|s| s.is_some())
     }
 }
 
@@ -232,11 +243,21 @@ struct Runner {
     cancel: watch::Sender<bool>,
 }
 
-pub fn spawn(clash_sock: PathBuf, stats: Arc<SmartStats>, shutdown: watch::Receiver<bool>) {
-    tokio::spawn(supervise(clash_sock, stats, shutdown));
+pub fn spawn(
+    clash_sock: PathBuf,
+    stats: Arc<SmartStats>,
+    fixed: Arc<crate::smart_fixed::SmartFixed>,
+    shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(supervise(clash_sock, stats, fixed, shutdown));
 }
 
-async fn supervise(sock: PathBuf, stats: Arc<SmartStats>, mut shutdown: watch::Receiver<bool>) {
+async fn supervise(
+    sock: PathBuf,
+    stats: Arc<SmartStats>,
+    fixed: Arc<crate::smart_fixed::SmartFixed>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let states: SharedStates = Arc::new(Mutex::new(HashMap::new()));
     let mut runners: HashMap<String, Runner> = HashMap::new();
     let mut last_names: Vec<String> = Vec::new();
@@ -255,6 +276,8 @@ async fn supervise(sock: PathBuf, stats: Arc<SmartStats>, mut shutdown: watch::R
             .retain(|k, _| groups.iter().any(|g| g.name == *k));
         stats.retain_groups(&groups);
         let names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+
+        fixed.retain_groups(&names);
         if names != last_names {
             if names.is_empty() {
                 st_log!("no smart group configured (ppsub.json), idle");
@@ -294,6 +317,7 @@ async fn supervise(sock: PathBuf, stats: Arc<SmartStats>, mut shutdown: watch::R
                 gs.clone(),
                 Arc::clone(&states),
                 Arc::clone(&stats),
+                Arc::clone(&fixed),
                 crx,
             ));
             runners.insert(
@@ -344,6 +368,7 @@ async fn runner(
     groups: Vec<SmartGroup>,
     states: SharedStates,
     stats: Arc<SmartStats>,
+    fixed: Arc<crate::smart_fixed::SmartFixed>,
     mut cancel: watch::Receiver<bool>,
 ) {
     loop {
@@ -361,7 +386,7 @@ async fn runner(
                 return;
             }
             let mut st = states.lock().unwrap().remove(&g.name).unwrap_or_default();
-            let r = run_group_pass(&sock, &g.name, &url, &mut st, &stats, &cancel).await;
+            let r = run_group_pass(&sock, &g.name, &url, &mut st, &stats, &fixed, &cancel).await;
             states.lock().unwrap().insert(g.name.clone(), st);
             if let Err(e) = r {
                 tracing::warn!(
@@ -393,6 +418,7 @@ async fn run_group_pass(
     url: &str,
     st: &mut GroupState,
     stats: &SmartStats,
+    fixed: &crate::smart_fixed::SmartFixed,
     shutdown: &watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let px: RawProxies = fetch_typed(sock, "/proxies").await?;
@@ -412,6 +438,15 @@ async fn run_group_pass(
     }
     st.hist.retain(|k, _| members.iter().any(|m| m.name == *k));
 
+    let mut locked = fixed.get(group);
+    if let Some(l) = &locked
+        && !members.iter().any(|m| &m.name == l)
+    {
+        fixed.clear(group);
+        st_info!("{group}: locked node `{l}` is gone from the group, lock released");
+        locked = None;
+    }
+
     let seeded = seed_from_clash(st, &members, &px, providers.as_ref(), url);
     if seeded > 0 {
         st_log!("{group}: seeded history for {seeded} node(s) from clash delay data");
@@ -423,7 +458,7 @@ async fn run_group_pass(
         .collect();
 
     if no_data.len() == members.len() {
-        let r = ladder_pass(sock, group, url, st, &members, &now).await;
+        let r = ladder_pass(sock, group, url, st, &members, &now, locked.as_deref()).await;
         stats.publish(group, &st.hist);
         return r;
     }
@@ -443,30 +478,53 @@ async fn run_group_pass(
 
     let mut current = now.clone();
     if !members.iter().any(|m| m.name == current) {
-        if let Some(best) = members
-            .iter()
-            .min_by(|a, b| st.score(&a.name).total_cmp(&st.score(&b.name)))
-        {
-            select_node(sock, group, &best.name).await?;
+        let pick = locked.clone().or_else(|| {
+            members
+                .iter()
+                .min_by(|a, b| st.score(&a.name).total_cmp(&st.score(&b.name)))
+                .map(|m| m.name.clone())
+        });
+        if let Some(pick) = pick {
+            select_node(sock, group, &pick).await?;
             st_info!(
-                "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{}`",
-                best.name
+                "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{pick}`"
             );
-            current = best.name.clone();
+            current = pick;
         }
     }
 
+    let anchor = locked.clone().unwrap_or_else(|| current.clone());
     st_log!(
-        "{group}: sequential sweep over {} node(s), current `{current}`",
-        members.len()
+        "{group}: sequential sweep over {} node(s), current `{current}`{}",
+        members.len(),
+        locked
+            .as_deref()
+            .map(|l| format!(", user-locked to `{l}`"))
+            .unwrap_or_default()
     );
-    if let Some(cur) = members.iter().find(|m| m.name == current) {
+    if let Some(cur) = members.iter().find(|m| m.name == anchor) {
         let d = test_member(sock, cur, url, REGULAR_TIMEOUT_MS).await;
         st.push(&cur.name, d);
         log_result(group, &cur.name, d, st.score(&cur.name));
         stats.publish(group, &st.hist);
     }
-    let mut rest: Vec<&Member> = members.iter().filter(|m| m.name != current).collect();
+
+    if let Some(l) = locked.clone()
+        && !st.latest_ok(&l)
+    {
+        fixed.clear(group);
+        st_info!("{group}: locked node `{l}` is down, lock released, back to auto");
+        locked = None;
+    }
+
+    if let Some(l) = locked.clone()
+        && current != l
+    {
+        select_node(sock, group, &l).await?;
+        st_info!("{group}: hold on user-locked `{l}` (was `{current}`)");
+        current = l;
+    }
+    let mut rest: Vec<&Member> = members.iter().filter(|m| m.name != anchor).collect();
     rest.sort_by(|a, b| st.score(&a.name).total_cmp(&st.score(&b.name)));
     for m in rest {
         if *shutdown.borrow() {
@@ -476,6 +534,10 @@ async fn run_group_pass(
         st.push(&m.name, d);
         log_result(group, &m.name, d, st.score(&m.name));
         stats.publish(group, &st.hist);
+
+        if locked.is_some() {
+            continue;
+        }
         let (cand, cur) = (st.score(&m.name), st.score(&current));
         if cand < cur {
             select_node(sock, group, &m.name).await?;
@@ -489,8 +551,9 @@ async fn run_group_pass(
         }
     }
     st_log!(
-        "{group}: sweep done, selected `{current}` (score {})",
-        fmt_score(st.score(&current))
+        "{group}: sweep done, selected `{current}` (score {}){}",
+        fmt_score(st.score(&current)),
+        if locked.is_some() { " [locked]" } else { "" }
     );
     Ok(())
 }
@@ -556,6 +619,21 @@ fn seed_from_clash(
     seeded
 }
 
+fn pick_ladder_best<'a>(
+    results: &'a [(Member, Option<u32>)],
+    locked: Option<&str>,
+) -> Option<(&'a Member, u32)> {
+    if let Some(l) = locked
+        && let Some((m, Some(d))) = results.iter().find(|(m, d)| m.name == l && d.is_some())
+    {
+        return Some((m, *d));
+    }
+    results
+        .iter()
+        .filter_map(|(m, d)| d.map(|d| (m, d)))
+        .min_by_key(|&(_, d)| d)
+}
+
 async fn ladder_pass(
     sock: &Path,
     group: &str,
@@ -563,6 +641,7 @@ async fn ladder_pass(
     st: &mut GroupState,
     members: &[Member],
     now: &str,
+    locked: Option<&str>,
 ) -> std::io::Result<()> {
     let refs: Vec<&Member> = members.iter().collect();
     st_log!(
@@ -571,17 +650,14 @@ async fn ladder_pass(
     );
     for t in LADDER_MS {
         let results = test_many(sock, &refs, url, t).await;
-        let mut best: Option<(&Member, u32)> = None;
         let mut ok = 0;
         for (m, d) in &results {
             if let Some(d) = d {
                 ok += 1;
                 st.push(&m.name, Some(*d));
-                if best.is_none_or(|(_, bd)| *d < bd) {
-                    best = Some((m, *d));
-                }
             }
         }
+        let best = pick_ladder_best(&results, locked);
         st_log!("{group}: ladder timeout={t}ms -> {ok}/{} ok", refs.len());
         if let Some((m, d)) = best {
             if m.name != now {
@@ -744,6 +820,45 @@ mod tests {
             h.push(*s);
         }
         h
+    }
+
+    fn member(name: &str) -> Member {
+        Member {
+            name: name.to_string(),
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn latest_ok_looks_only_at_the_newest_sample() {
+        let mut st = GroupState::default();
+
+        st.hist.insert("A".into(), hist(&[None, None, Some(120)]));
+        st.hist
+            .insert("B".into(), hist(&[Some(80), Some(80), None]));
+        assert!(st.latest_ok("A"), "recovered node counts as up");
+        assert!(!st.latest_ok("B"), "latest failure counts as down");
+        assert!(!st.latest_ok("never-tested"), "no sample is not up");
+    }
+
+    #[test]
+    fn ladder_prefers_the_locked_node_over_the_fastest() {
+        let results = vec![
+            (member("A"), Some(300)),
+            (member("B"), Some(50)),
+            (member("C"), None),
+        ];
+
+        assert_eq!(pick_ladder_best(&results, None).unwrap().0.name, "B");
+
+        assert_eq!(pick_ladder_best(&results, Some("A")).unwrap().0.name, "A");
+
+        assert_eq!(pick_ladder_best(&results, Some("C")).unwrap().0.name, "B");
+
+        assert_eq!(pick_ladder_best(&results, Some("Z")).unwrap().0.name, "B");
+
+        let all_fail = vec![(member("A"), None)];
+        assert!(pick_ladder_best(&all_fail, Some("A")).is_none());
     }
 
     #[test]

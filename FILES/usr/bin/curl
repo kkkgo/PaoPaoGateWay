@@ -1,0 +1,18 @@
+#!/bin/sh
+url=""
+for a in "$@"; do
+    case "$a" in
+        -*) continue ;;
+    esac
+    url="$a"
+    break
+done
+if [ -z "$url" ]; then
+    echo "usage: curl <url>" >&2
+    exit 1
+fi
+case "$url" in
+    http://*|https://*) ;;
+    *) url="https://$url" ;;
+esac
+exec /usr/bin/ppgw -curlURL "$url"

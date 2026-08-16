@@ -90,6 +90,8 @@ pub enum Subcommand {
     PpsubRetry,
 
     IniExport,
+
+    CurlUrl,
     Usage,
 }
 
@@ -118,6 +120,7 @@ impl Subcommand {
             Subcommand::ClashUp => "clash-up",
             Subcommand::PpsubRetry => "ppsub-retry",
             Subcommand::IniExport => "ini-export",
+            Subcommand::CurlUrl => "curlURL",
             Subcommand::Usage => "usage",
         }
     }
@@ -155,6 +158,9 @@ pub fn select(f: &PpgwFlags) -> Subcommand {
     }
     if !f.genhost.is_empty() {
         return Subcommand::Genhost;
+    }
+    if !f.curl_url.is_empty() {
+        return Subcommand::CurlUrl;
     }
     if !f.healthcheck.is_empty() {
         return Subcommand::Healthcheck;
@@ -251,6 +257,7 @@ fn execute(sub: Subcommand, f: &PpgwFlags, io: &mut Io) -> i32 {
         Subcommand::ClashUp => clashup::cmd_clash_up(io),
         Subcommand::PpsubRetry => ppsub::retry::run(io),
         Subcommand::IniExport => cmd_ini_export(f, io),
+        Subcommand::CurlUrl => cmd_curl(f, io),
         Subcommand::Usage => {
             let _ = write!(io.err, "{}", usage());
             0
@@ -498,6 +505,43 @@ fn cmd_download(f: &PpgwFlags, io: &mut Io) -> i32 {
             1
         }
     }
+}
+
+const CURL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+const CURL_MAX_BODY: u64 = 64 * 1024 * 1024;
+
+fn cmd_curl(f: &PpgwFlags, io: &mut Io) -> i32 {
+    match crate::rt::block_on(curl_fetch(&f.curl_url)) {
+        Ok(body) => {
+            let _ = io.out.write_all(&body);
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(io.err, "{}{e}", term::red("[PaoPaoGW Curl]"));
+            1
+        }
+    }
+}
+
+async fn curl_fetch(url: &str) -> Result<Vec<u8>, httpcli::HttpErr> {
+    let resp = httpcli::insecure_client()
+        .get(url)
+        .timeout(CURL_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| httpcli::HttpErr::Request(e.to_string()))?;
+    let code = resp.status().as_u16();
+    if code >= 400 {
+        return Err(httpcli::HttpErr::Request(format!("status {code}")));
+    }
+    let (body, truncated) = httpcli::read_body_bounded(resp, CURL_MAX_BODY).await?;
+    if truncated {
+        return Err(httpcli::HttpErr::Request(format!(
+            "body exceeds {CURL_MAX_BODY} bytes"
+        )));
+    }
+    Ok(body)
 }
 
 const HEALTHCHECK_GRACE_SECS: u64 = 120;
@@ -780,6 +824,7 @@ pub fn usage() -> String {
     s.push_str("  -testProxy -test_node_url <u>      Probe via health-check inbound (:1079)\n");
     s.push_str("  -rawURL <u> -server <dns> -port <p>  nslookup\n");
     s.push_str("  -downURL <u> -output <f>           Download\n");
+    s.push_str("  -curlURL <u>                       Debug: GET u, body to stdout (Chrome UA)\n");
     s.push_str("  -interval <Nd|Nh|Nm> -sleeptime <n>  Poll interval/count\n");
     s.push_str("  -dnslist <s> -dnsinput <f> -output <f>   dns_burn\n");
     s.push_str("  -input <f> [-input <f>...] -output <f>   Merge YAML\n");
@@ -862,6 +907,10 @@ mod tests {
             Subcommand::Download
         );
         assert_eq!(
+            select(&pf(&["-curlURL", "https://x/y"])),
+            Subcommand::CurlUrl
+        );
+        assert_eq!(
             select(&pf(&["-interval", "1d", "-sleeptime", "30"])),
             Subcommand::Subtime
         );
@@ -894,5 +943,63 @@ mod tests {
             Subcommand::ClashReady,
             "extension takes precedence over reload"
         );
+    }
+
+    fn serve_once_http(reply: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply);
+            }
+        });
+        (port, h)
+    }
+
+    #[test]
+    fn curl_fetch_returns_body_on_200() {
+        let (port, srv) = serve_once_http(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let body =
+            crate::rt::block_on(curl_fetch(&format!("http://127.0.0.1:{port}/"))).expect("fetch");
+        let _ = srv.join();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn curl_fetch_errors_on_4xx() {
+        let (port, srv) = serve_once_http(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let err = crate::rt::block_on(curl_fetch(&format!("http://127.0.0.1:{port}/")))
+            .expect_err("404 must fail");
+        let _ = srv.join();
+        assert!(err.to_string().contains("404"), "{err}");
+    }
+
+    #[test]
+    fn run_curl_url_writes_body_to_stdout() {
+        let (port, srv) =
+            serve_once_http(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let args: Vec<String> = ["ppgw", "-curlURL", &format!("http://127.0.0.1:{port}/")]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        let code = run(&args, &mut io);
+        let _ = srv.join();
+        assert_eq!(code, 0);
+        assert_eq!(out, b"ok");
     }
 }

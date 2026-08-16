@@ -64,6 +64,10 @@ pub async fn handle(
             proxy_detail_get(stream, req, cfg, ka).await?;
             Ok(ka)
         }
+        "/sniffbox/smart/fixed" => {
+            smart_fixed_set(stream, req, cfg, ka, body).await?;
+            Ok(ka)
+        }
         "/sniffbox/nodes/clear" => {
             nodes_clear(stream, cfg, ka).await?;
             Ok(ka)
@@ -292,6 +296,57 @@ async fn proxy_detail_get(
         .unwrap_or((500, r#"{"message":"internal"}"#.to_string()));
     let reason = if status == 200 { "OK" } else { "Not Found" };
     respond::send(stream, status, reason, &[JSON], body.as_bytes(), ka).await
+}
+
+async fn smart_fixed_set(
+    stream: &mut TcpStream,
+    req: &ReqHead,
+    cfg: &ServerConfig,
+    ka: bool,
+    body: &[u8],
+) -> io::Result<()> {
+    let Some(src) = cfg.proxies.as_ref() else {
+        return respond::not_found(stream, ka).await;
+    };
+    if !req.method.eq_ignore_ascii_case("POST") {
+        return respond::send(
+            stream,
+            405,
+            "Method Not Allowed",
+            &[JSON, ("Allow", "POST")],
+            b"",
+            ka,
+        )
+        .await;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        let msg = br#"{"message":"bad request"}"#;
+        return respond::send(stream, 400, "Bad Request", &[JSON], msg, ka).await;
+    };
+    let group = v.get("group").and_then(|g| g.as_str()).unwrap_or_default();
+    if group.is_empty() {
+        let msg = br#"{"message":"missing group"}"#;
+        return respond::send(stream, 400, "Bad Request", &[JSON], msg, ka).await;
+    }
+
+    let node = v
+        .get("node")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let group = group.to_string();
+    let src = Arc::clone(src);
+    let (status, out) = tokio::task::spawn_blocking(move || src.smart_fix(&group, node.as_deref()))
+        .await
+        .unwrap_or((500, r#"{"message":"internal"}"#.to_string()));
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        409 => "Conflict",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    respond::send(stream, status, reason, &[JSON], out.as_bytes(), ka).await
 }
 
 fn query_param(path: &str, key: &str) -> Option<String> {

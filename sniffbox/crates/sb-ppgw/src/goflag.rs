@@ -39,6 +39,7 @@ pub struct PpgwFlags {
     pub clash_up: bool,
     pub ppsub_retry: bool,
     pub ini_export: String,
+    pub curl_url: String,
 }
 
 impl Default for PpgwFlags {
@@ -80,6 +81,7 @@ impl Default for PpgwFlags {
             clash_up: false,
             ppsub_retry: false,
             ini_export: String::new(),
+            curl_url: String::new(),
         }
     }
 }
@@ -152,6 +154,7 @@ pub fn parse(argv: &[String]) -> Result<PpgwFlags, GoFlagErr> {
             "yamlhashFile" => f.yamlhash_file = value!(),
             "rawURL" => f.raw_url = value!(),
             "downURL" => f.down_url = value!(),
+            "curlURL" => f.curl_url = value!(),
             "server" => f.server = value!(),
             "interval" => f.interval = value!(),
             "sleeptime" => f.sleeptime = value!(),
@@ -316,6 +319,8 @@ mod tests {
         .unwrap();
         assert_eq!(f.genhost, "/tmp/clash.yaml");
         assert_eq!(f.server, "223.5.5.5");
+        let f = p(&["-curlURL", "http://example.invalid/x"]).unwrap();
+        assert_eq!(f.curl_url, "http://example.invalid/x");
     }
 
     #[test]

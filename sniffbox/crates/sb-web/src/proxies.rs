@@ -13,4 +13,8 @@ pub trait ProxiesSource: Send + Sync {
     fn proxy_detail(&self, _name: &str) -> (u16, String) {
         (404, r#"{"message":"Resource not found"}"#.to_string())
     }
+
+    fn smart_fix(&self, _group: &str, _node: Option<&str>) -> (u16, String) {
+        (404, r#"{"message":"Resource not found"}"#.to_string())
+    }
 }

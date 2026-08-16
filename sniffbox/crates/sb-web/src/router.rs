@@ -117,6 +117,36 @@ fn clash_allowed(method: &str, path: &str) -> bool {
     })
 }
 
+pub fn group_delay_target(method: &str, path: &str) -> Option<String> {
+    if !method.eq_ignore_ascii_case("GET") {
+        return None;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["group", name, "delay"] if !name.is_empty() => Some(pct_decode_segment(name)),
+        _ => None,
+    }
+}
+
+fn pct_decode_segment(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn configs_patch_mode_only(body: &[u8]) -> bool {
     matches!(
         serde_json::from_slice::<serde_json::Value>(body),
@@ -231,5 +261,52 @@ mod tests {
         assert!(!configs_patch_mode_only(b""));
         assert!(!configs_patch_mode_only(b"\"mode\""));
         assert!(!configs_patch_mode_only(b"not json"));
+    }
+
+    #[test]
+    fn group_delay_target_extracts_decoded_group_name() {
+        assert_eq!(
+            group_delay_target("GET", "/group/AUTO/delay").as_deref(),
+            Some("AUTO")
+        );
+
+        assert_eq!(
+            group_delay_target(
+                "GET",
+                "/group/%e3%82%a2%e3%83%a1%e3%83%aa%e3%82%ab%20US/delay"
+            )
+            .as_deref(),
+            Some("アメリカ US")
+        );
+
+        assert_eq!(
+            group_delay_target("GET", "/group/a+b/delay").as_deref(),
+            Some("a+b")
+        );
+
+        assert_eq!(
+            group_delay_target("GET", "/group/a%zz/delay").as_deref(),
+            Some("a%zz")
+        );
+    }
+
+    #[test]
+    fn group_delay_target_ignores_everything_else() {
+        for (m, p) in [
+            ("PUT", "/group/AUTO/delay"),
+            ("GET", "/group/AUTO"),
+            ("GET", "/group"),
+            ("GET", "/groups/AUTO/delay"),
+            ("GET", "/proxies/AUTO/delay"),
+            ("GET", "/group/AUTO/delay/extra"),
+        ] {
+            assert_eq!(group_delay_target(m, p), None, "{m} {p} must not gate");
+        }
+    }
+
+    #[test]
+    fn group_delay_stays_whitelisted_and_plural_stays_blocked() {
+        assert_eq!(classify("GET", "/group/AUTO/delay"), Route::ProxyClash);
+        assert_eq!(classify("GET", "/groups/AUTO/delay"), Route::Blocked);
     }
 }

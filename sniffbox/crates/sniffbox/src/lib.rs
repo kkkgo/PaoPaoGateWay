@@ -25,6 +25,7 @@ pub mod production;
 pub mod reload;
 pub mod resolver;
 pub mod runtime;
+pub mod smart_fixed;
 pub mod smart_speed;
 pub mod sysinfo;
 pub mod tasks;
@@ -488,6 +489,8 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
     let nodes_enabled = cfg.stats.as_ref().is_some_and(|s| s.enabled);
 
     let smart_stats = Arc::new(smart_speed::SmartStats::default());
+
+    let smart_fixed = smart_fixed::SmartFixed::load(smart_fixed::state_path());
     if nodes_enabled {
         start_stats_pipeline(&shared, shutdown_rx.clone());
     }
@@ -504,6 +507,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
         smart_speed::spawn(
             cfg.web.clash_sock.clone(),
             Arc::clone(&smart_stats),
+            Arc::clone(&smart_fixed),
             shutdown_rx.clone(),
         );
     } else {
@@ -550,8 +554,11 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
         }
 
         let web_proxies = cfg.outbound.mode.via_clash().then(|| {
-            let wp =
-                web_proxies::WebProxies::new(cfg.web.clash_sock.clone(), Arc::clone(&smart_stats));
+            let wp = web_proxies::WebProxies::new(
+                cfg.web.clash_sock.clone(),
+                Arc::clone(&smart_stats),
+                Arc::clone(&smart_fixed),
+            );
             let wp2 = Arc::clone(&wp);
             let warm = wp.warm_signal();
             let mut sd = shutdown_rx.clone();
@@ -644,6 +651,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
 
             reload_cmd: (!cfg.web.reload_cmd.is_empty()).then(|| cfg.web.reload_cmd.clone()),
             reload_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            group_delay_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
 
             probe: Some(Arc::new(probe::WebProbe::new(cfg.inbound_proxy.udp))
                 as Arc<dyn sb_web::ProbeSource>),

@@ -78,10 +78,16 @@ pub struct WebProxies {
     warm: Arc<tokio::sync::Notify>,
 
     smart_stats: Arc<crate::smart_speed::SmartStats>,
+
+    smart_fixed: Arc<crate::smart_fixed::SmartFixed>,
 }
 
 impl WebProxies {
-    pub fn new(clash_sock: PathBuf, smart_stats: Arc<crate::smart_speed::SmartStats>) -> Arc<Self> {
+    pub fn new(
+        clash_sock: PathBuf,
+        smart_stats: Arc<crate::smart_speed::SmartStats>,
+        smart_fixed: Arc<crate::smart_fixed::SmartFixed>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             clash_sock,
             ppgw_ini: PathBuf::from("/tmp/ppgw.ini"),
@@ -89,6 +95,7 @@ impl WebProxies {
             last_fetch: Mutex::new(None),
             warm: Arc::new(tokio::sync::Notify::new()),
             smart_stats,
+            smart_fixed,
         })
     }
 
@@ -128,6 +135,7 @@ impl WebProxies {
             &test_url,
             &smart_urls,
             &|g| self.smart_stats.group_scores(g),
+            &self.smart_fixed.all(),
         ))
     }
 
@@ -188,6 +196,62 @@ impl sb_web::ProxiesSource for WebProxies {
     fn proxy_detail(&self, name: &str) -> (u16, String) {
         proxy_detail_lookup(&self.clash_sock, name)
     }
+
+    fn smart_fix(&self, group: &str, node: Option<&str>) -> (u16, String) {
+
+        if self.cache.lock().unwrap().is_none() {
+            self.refresh();
+        }
+        let snap: Value = match self
+            .cache
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map(serde_json::from_str)
+        {
+            Some(Ok(v)) => v,
+            _ => return (503, err_json("clash not ready")),
+        };
+        let Some(g) = snap.get("proxies").and_then(|p| p.get(group)) else {
+            return (404, err_json("group not found"));
+        };
+        if g.get("smart") != Some(&Value::Bool(true)) {
+
+            return (409, err_json("not a smart group"));
+        }
+        match node {
+            Some(n) => {
+                let member = g
+                    .get("all")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(n)));
+                if !member {
+                    return (404, err_json("node not in group"));
+                }
+                self.smart_fixed.set(group, n);
+
+                let path = format!("/proxies/{}", pct_encode_segment(group));
+                let body = serde_json::json!({ "name": n }).to_string();
+                if let Err(e) = clash_request(&self.clash_sock, "PUT", &path, Some(&body)) {
+                    tracing::debug!("smart fix: clash select {group} -> {n} failed: {e}");
+                }
+            }
+            None => {
+                self.smart_fixed.clear(group);
+            }
+        }
+
+        *self.last_fetch.lock().unwrap() = None;
+        self.refresh();
+        (
+            200,
+            serde_json::json!({ "group": group, "fixed": node }).to_string(),
+        )
+    }
+}
+
+fn err_json(msg: &str) -> String {
+    serde_json::json!({ "message": msg }).to_string()
 }
 
 fn proxy_detail_lookup(sock: &Path, name: &str) -> (u16, String) {
@@ -260,6 +324,7 @@ pub(crate) fn build_trimmed(
     test_url: &str,
     smart_urls: &HashMap<String, String>,
     smart_scores: &dyn Fn(&str) -> Option<Value>,
+    smart_fixed: &HashMap<String, String>,
 ) -> String {
     let mut proxies = Map::new();
     for (name, p) in &proxies_raw.proxies {
@@ -280,6 +345,14 @@ pub(crate) fn build_trimmed(
 
                 if let Some(sc) = smart_scores(name) {
                     o.insert("scores".into(), sc);
+                }
+
+                if let Some(n) = smart_fixed.get(name)
+                    && o.get("all")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(n.as_str())))
+                {
+                    o.insert("fixed".into(), Value::String(n.clone()));
                 }
             }
         }
@@ -442,10 +515,27 @@ fn clash_get(sock: &Path, path: &str) -> std::io::Result<Vec<u8>> {
 }
 
 fn clash_get_status(sock: &Path, path: &str) -> std::io::Result<(u16, Vec<u8>)> {
+    clash_request(sock, "GET", path, None)
+}
+
+fn clash_request(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> std::io::Result<(u16, Vec<u8>)> {
     let mut s = std::os::unix::net::UnixStream::connect(sock)?;
     s.set_read_timeout(Some(Duration::from_secs(8)))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let req = match body {
+        Some(b) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}",
+            b.len()
+        ),
+        None => {
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        }
+    };
     s.write_all(req.as_bytes())?;
     s.flush()?;
     let mut buf = Vec::new();
@@ -553,6 +643,7 @@ mod tests {
             "http://t",
             &HashMap::new(),
             &|_| None,
+            &HashMap::new(),
         ))
         .unwrap();
         assert_eq!(out["mode"], "Rule");
@@ -609,6 +700,7 @@ mod tests {
             "u",
             &smart_urls,
             &|g| (g == "Smart").then(|| json!({"N1": {"score": 123, "samples": [100, null]}})),
+            &HashMap::new(),
         ))
         .unwrap();
 
@@ -652,9 +744,71 @@ mod tests {
             "http://fallback/204",
             &smart_urls,
             &|_| None,
+            &HashMap::new(),
         ))
         .unwrap();
         assert_eq!(out["proxies"]["Smart"]["testUrl"], "http://fallback/204");
+    }
+
+    #[test]
+    fn smart_lock_is_exposed_as_the_group_fixed_field() {
+        let proxies = json!({"proxies": {
+            "N1": {"name": "N1", "type": "Trojan"},
+            "N2": {"name": "N2", "type": "Trojan"},
+            "Smart": {"name": "Smart", "type": "Selector", "now": "N1",
+                      "all": ["N1", "N2", "smartspeedtest@hide"]},
+            "Plain": {"name": "Plain", "type": "Selector", "now": "N1", "all": ["N1"]}
+        }});
+        let smart_urls = HashMap::from([("Smart".to_string(), "http://s/204".to_string())]);
+        let trim = |fixed: HashMap<String, String>| -> Value {
+            serde_json::from_str(&build_trimmed(
+                &px(proxies.clone()),
+                &RawProviders::default(),
+                "rule",
+                "http://d/204",
+                &smart_urls,
+                &|_| None,
+                &fixed,
+            ))
+            .unwrap()
+        };
+
+        let out = trim(HashMap::from([("Smart".to_string(), "N2".to_string())]));
+        assert_eq!(out["proxies"]["Smart"]["fixed"], "N2");
+
+        assert!(out["proxies"]["Plain"].get("fixed").is_none());
+
+        let gone = trim(HashMap::from([("Smart".to_string(), "N9".to_string())]));
+        assert!(gone["proxies"]["Smart"].get("fixed").is_none());
+
+        let none = trim(HashMap::new());
+        assert!(none["proxies"]["Smart"].get("fixed").is_none());
+    }
+
+    #[test]
+    fn clash_fixed_of_urltest_group_is_forwarded_untouched() {
+
+        let proxies = json!({"proxies": {
+            "N1": {"name": "N1", "type": "Trojan"},
+            "UT": {"name": "UT", "type": "URLTest", "now": "N1", "all": ["N1"],
+                   "testUrl": "http://ut/204", "fixed": "N1"},
+            "UT2": {"name": "UT2", "type": "URLTest", "now": "N1", "all": ["N1"],
+                    "testUrl": "http://ut/204", "fixed": ""}
+        }});
+        let out: Value = serde_json::from_str(&build_trimmed(
+            &px(proxies),
+            &RawProviders::default(),
+            "rule",
+            "http://d/204",
+            &HashMap::new(),
+            &|_| None,
+            &HashMap::new(),
+        ))
+        .unwrap();
+        assert_eq!(out["proxies"]["UT"]["fixed"], "N1");
+        assert_eq!(out["proxies"]["UT"]["testUrl"], "http://ut/204");
+
+        assert!(out["proxies"]["UT2"].get("fixed").is_none());
     }
 
     #[test]
@@ -744,6 +898,7 @@ mod tests {
             "u",
             &HashMap::new(),
             &|_| None,
+            &HashMap::new(),
         ))
         .unwrap();
         assert_eq!(out["proxies"], json!({}));

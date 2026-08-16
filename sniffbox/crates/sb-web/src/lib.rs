@@ -7,6 +7,7 @@ pub mod clash_logs;
 pub mod cloudflared;
 pub mod connections;
 pub mod events;
+pub mod gate;
 pub mod geo;
 pub mod http;
 mod idle_gate;

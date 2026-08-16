@@ -5,7 +5,7 @@ use crate::events::LogTx;
 use crate::screen::ScreenHistory;
 use crate::traffic::TrafficSource;
 use crate::{
-    auth, clash_logs, connections, http, native, proxy_unix, respond, router, screen_poll,
+    auth, clash_logs, connections, gate, http, native, proxy_unix, respond, router, screen_poll,
     static_files,
 };
 use arc_swap::ArcSwap;
@@ -49,6 +49,8 @@ pub struct ServerConfig {
     pub reload_cmd: Option<Vec<String>>,
 
     pub reload_inflight: Arc<AtomicBool>,
+
+    pub group_delay_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 
     pub probe: Option<Arc<dyn crate::probe::ProbeSource>>,
 
@@ -191,6 +193,30 @@ async fn handle_conn(
             router::Route::ProxyClash => {
 
                 let path = req.path_only();
+
+                let _gate = match router::group_delay_target(&req.method, path) {
+                    Some(g) => match gate::Gate::try_acquire(&cfg.group_delay_inflight, &g) {
+                        Some(guard) => Some(guard),
+                        None => {
+                            tracing::info!(%peer, group = %g, "group delay already in flight");
+                            respond::send(
+                                &mut stream,
+                                429,
+                                "Too Many Requests",
+                                &[("Content-Type", "application/json"), ("Retry-After", "2")],
+                                br#"{"message":"group delay already in flight"}"#,
+                                ka,
+                            )
+                            .await?;
+                            carry = consume_body(&mut stream, req.framing()?, body_prefix).await?;
+                            if !ka {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let is_conn = path == "/connections" || path.starts_with("/connections/");
                 let is_delete = req.method.eq_ignore_ascii_case("DELETE");
                 let self_serve = is_conn && !(cfg.clash_enabled && is_delete);
