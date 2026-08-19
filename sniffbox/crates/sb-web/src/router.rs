@@ -46,6 +46,7 @@ const CLASH_ALLOW: &[(&str, &[Seg])] = &[
     ("PUT", &[Lit("proxies"), Param]),
     ("DELETE", &[Lit("proxies"), Param]),
     ("GET", &[Lit("proxies"), Param, Lit("delay")]),
+
     ("GET", &[Lit("group"), Param, Lit("delay")]),
     ("GET", &[Lit("providers"), Lit("proxies")]),
     ("PUT", &[Lit("providers"), Lit("proxies"), Param]),
