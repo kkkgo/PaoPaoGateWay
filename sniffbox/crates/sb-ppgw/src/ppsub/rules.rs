@@ -119,9 +119,13 @@ fn build_provider(rs: &RuleSet) -> Yaml {
         Yaml::Array(vec![ystr(super::groups::ua_ruleset())]),
     );
     p.insert(ystr("header"), Yaml::Hash(header));
-    if !rs.format.is_empty() {
-        p.insert(ystr("format"), ystr(&rs.format));
-    }
+
+    let format = if rs.format.is_empty() {
+        crate::ruleset::guess_format(&rs.url)
+    } else {
+        &rs.format
+    };
+    p.insert(ystr("format"), ystr(format));
     if !rs.proxy.is_empty() {
         p.insert(ystr("proxy"), ystr(&rs.proxy));
     }
@@ -328,5 +332,38 @@ mod tests {
             "default classical"
         );
         assert_eq!(a["type"].as_str(), Some("http"));
+    }
+
+    #[test]
+    fn provider_format_auto_is_never_left_empty() {
+        let rs = |url: &str, format: &str| RuleSet {
+            priority: 1,
+            typ: "rule-set".into(),
+            name: "a".into(),
+            url: url.into(),
+            behavior: String::new(),
+            interval: 0,
+            fixrule: vec![],
+            is_forced: false,
+            format: format.into(),
+            proxy: String::new(),
+            path: String::new(),
+        };
+        let fmt = |r: &RuleSet| build_provider(r)["format"].as_str().map(String::from);
+        assert_eq!(fmt(&rs("http://x/a.yaml", "")).as_deref(), Some("yaml"));
+        assert_eq!(fmt(&rs("http://x/a.mrs?v=1", "")).as_deref(), Some("mrs"));
+        assert_eq!(fmt(&rs("http://x/a.list", "")).as_deref(), Some("text"));
+        assert_eq!(fmt(&rs("http://x/raw", "")).as_deref(), Some("text"));
+        assert_eq!(
+            fmt(&rs("http://x/a.yaml", "text")).as_deref(),
+            Some("text"),
+            "explicit format wins over the suffix"
+        );
+        assert!(
+            build_provider(&rs("http://x/raw", ""))["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(".txt")
+        );
     }
 }

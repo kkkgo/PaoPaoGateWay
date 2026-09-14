@@ -62,6 +62,10 @@ fn ext_for(format: &str, url: &str) -> &'static str {
     }
 }
 
+pub fn guess_format(url: &str) -> &'static str {
+    url_ext(url).unwrap_or("text")
+}
+
 fn url_ext(url: &str) -> Option<&'static str> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let last = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
@@ -127,7 +131,7 @@ pub struct Provider {
     pub path: String,
     pub interval: i64,
 
-    pub has_format: bool,
+    pub format: String,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -166,7 +170,7 @@ pub fn parse_providers(content: &str) -> Vec<Provider> {
             url: url.to_string(),
             path: path.to_string(),
             interval: p["interval"].as_i64().unwrap_or(0),
-            has_format: p["format"].as_str().is_some_and(|s| !s.is_empty()),
+            format: p["format"].as_str().unwrap_or("").to_string(),
         });
     }
     out
@@ -238,7 +242,28 @@ fn ystr(s: &str) -> Yaml {
     Yaml::String(s.to_string())
 }
 
-pub fn prefetch_with<F>(clash_yaml: &str, dir: &str, fetch: F) -> PrefetchReport
+fn note_format(
+    backfills: &mut HashMap<String, String>,
+    p: &Provider,
+    auto: &HashSet<String>,
+    bytes: &[u8],
+) {
+    if !p.format.is_empty() && !auto.contains(&p.name) {
+        return;
+    }
+    if let Some(fmt) = detect_format(&p.url, bytes)
+        && fmt != p.format
+    {
+        backfills.insert(p.name.clone(), fmt.to_string());
+    }
+}
+
+pub fn prefetch_with<F>(
+    clash_yaml: &str,
+    dir: &str,
+    auto: &HashSet<String>,
+    fetch: F,
+) -> PrefetchReport
 where
     F: Fn(&str, &str) -> Result<Vec<u8>, String>,
 {
@@ -265,16 +290,15 @@ where
         let path = Path::new(&p.path);
         if is_fresh(path, p.interval) {
             report.cached += 1;
+            if let Ok(bytes) = std::fs::read(path) {
+                note_format(&mut backfills, p, auto, &bytes);
+            }
             continue;
         }
         let tmp = format!("{}.tmp", p.path);
         match fetch(&p.url, &tmp) {
             Ok(bytes) => {
-                if let Some(fmt) = detect_format(&p.url, &bytes) {
-                    if !p.has_format {
-                        backfills.insert(p.name.clone(), fmt.to_string());
-                    }
-                }
+                note_format(&mut backfills, p, auto, &bytes);
                 if std::fs::rename(&tmp, &p.path).is_ok() {
                     report.downloaded += 1;
                 } else {
@@ -299,12 +323,101 @@ where
 
 pub const PREFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-pub fn prefetch(clash_yaml: &str, dir: &str) -> PrefetchReport {
-    prefetch_with(clash_yaml, dir, |url, tmp| {
+pub fn prefetch(clash_yaml: &str, dir: &str, auto: &HashSet<String>) -> PrefetchReport {
+    prefetch_with(clash_yaml, dir, auto, |url, tmp| {
         crate::download::Downloader::new(url, tmp)
             .best_effort(PREFETCH_TIMEOUT)
             .download()
             .map_err(|e| e.to_string())?;
+        std::fs::read(tmp).map_err(|e| e.to_string())
+    })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PredetectReport {
+
+    pub detected: usize,
+
+    pub unknown: usize,
+    pub backfilled: usize,
+}
+
+pub fn predetect_with<F>(clash_yaml: &str, auto: &HashSet<String>, fetch: F) -> PredetectReport
+where
+    F: Fn(&str, &str) -> Result<Vec<u8>, String> + Sync,
+{
+    let mut report = PredetectReport::default();
+    let Ok(content) = std::fs::read_to_string(clash_yaml) else {
+        return report;
+    };
+    let targets: Vec<Provider> = parse_providers(&content)
+        .into_iter()
+        .filter(|p| auto.contains(&p.name) && url_ext(&p.url).is_none())
+        .collect();
+    if targets.is_empty() {
+        return report;
+    }
+    let fetch = &fetch;
+    let found: Vec<Option<&'static str>> = std::thread::scope(|s| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|p| {
+                s.spawn(move || {
+                    if let Ok(bytes) = std::fs::read(&p.path)
+                        && let Some(fmt) = detect_format(&p.url, &bytes)
+                    {
+                        return Some(fmt);
+                    }
+                    let tmp = std::env::temp_dir().join(format!(
+                        "ppgw_rs_detect_{}_{}",
+                        hash16(&p.url),
+                        std::process::id()
+                    ));
+                    let tmp = tmp.to_string_lossy().into_owned();
+                    let got = fetch(&p.url, &tmp);
+                    let _ = std::fs::remove_file(&tmp);
+                    got.ok().and_then(|b| detect_format(&p.url, &b))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    });
+
+    let mut backfills: HashMap<String, String> = HashMap::new();
+    for (p, fmt) in targets.iter().zip(found) {
+        match fmt {
+            Some(fmt) => {
+                report.detected += 1;
+                if fmt != p.format {
+                    backfills.insert(p.name.clone(), fmt.to_string());
+                }
+            }
+            None => report.unknown += 1,
+        }
+    }
+    if let Some(new_content) = backfill_formats(&content, &backfills)
+        && std::fs::write(clash_yaml, new_content).is_ok()
+    {
+        report.backfilled = backfills.len();
+    }
+    report
+}
+
+pub fn predetect(clash_yaml: &str, auto: &HashSet<String>) -> PredetectReport {
+    predetect_with(clash_yaml, auto, |url, tmp| {
+        use crate::download::Downloader;
+        let direct = Downloader::new(url, tmp)
+            .best_effort(PREFETCH_TIMEOUT)
+            .download();
+        if direct.is_err() {
+            Downloader::new(url, tmp)
+                .timeout(PREFETCH_TIMEOUT)
+                .via_proxy(crate::HEALTHCHECK_SOCKS5)
+                .map_err(|e| e.to_string())?;
+        }
         std::fs::read(tmp).map_err(|e| e.to_string())
     })
 }
@@ -424,9 +537,9 @@ rule-providers:
         let ad = ps.iter().find(|p| p.name == "ad").unwrap();
         assert_eq!(ad.url, "http://u/ad.yaml");
         assert_eq!(ad.interval, 3600);
-        assert!(ad.has_format);
+        assert_eq!(ad.format, "yaml");
         let ok2 = ps.iter().find(|p| p.name == "ok2").unwrap();
-        assert!(!ok2.has_format);
+        assert_eq!(ok2.format, "");
         assert_eq!(ok2.interval, 0);
     }
 
@@ -483,6 +596,7 @@ rule-providers:
         let rep = prefetch_with(
             clash.to_str().unwrap(),
             dir.to_str().unwrap(),
+            &HashSet::new(),
             |url, tmp| {
                 let body: &[u8] = if url.ends_with("ad.yaml") {
                     b"payload:\n  - '+.a.com'\n"
@@ -508,9 +622,12 @@ rule-providers:
             Some("text")
         );
 
-        let rep2 = prefetch_with(clash.to_str().unwrap(), dir.to_str().unwrap(), |_, _| {
-            panic!("should not download fresh files")
-        });
+        let rep2 = prefetch_with(
+            clash.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            &HashSet::new(),
+            |_, _| panic!("should not download fresh files"),
+        );
         assert_eq!(rep2.cached, 2);
         assert_eq!(rep2.downloaded, 0);
 
@@ -533,13 +650,188 @@ rule-providers:
             ),
         )
         .unwrap();
-        let rep = prefetch_with(clash.to_str().unwrap(), dir.to_str().unwrap(), |_, _| {
-            Err("net down".to_string())
-        });
+        let rep = prefetch_with(
+            clash.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            &HashSet::new(),
+            |_, _| Err("net down".to_string()),
+        );
         assert_eq!(rep.failed, 1);
         assert_eq!(rep.downloaded, 0);
         assert!(!p.exists(), "failure leaves no half-done artifacts");
         assert!(!dir.join("a.yaml.tmp").exists(), "tmp cleaned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guess_format_uses_suffix_then_text() {
+        assert_eq!(guess_format("http://x/a.yaml"), "yaml");
+        assert_eq!(guess_format("http://x/a.YML?v=2"), "yaml");
+        assert_eq!(guess_format("http://x/a.mrs#f"), "mrs");
+        assert_eq!(guess_format("http://x/a.list"), "text");
+        assert_eq!(guess_format("http://x/raw"), "text");
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ppgw_rs_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn provider_yaml(entries: &[(&str, &str, &Path, &str)]) -> String {
+        let mut s = String::from("rule-providers:\n");
+        for (name, url, path, format) in entries {
+            s.push_str(&format!(
+                "  {name}:\n    type: http\n    url: {url}\n    path: {}\n",
+                path.display()
+            ));
+            if !format.is_empty() {
+                s.push_str(&format!("    format: {format}\n"));
+            }
+        }
+        s
+    }
+
+    fn formats_of(clash: &Path) -> HashMap<String, String> {
+        let out = std::fs::read_to_string(clash).unwrap();
+        let doc = &YamlLoader::load_from_str(&out).unwrap()[0];
+        doc["rule-providers"]
+            .as_hash()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().unwrap().to_string(),
+                    v["format"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn names(ns: &[&str]) -> HashSet<String> {
+        ns.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prefetch_corrects_guessed_format_but_keeps_explicit_one() {
+        let dir = scratch("pf_guess");
+        let clash = dir.with_extension("yaml");
+        let (guessed, explicit, cached) = (dir.join("g.txt"), dir.join("e.txt"), dir.join("c.txt"));
+
+        std::fs::write(&cached, b"payload:\n  - '+.c.com'\n").unwrap();
+        std::fs::write(
+            &clash,
+            provider_yaml(&[
+                ("guessed", "http://u/g", &guessed, "text"),
+                ("explicit", "http://u/e", &explicit, "text"),
+                ("cached", "http://u/c", &cached, "text"),
+            ]),
+        )
+        .unwrap();
+
+        let rep = prefetch_with(
+            clash.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            &names(&["guessed", "cached"]),
+            |_, tmp| {
+                let body = b"payload:\n  - '+.a.com'\n".to_vec();
+                std::fs::write(tmp, &body).unwrap();
+                Ok(body)
+            },
+        );
+        assert_eq!(rep.downloaded, 2);
+        assert_eq!(rep.cached, 1);
+        assert_eq!(rep.backfilled, 2);
+        let f = formats_of(&clash);
+        assert_eq!(f["guessed"], "yaml");
+        assert_eq!(f["cached"], "yaml");
+        assert_eq!(f["explicit"], "text", "explicit format is never overridden");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&clash);
+    }
+
+    #[test]
+    fn prefetch_keeps_correct_guess_without_rewriting() {
+        let dir = scratch("pf_keep");
+        let clash = dir.with_extension("yaml");
+        let p = dir.join("a.txt");
+        let yaml = provider_yaml(&[("a", "http://u/a", &p, "text")]);
+        std::fs::write(&clash, &yaml).unwrap();
+        let rep = prefetch_with(
+            clash.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            &names(&["a"]),
+            |_, tmp| {
+                let body = b"DOMAIN-SUFFIX,a.com\n".to_vec();
+                std::fs::write(tmp, &body).unwrap();
+                Ok(body)
+            },
+        );
+        assert_eq!(rep.backfilled, 0);
+        assert_eq!(std::fs::read_to_string(&clash).unwrap(), yaml, "untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&clash);
+    }
+
+    #[test]
+    fn predetect_reads_local_file_then_fetches_and_never_touches_clash_files() {
+        let dir = scratch("pd");
+        let clash = dir.join("clash.yaml");
+        let local = dir.join("local.txt");
+        let remote = dir.join("remote.txt");
+        let dead = dir.join("dead.txt");
+        let domains = dir.join("domains.txt");
+        std::fs::write(&local, b"payload:\n  - '+.l.com'\n").unwrap();
+        std::fs::write(
+            &clash,
+            provider_yaml(&[
+                ("local", "http://u/local", &local, "text"),
+                ("remote", "http://u/remote", &remote, "text"),
+                ("dead", "http://u/dead", &dead, "text"),
+                ("domains", "http://u/domains", &domains, "text"),
+                ("suffix", "http://u/s.mrs", &dir.join("s.mrs"), "mrs"),
+                ("manual", "http://u/manual", &dir.join("m.txt"), "text"),
+            ]),
+        )
+        .unwrap();
+
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let rep = predetect_with(
+            clash.to_str().unwrap(),
+            &names(&["local", "remote", "dead", "domains", "suffix"]),
+            |url, tmp| {
+                fetched.lock().unwrap().push(url.to_string());
+                let body: &[u8] = match url {
+                    "http://u/remote" => b"\x28\xB5\x2F\xFDzstd",
+                    "http://u/domains" => b"+.a.com\n+.b.com\n",
+                    _ => return Err("net down".into()),
+                };
+                std::fs::write(tmp, body).unwrap();
+                Ok(body.to_vec())
+            },
+        );
+
+        let mut fetched = fetched.into_inner().unwrap();
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            ["http://u/dead", "http://u/domains", "http://u/remote"],
+            "local cache hit and suffix-typed providers need no fetch; manual ones are skipped"
+        );
+        assert_eq!(rep.detected, 2);
+        assert_eq!(rep.unknown, 2);
+        assert_eq!(rep.backfilled, 2);
+        let f = formats_of(&clash);
+        assert_eq!(f["local"], "yaml");
+        assert_eq!(f["remote"], "mrs");
+        assert_eq!(f["dead"], "text", "unknown keeps the guess");
+        assert_eq!(f["domains"], "text");
+        assert_eq!(f["manual"], "text");
+        assert!(
+            !remote.exists() && !dead.exists(),
+            "clash-owned paths untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

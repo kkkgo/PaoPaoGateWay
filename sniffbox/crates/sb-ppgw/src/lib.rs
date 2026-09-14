@@ -667,6 +667,7 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                 f.output
             );
 
+            let auto = ppsub::auto_format_rule_sets(&f.ppsub);
             if clash_client(f).is_up() {
                 let _ = writeln!(
                     io.out,
@@ -674,10 +675,25 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                     term::green("[PaoPaoGW RuleSet]")
                 );
 
+                let rep = ruleset::predetect(&f.output, &auto);
+                if rep.detected + rep.unknown > 0 {
+                    let _ = writeln!(
+                        io.out,
+                        "{}rule-set format detect: detected={} unknown={} format_backfilled={}",
+                        term::green("[PaoPaoGW RuleSet]"),
+                        rep.detected,
+                        rep.unknown,
+                        rep.backfilled,
+                    );
+                }
+                if rep.backfilled > 0 {
+                    ppsub::state::refresh_output_hash(&f.output);
+                }
+
                 return 0;
             }
 
-            let rep = ruleset::prefetch(&f.output, &ruleset::ruleset_dir());
+            let rep = ruleset::prefetch(&f.output, &ruleset::ruleset_dir(), &auto);
             let _ = writeln!(
                 io.out,
                 "{}rule-set prefetch: downloaded={} cached={} failed={} removed={} format_backfilled={}",

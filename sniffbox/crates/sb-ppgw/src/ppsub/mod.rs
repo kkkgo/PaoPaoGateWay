@@ -521,6 +521,20 @@ fn parse_shadowsocks_in(cfg: &serde_json::Value) -> Option<ShadowsocksIn> {
     Some(ShadowsocksIn { password, cipher })
 }
 
+pub fn auto_format_rule_sets(config_file: &str) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(config_file)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .map(|cfg| {
+            parse_rules(&cfg)
+                .into_iter()
+                .filter(|r| r.typ == "rule-set" && r.format.is_empty() && !r.name.is_empty())
+                .map(|r| r.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_rules(cfg: &serde_json::Value) -> Vec<RuleSet> {
     cfg.get("rules")
         .and_then(|x| x.as_array())
@@ -770,5 +784,27 @@ mod tests {
 
         assert_eq!(r[1].format, "");
         assert_eq!(r[1].path, "");
+    }
+
+    #[test]
+    fn auto_format_rule_sets_lists_only_auto_rule_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("ppsub.json");
+        std::fs::write(
+            &cfg,
+            r#"{"rules":[
+                {"priority":1,"type":"rule-set","name":"a","url":"http://u/a","format":"auto"},
+                {"priority":2,"type":"rule-set","name":"b","url":"http://u/b"},
+                {"priority":3,"type":"rule-set","name":"c","url":"http://u/c","format":"text"},
+                {"priority":4,"type":"url","name":"d","url":"http://u/d"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut got: Vec<String> = auto_format_rule_sets(cfg.to_str().unwrap())
+            .into_iter()
+            .collect();
+        got.sort();
+        assert_eq!(got, ["a", "b"]);
+        assert!(auto_format_rule_sets("/nonexistent/ppsub.json").is_empty());
     }
 }
