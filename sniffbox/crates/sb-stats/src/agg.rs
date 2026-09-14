@@ -2,6 +2,7 @@
 
 use crate::types::{ConnRecord, RecordKind, Transport, now_epoch_ms};
 use arc_swap::ArcSwap;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -117,8 +118,8 @@ impl AggTable {
         prune_rows(&mut rows, self.window, max_rows);
     }
 
-    pub fn snapshot_json(&self) -> String {
-        (**self.json.load()).clone()
+    pub fn snapshot_json(&self) -> Arc<String> {
+        self.json.load_full()
     }
 
     pub fn clear(&self) {
@@ -157,32 +158,51 @@ fn prune_rows(rows: &mut HashMap<AggKey, AggRow>, window: Duration, max_rows: us
 }
 
 fn serialize(rows: &HashMap<AggKey, AggRow>) -> String {
-    let mut items: Vec<(&AggKey, &AggRow)> = rows.iter().collect();
-    items.sort_unstable_by_key(|x| std::cmp::Reverse(x.1.last_ms));
-    let arr: Vec<serde_json::Value> = items.iter().map(|(k, r)| row_json(k, r)).collect();
-    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+    let mut items: Vec<RowOut<'_>> = rows.iter().map(|(k, r)| RowOut { k, r }).collect();
+    items.sort_unstable_by_key(|x| std::cmp::Reverse(x.r.last_ms));
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
 }
 
-fn row_json(k: &AggKey, r: &AggRow) -> serde_json::Value {
+struct RowOut<'a> {
+    k: &'a AggKey,
+    r: &'a AggRow,
+}
 
-    let mut sniff: Vec<&&str> = r.sniffs.iter().filter(|s| !s.is_empty()).collect();
-    if sniff.is_empty() {
-        sniff = r.sniffs.iter().collect();
+impl Serialize for RowOut<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (k, r) = (self.k, self.r);
+        let mut m = s.serialize_map(Some(12))?;
+        m.serialize_entry("client", &DisplayStr(&k.client))?;
+        m.serialize_entry("conns", &r.conns)?;
+        m.serialize_entry("domain", &k.domain)?;
+        m.serialize_entry("down", &r.down)?;
+        m.serialize_entry("dport", &r.dports)?;
+        m.serialize_entry("head", &r.head)?;
+        m.serialize_entry("inbound", &r.inbounds)?;
+        m.serialize_entry("last_seen", &r.last_ms)?;
+        m.serialize_entry("sniff", &SniffOut(&r.sniffs))?;
+        m.serialize_entry("transport", k.transport.as_str())?;
+        m.serialize_entry("ts", &r.first_ms)?;
+        m.serialize_entry("up", &r.up)?;
+        m.end()
     }
-    serde_json::json!({
-        "client": k.client.to_string(),
-        "transport": k.transport.as_str(),
-        "dport": r.dports.iter().collect::<Vec<_>>(),
-        "domain": k.domain,
-        "ts": r.first_ms,
-        "last_seen": r.last_ms,
-        "conns": r.conns,
-        "up": r.up,
-        "down": r.down,
-        "sniff": sniff,
-        "inbound": r.inbounds.iter().collect::<Vec<_>>(),
-        "head": r.head,
-    })
+}
+
+struct DisplayStr<'a, T: std::fmt::Display>(&'a T);
+
+impl<T: std::fmt::Display> Serialize for DisplayStr<'_, T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self.0)
+    }
+}
+
+struct SniffOut<'a>(&'a BTreeSet<&'static str>);
+
+impl Serialize for SniffOut<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let concrete = self.0.iter().any(|v| !v.is_empty());
+        s.collect_seq(self.0.iter().filter(|v| !concrete || !v.is_empty()))
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +226,143 @@ mod tests {
 
     fn parse(t: &AggTable) -> Vec<serde_json::Value> {
         serde_json::from_str(&t.snapshot_json()).unwrap()
+    }
+
+    fn serialize_via_value(rows: &HashMap<AggKey, AggRow>) -> String {
+        let mut items: Vec<(&AggKey, &AggRow)> = rows.iter().collect();
+        items.sort_unstable_by_key(|x| std::cmp::Reverse(x.1.last_ms));
+        let arr: Vec<serde_json::Value> = items.iter().map(|(k, r)| row_json(k, r)).collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+    }
+
+    fn row_json(k: &AggKey, r: &AggRow) -> serde_json::Value {
+        let mut sniff: Vec<&&str> = r.sniffs.iter().filter(|s| !s.is_empty()).collect();
+        if sniff.is_empty() {
+            sniff = r.sniffs.iter().collect();
+        }
+        serde_json::json!({
+            "client": k.client.to_string(),
+            "transport": k.transport.as_str(),
+            "dport": r.dports.iter().collect::<Vec<_>>(),
+            "domain": k.domain,
+            "ts": r.first_ms,
+            "last_seen": r.last_ms,
+            "conns": r.conns,
+            "up": r.up,
+            "down": r.down,
+            "sniff": sniff,
+            "inbound": r.inbounds.iter().collect::<Vec<_>>(),
+            "head": r.head,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        last_ms: u64,
+        up: u64,
+        down: u64,
+        conns: u64,
+        dports: &[u16],
+        sniffs: &[&'static str],
+        inbounds: &[&'static str],
+        head: Option<&str>,
+    ) -> AggRow {
+        AggRow {
+            first_ms: last_ms.saturating_sub(1_000),
+            last_ms,
+            up,
+            down,
+            conns,
+            dports: dports.iter().copied().collect(),
+            sniffs: sniffs.iter().copied().collect(),
+            inbounds: inbounds.iter().copied().collect(),
+            head: head.map(str::to_string),
+        }
+    }
+
+    fn key(client: &str, transport: Transport, domain: &str) -> AggKey {
+        AggKey {
+            client: client.parse().unwrap(),
+            transport,
+            domain: domain.to_string(),
+        }
+    }
+
+    #[test]
+    fn typed_serialize_is_byte_identical_to_value_reference() {
+        let mut rows = HashMap::new();
+        rows.insert(
+            key("10.0.0.1", Transport::Tcp, "example.com"),
+            row(
+                1_700_000_000_500,
+                1500,
+                90_000,
+                3,
+                &[80, 443],
+                &["tls"],
+                &["tproxy"],
+                None,
+            ),
+        );
+        rows.insert(
+            key("fd00::1", Transport::Udp, "we\"ird\\name\u{1}\t.例子.test"),
+            row(
+                1_700_000_000_400,
+                1,
+                2,
+                1,
+                &[443],
+                &["", "quic"],
+                &["socks5", "tproxy"],
+                Some("c0ffee00"),
+            ),
+        );
+        rows.insert(
+            key("192.168.1.9", Transport::Udp, "1.2.3.4"),
+            row(
+                1_700_000_000_300,
+                0,
+                u64::MAX,
+                u64::MAX,
+                &[53, 3478, 65535],
+                &[""],
+                &["internal"],
+                Some(""),
+            ),
+        );
+        rows.insert(
+            key("::ffff:10.1.2.3", Transport::Tcp, ""),
+            row(1_700_000_000_200, 7, 0, 0, &[], &[], &[], None),
+        );
+        rows.insert(
+            key("2001:db8::abcd", Transport::Tcp, "a.b"),
+            row(
+                1_700_000_000_100,
+                42,
+                42,
+                2,
+                &[8443],
+                &["http", "RealIP", "tls"],
+                &["http"],
+                Some("16030100"),
+            ),
+        );
+
+        let typed = serialize(&rows);
+        assert_eq!(
+            typed,
+            serialize_via_value(&rows),
+            "typed serializer drifted from the Value reference"
+        );
+
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&typed).unwrap();
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[0]["domain"], "example.com");
+        assert_eq!(arr[4]["domain"], "a.b");
+
+        let empty = HashMap::new();
+        assert_eq!(serialize(&empty), serialize_via_value(&empty));
+        assert_eq!(serialize(&empty), "[]");
     }
 
     #[test]
@@ -400,6 +557,6 @@ mod tests {
         t.fold(&a, 10, 0);
         t.clear();
         assert!(parse(&t).is_empty());
-        assert_eq!(t.snapshot_json(), "[]");
+        assert_eq!(*t.snapshot_json(), "[]");
     }
 }

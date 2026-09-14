@@ -55,6 +55,8 @@ struct Req {
     max_body: u64,
 
     binary: bool,
+
+    relaxed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,7 @@ fn validate_with(v: &Value, relaxed: bool) -> Result<Req, String> {
         timeout: Duration::from_millis(timeout_ms),
         max_body,
         binary: obj.get("binary").and_then(Value::as_bool).unwrap_or(false),
+        relaxed,
     })
 }
 
@@ -227,6 +230,10 @@ fn is_header_value(s: &str) -> bool {
 
 fn check_url(url: &str, relaxed: bool) -> Result<(), String> {
     let uri: Uri = url.parse().map_err(|_| "bad url".to_string())?;
+    check_uri(&uri, relaxed)
+}
+
+fn check_uri(uri: &Uri, relaxed: bool) -> Result<(), String> {
     let scheme = uri.scheme_str().ok_or("url must be absolute")?;
     let https = match scheme {
         "http" => false,
@@ -329,7 +336,7 @@ async fn execute(req: &Req, proxy: &str) -> Result<Value, String> {
     };
 
     rb = rb.redirect(if req.follow {
-        wreq::redirect::Policy::limited(MAX_REDIRECTS)
+        redirect_policy(req.relaxed)
     } else {
         wreq::redirect::Policy::none()
     });
@@ -371,6 +378,35 @@ async fn execute(req: &Req, proxy: &str) -> Result<Value, String> {
         "encoding": encoding,
         "truncated": truncated,
     }))
+}
+
+fn redirect_policy(relaxed: bool) -> wreq::redirect::Policy {
+    let limited = wreq::redirect::Policy::limited(MAX_REDIRECTS);
+    wreq::redirect::Policy::custom(move |attempt| {
+        let visited = attempt
+            .previous
+            .iter()
+            .any(|p| same_origin(p, &attempt.uri));
+        if visited || check_uri(&attempt.uri, relaxed).is_ok() {
+            limited.redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+fn same_origin(a: &Uri, b: &Uri) -> bool {
+    let port = |u: &Uri| {
+        u.port_u16().or(match u.scheme_str() {
+            Some("http") => Some(80),
+            Some("https") => Some(443),
+            _ => None,
+        })
+    };
+    a.scheme_str() == b.scheme_str()
+        && a.host()
+            .is_some_and(|h| b.host().is_some_and(|k| h.eq_ignore_ascii_case(k)))
+        && port(a) == port(b)
 }
 
 fn apply(mut rb: wreq::RequestBuilder, req: &Req) -> wreq::RequestBuilder {
@@ -698,6 +734,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_body: DEFAULT_RESP_BODY,
             binary: false,
+            relaxed: false,
         }
     }
 
@@ -754,6 +791,106 @@ mod tests {
         assert_eq!(v["headers"]["location"], "/ok");
     }
 
+    fn spawn_redirector(location: String) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn redirect_to_a_new_origin_is_sandboxed_per_hop() {
+        let internal = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let internal_port = internal.local_addr().unwrap().port();
+        internal.set_nonblocking(true).unwrap();
+        let to_loopback = spawn_redirector(format!("http://127.0.0.1:{internal_port}/admin"));
+
+        for relaxed in [false, true] {
+            let mut req = req_to(to_loopback, "/start");
+            req.relaxed = relaxed;
+            req.timeout = Duration::from_secs(2);
+            let v = crate::rt::block_on(execute(&req, "")).unwrap_or_else(|e| {
+                panic!("a refused hop must stop at the 3xx, not fail (relaxed={relaxed}): {e}")
+            });
+            assert_eq!(v["status"], 302, "relaxed={relaxed}: {v}");
+            assert_eq!(
+                v["url"],
+                format!("http://127.0.0.1:{to_loopback}/start"),
+                "the probe must not report the refused hop as visited (relaxed={relaxed})"
+            );
+            assert_eq!(
+                v["headers"]["location"],
+                format!("http://127.0.0.1:{internal_port}/admin"),
+                "the caller still sees where it wanted to go"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            internal.accept().is_err(),
+            "loopback is refused by both profiles, so the internal service must never be contacted"
+        );
+
+        let to_lan = spawn_redirector("http://10.255.255.1:9/".to_string());
+        let mut strict = req_to(to_lan, "/start");
+        strict.timeout = Duration::from_millis(800);
+        let v = crate::rt::block_on(execute(&strict, "")).unwrap();
+        assert_eq!(
+            v["status"], 302,
+            "the strict profile refuses a LAN hop: {v}"
+        );
+
+        let mut relaxed = req_to(to_lan, "/start");
+        relaxed.relaxed = true;
+        relaxed.timeout = Duration::from_millis(800);
+        let r = crate::rt::block_on(execute(&relaxed, ""));
+        assert!(
+            !matches!(&r, Ok(v) if v["status"] == 302),
+            "the relaxed profile allows a LAN hop, so it must try to follow it: {r:?}"
+        );
+    }
+
+    #[test]
+    fn same_origin_matches_scheme_host_and_effective_port() {
+        let u = |s: &str| s.parse::<Uri>().unwrap();
+        assert!(same_origin(
+            &u("http://a.example/x"),
+            &u("http://a.example:80/y")
+        ));
+        assert!(same_origin(
+            &u("https://A.example/"),
+            &u("https://a.example:443/z")
+        ));
+        assert!(!same_origin(
+            &u("http://a.example/"),
+            &u("https://a.example/")
+        ));
+        assert!(!same_origin(
+            &u("http://a.example/"),
+            &u("http://a.example:8080/")
+        ));
+        assert!(!same_origin(
+            &u("http://a.example/"),
+            &u("http://b.example/")
+        ));
+    }
+
     #[test]
     fn execute_sends_headers_ua_and_body() {
         let port = spawn_server();
@@ -767,6 +904,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_body: DEFAULT_RESP_BODY,
             binary: false,
+            relaxed: false,
         };
         let v = crate::rt::block_on(execute(&req, "")).unwrap();
         let echo = v["body"].as_str().unwrap().to_ascii_lowercase();

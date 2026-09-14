@@ -18,6 +18,7 @@ pub async fn handle(
     cfg: &ServerConfig,
     ka: bool,
     body: &[u8],
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<bool> {
     match req.path_only() {
         "/sniffbox/probe" => {
@@ -29,7 +30,7 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/logs/sse" => {
-            logs_sse(stream, cfg).await?;
+            logs_sse(stream, cfg, shutdown).await?;
             Ok(false)
         }
         "/sniffbox/screen" => {
@@ -37,7 +38,7 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/screen/sse" => {
-            screen_sse(stream, cfg).await?;
+            screen_sse(stream, cfg, shutdown).await?;
             Ok(false)
         }
         "/sniffbox/traffic/total" => {
@@ -49,7 +50,7 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/traffic/sse" => {
-            traffic_sse(stream, cfg).await?;
+            traffic_sse(stream, cfg, shutdown).await?;
             Ok(false)
         }
         "/sniffbox/nodes" => {
@@ -109,7 +110,7 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/cloudflared/logs/sse" => {
-            cloudflared_logs_sse(stream, cfg).await?;
+            cloudflared_logs_sse(stream, cfg, shutdown).await?;
             Ok(false)
         }
         _ => {
@@ -267,7 +268,42 @@ async fn proxies_get(
     })
     .await
     .unwrap_or_else(|_| "{}".to_string());
-    respond::send(stream, 200, "OK", &[JSON], body.as_bytes(), ka).await
+
+    let etag = etag_of(body.as_bytes());
+    if req
+        .header("if-none-match")
+        .is_some_and(|v| if_none_match_hits(v, &etag))
+    {
+        return respond::not_modified(stream, &etag, ka).await;
+    }
+    respond::send(
+        stream,
+        200,
+        "OK",
+        &[JSON, ("ETag", &etag), ("Cache-Control", "no-cache")],
+        body.as_bytes(),
+        ka,
+    )
+    .await
+}
+
+fn etag_of(body: &[u8]) -> String {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut h = DefaultHasher::new();
+    h.write(body);
+    format!("\"{:016x}\"", h.finish())
+}
+
+fn if_none_match_hits(header: &[u8], etag: &str) -> bool {
+    let Ok(header) = std::str::from_utf8(header) else {
+        return false;
+    };
+    let strip_weak = |t: &str| t.strip_prefix("W/").unwrap_or(t).to_string();
+    let current = strip_weak(etag);
+    header
+        .split(',')
+        .map(str::trim)
+        .any(|t| t == "*" || strip_weak(t) == current)
 }
 
 async fn proxy_detail_get(
@@ -633,7 +669,11 @@ async fn cloudflared_logs(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) 
     .await
 }
 
-async fn cloudflared_logs_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+async fn cloudflared_logs_sse(
+    stream: &mut TcpStream,
+    cfg: &ServerConfig,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> io::Result<()> {
     let Some(hist) = cfg.cloudflared_log.as_ref() else {
         return respond::not_found(stream, false).await;
     };
@@ -641,8 +681,11 @@ async fn cloudflared_logs_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io:
     sse::write_headers(stream).await?;
     let mut hb = tokio::time::interval(Duration::from_secs(15));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut sd = shutdown.clone();
     loop {
         tokio::select! {
+            _ = sd.changed() => { if *sd.borrow() { return Ok(()); } }
             r = rx.recv() => match r {
                 Ok(chunk) => sse::event(stream, &chunk).await?,
                 Err(RecvError::Lagged(n)) => sse::comment(stream, &format!("lagged {n}")).await?,
@@ -669,20 +712,34 @@ async fn traffic_clear(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> 
     .await
 }
 
-async fn traffic_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+async fn traffic_sse(
+    stream: &mut TcpStream,
+    cfg: &ServerConfig,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> io::Result<()> {
     let Some(src) = cfg.traffic.as_ref() else {
         return respond::not_found(stream, false).await;
     };
     sse::write_headers(stream).await?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+
+    let mut sd = shutdown.clone();
     loop {
-        tick.tick().await;
-        let snap = src.snapshot_json();
-        sse::event(stream, &snap).await?;
+        tokio::select! {
+            _ = sd.changed() => { if *sd.borrow() { return Ok(()); } }
+            _ = tick.tick() => {
+                let snap = src.snapshot_json();
+                sse::event(stream, &snap).await?;
+            }
+        }
     }
 }
 
-async fn logs_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+async fn logs_sse(
+    stream: &mut TcpStream,
+    cfg: &ServerConfig,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> io::Result<()> {
     let Some(tx) = cfg.log_tx.as_ref() else {
         return respond::not_found(stream, false).await;
     };
@@ -690,8 +747,11 @@ async fn logs_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> 
     sse::write_headers(stream).await?;
     let mut hb = tokio::time::interval(Duration::from_secs(15));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut sd = shutdown.clone();
     loop {
         tokio::select! {
+            _ = sd.changed() => { if *sd.borrow() { return Ok(()); } }
             r = rx.recv() => match r {
                 Ok(ev) => sse::event(stream, &ev.to_json()).await?,
                 Err(RecvError::Lagged(n)) => sse::comment(stream, &format!("lagged {n}")).await?,
@@ -730,13 +790,20 @@ async fn screen_snapshot(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -
     .await
 }
 
-async fn screen_sse(stream: &mut TcpStream, cfg: &ServerConfig) -> io::Result<()> {
+async fn screen_sse(
+    stream: &mut TcpStream,
+    cfg: &ServerConfig,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> io::Result<()> {
     let mut rx = cfg.screen_history.subscribe();
     sse::write_headers(stream).await?;
     let mut hb = tokio::time::interval(Duration::from_secs(15));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut sd = shutdown.clone();
     loop {
         tokio::select! {
+            _ = sd.changed() => { if *sd.borrow() { return Ok(()); } }
             r = rx.recv() => match r {
                 Ok(chunk) => sse::event(stream, &chunk).await?,
                 Err(RecvError::Lagged(n)) => sse::comment(stream, &format!("lagged {n}")).await?,
@@ -755,7 +822,37 @@ async fn read_screen_async(dev: PathBuf) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{pct_decode, query_param};
+    use super::{etag_of, if_none_match_hits, pct_decode, query_param};
+
+    #[test]
+    fn if_none_match_follows_rfc_weak_comparison() {
+        let tag = etag_of(br#"{"proxies":{}}"#);
+        assert!(tag.starts_with('"') && tag.ends_with('"'), "{tag}");
+        assert_eq!(tag, etag_of(br#"{"proxies":{}}"#), "same body, same tag");
+        assert_ne!(
+            tag,
+            etag_of(br#"{"proxies":{"a":1}}"#),
+            "changed body, new tag"
+        );
+
+        assert!(if_none_match_hits(tag.as_bytes(), &tag));
+        assert!(
+            if_none_match_hits(format!("W/{tag}").as_bytes(), &tag),
+            "weak comparison"
+        );
+        assert!(
+            if_none_match_hits(format!("\"x\", {tag}").as_bytes(), &tag),
+            "a list"
+        );
+        assert!(if_none_match_hits(b"*", &tag));
+        assert!(!if_none_match_hits(b"\"0000\"", &tag));
+        assert!(!if_none_match_hits(b"", &tag));
+        assert!(
+            !if_none_match_hits(&[0xff, 0xfe], &tag),
+            "non-UTF-8 never matches"
+        );
+    }
+
     #[test]
     fn pct_decode_basic() {
         assert_eq!(pct_decode("abc"), "abc");

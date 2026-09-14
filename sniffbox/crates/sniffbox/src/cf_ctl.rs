@@ -210,6 +210,8 @@ pub struct CloudflaredSupervisor {
 
     start_lock: Mutex<()>,
 
+    stopping: AtomicBool,
+
     global: Mutex<Global>,
 
     bytes: [crate::cf_metrics::ByteAccum; 2],
@@ -379,6 +381,7 @@ impl CloudflaredSupervisor {
 
             logs: sb_web::LineHistory::new(2000),
             start_lock: Mutex::new(()),
+            stopping: AtomicBool::new(false),
             global: Mutex::new(Global::default()),
             bytes: Default::default(),
         }
@@ -490,6 +493,10 @@ impl CloudflaredSupervisor {
     }
 
     pub fn restart(&self, which: Option<Egress>) -> Result<usize, &'static str> {
+
+        if self.is_stopping() {
+            return Err("cloudflared is shutting down");
+        }
         let cfg = self.load_cf_cfg();
         if cfg.token.is_none() {
             return Err("cloudflared_token not configured");
@@ -615,9 +622,14 @@ impl CloudflaredSupervisor {
     }
 
     pub fn kill(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
         for egress in Egress::ALL {
             self.kill_one(egress);
         }
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     fn tick(&self) {
@@ -695,6 +707,10 @@ impl CloudflaredSupervisor {
     }
 
     fn tick_locked(&self) {
+
+        if self.is_stopping() {
+            return;
+        }
         let cfg = self.load_cf_cfg();
         let mode = cfg.proxy;
         let Some(token) = cfg.token.clone() else {
@@ -922,6 +938,24 @@ impl CloudflaredSupervisor {
             };
             let bin_fp = file_fingerprint(CF_BIN);
             let stamp_now = stamp_with(&base, proto);
+
+            let disowned = self.with_proc(egress, |p| {
+                if self.stopping.load(Ordering::SeqCst) {
+                    p.pid = Some(pid);
+                    kill_locked(p);
+                    true
+                } else {
+                    false
+                }
+            });
+            if disowned {
+                tracing::info!(
+                    egress = egress.as_str(),
+                    pid,
+                    "cloudflared spawned during shutdown; reaped it instead of leaving an orphan"
+                );
+                return;
+            }
             self.with_proc(egress, |p| {
                 p.pid = Some(pid);
                 p.token = Some(token.to_string());
@@ -1830,6 +1864,43 @@ mod tests {
 
     fn sup() -> CloudflaredSupervisor {
         CloudflaredSupervisor::new(ConfigSource::Production, OutboundMode::Free, None)
+    }
+
+    #[test]
+    fn kill_latches_stopping_so_nothing_can_respawn() {
+        let s = sup();
+        assert!(!s.is_stopping(), "fresh supervisor is not stopping");
+        s.kill();
+        assert!(s.is_stopping(), "kill must latch");
+
+        assert_eq!(
+            s.restart(None),
+            Err("cloudflared is shutting down"),
+            "manual restart must be refused once stopping"
+        );
+
+        s.tick();
+        assert!(s.is_stopping());
+    }
+
+    #[test]
+    fn start_replica_rechecks_the_stopping_latch_after_spawning() {
+        let src = include_str!("cf_ctl.rs");
+        let body = method_body(src, "fn start_replica(&self");
+        let spawn_at = body
+            .find("spawn_cf(")
+            .expect("start_replica must still spawn");
+        let recheck_at = body
+            .find("self.stopping.load(")
+            .expect("start_replica must consult the stopping latch");
+        assert!(
+            recheck_at > spawn_at,
+            "the latch recheck must come after spawn_cf (that is the racy window); body:\n{body}"
+        );
+        assert!(
+            body.contains("kill_locked(p)"),
+            "a replica spawned during shutdown must be reaped, not just skipped; body:\n{body}"
+        );
     }
 
     #[test]

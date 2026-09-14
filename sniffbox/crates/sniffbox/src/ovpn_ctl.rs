@@ -25,6 +25,8 @@ const TUN_UP_WAIT: Duration = Duration::from_secs(15);
 pub struct OvpnSupervisor {
     inner: Mutex<Inner>,
 
+    stopping: AtomicBool,
+
     tun_ready: Option<Arc<AtomicBool>>,
 }
 
@@ -58,6 +60,7 @@ impl OvpnSupervisor {
                     None
                 },
             }),
+            stopping: AtomicBool::new(false),
             tun_ready,
         };
         sup.refresh_ready();
@@ -66,12 +69,22 @@ impl OvpnSupervisor {
 
     fn refresh_ready(&self) {
         if let Some(gate) = &self.tun_ready {
-            gate.store(self.is_healthy(), Ordering::Relaxed);
+
+            let up = !self.is_stopping() && self.is_healthy();
+            gate.store(up, Ordering::Relaxed);
         }
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     pub fn ensure_up(&self) -> io::Result<bool> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if self.is_stopping() {
+            return Ok(false);
+        }
         if let Some(pid) = g.pid
             && proc_is_ovpn(pid)
         {
@@ -98,6 +111,13 @@ impl OvpnSupervisor {
     pub fn cold_restart(&self) -> io::Result<()> {
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+            if self.stopping.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "openvpn supervisor is stopping",
+                ));
+            }
             kill_locked(&mut g);
         }
 
@@ -121,6 +141,8 @@ impl OvpnSupervisor {
     }
 
     pub fn kill(&self) {
+
+        self.stopping.store(true, Ordering::SeqCst);
 
         if let Some(gate) = &self.tun_ready {
             gate.store(false, Ordering::Relaxed);
@@ -282,6 +304,10 @@ pub fn spawn_monitor(
 
 fn monitor_tick(sup: &OvpnSupervisor) {
 
+    if sup.is_stopping() {
+        return;
+    }
+
     if sup.config_changed() {
         tracing::info!("openvpn config changed; cold-restart to reload");
         if let Err(e) = sup.cold_restart() {
@@ -331,6 +357,39 @@ fn wait_tun_up(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_latches_stopping_so_nothing_can_respawn() {
+        let gate = Arc::new(AtomicBool::new(true));
+        let sup = OvpnSupervisor::new(Some(Arc::clone(&gate)));
+        assert!(!sup.is_stopping(), "fresh supervisor is not stopping");
+
+        sup.kill();
+        assert!(sup.is_stopping(), "kill must latch");
+        assert!(
+            !gate.load(Ordering::Relaxed),
+            "kill must close the readiness gate"
+        );
+
+        assert!(
+            !sup.ensure_up().expect("ensure_up must not error"),
+            "ensure_up must be a no-op once stopping"
+        );
+        assert_eq!(
+            sup.cold_restart().unwrap_err().kind(),
+            io::ErrorKind::Interrupted,
+            "cold_restart must refuse once stopping"
+        );
+
+        sup.refresh_ready();
+        assert!(
+            !gate.load(Ordering::Relaxed),
+            "refresh_ready must not reopen the gate after kill"
+        );
+
+        monitor_tick(&sup);
+        assert!(sup.is_stopping());
+    }
 
     #[test]
     fn adopts_none_when_no_ovpn() {

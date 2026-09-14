@@ -26,17 +26,19 @@ impl AdminAcl {
     }
 
     pub fn allows(&self, ip: IpAddr) -> bool {
+
+        if self.nets.is_empty() {
+            return true;
+        }
         let v4 = match ip {
             IpAddr::V4(a) => a,
             IpAddr::V6(a) => match a.to_ipv4_mapped() {
                 Some(a) => a,
+
                 None => return a.is_loopback(),
             },
         };
-        if v4.is_loopback() || self.nets.is_empty() {
-            return true;
-        }
-        self.nets.iter().any(|n| n.contains(&v4))
+        v4.is_loopback() || self.nets.iter().any(|n| n.contains(&v4))
     }
 }
 
@@ -48,6 +50,23 @@ mod tests {
     fn empty_allows_all() {
         let acl = AdminAcl::default();
         assert!(acl.allows("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn empty_allows_all_including_plain_ipv6() {
+        let acl = AdminAcl::default();
+        assert!(acl.allows("2001:db8::1".parse().unwrap()));
+        assert!(acl.allows("::1".parse().unwrap()));
+        assert!(acl.allows("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn non_empty_acl_still_only_admits_loopback_for_plain_ipv6() {
+        let acl = AdminAcl::new(vec!["10.0.0.0/8".parse().unwrap()]);
+        assert!(acl.allows("::1".parse().unwrap()));
+        assert!(!acl.allows("2001:db8::1".parse().unwrap()));
+        assert!(acl.allows("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!acl.allows("::ffff:192.168.1.1".parse().unwrap()));
     }
 
     #[test]

@@ -322,7 +322,7 @@ pub struct WebTraffic {
 }
 
 impl sb_web::TrafficSource for WebTraffic {
-    fn snapshot_json(&self) -> String {
+    fn snapshot_json(&self) -> Arc<String> {
 
         let now = sb_stats::now_epoch_ms();
         let prev = self.shared.traffic_last_access.swap(now, Ordering::Relaxed);
@@ -553,7 +553,22 @@ pub struct WebInfo {
     pub shared: Arc<SharedState>,
     pub stat: InfoStatic,
     sample: std::sync::Mutex<InfoSample>,
+    pids: std::sync::Mutex<crate::sysinfo::RescanCache<TrackedPids>>,
 }
+
+#[derive(Clone, Default)]
+struct TrackedPids {
+    clash: Option<u32>,
+    ovpn: Option<u32>,
+
+    cloudflared: Vec<u32>,
+}
+
+const CLASH_COMMS: &[&str] = &["clash", "mihomo", "clash-meta"];
+const OVPN_COMMS: &[&str] = &["openvpn"];
+const CF_COMMS: &[&str] = &["cloudflared"];
+
+const PID_RESCAN_TTL: Duration = Duration::from_secs(5);
 
 impl WebInfo {
     pub fn new(shared: Arc<SharedState>, stat: InfoStatic) -> Self {
@@ -561,7 +576,31 @@ impl WebInfo {
             shared,
             stat,
             sample: std::sync::Mutex::new(InfoSample::default()),
+            pids: std::sync::Mutex::new(crate::sysinfo::RescanCache::new(PID_RESCAN_TTL)),
         }
+    }
+
+    fn tracked_pids(&self) -> TrackedPids {
+        use crate::sysinfo::{find_pids_by_names, pid_has_comm};
+        let want_clash = self.stat.mode.via_clash();
+        let want_ovpn = self.stat.mode == OutboundMode::Ovpn;
+        let mut cache = self.pids.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(
+            std::time::Instant::now(),
+            |p| {
+                p.clash.is_none_or(|pid| pid_has_comm(pid, CLASH_COMMS))
+                    && p.ovpn.is_none_or(|pid| pid_has_comm(pid, OVPN_COMMS))
+                    && p.cloudflared.iter().all(|&pid| pid_has_comm(pid, CF_COMMS))
+            },
+            || {
+                let found = find_pids_by_names(&[CLASH_COMMS, OVPN_COMMS, CF_COMMS]);
+                TrackedPids {
+                    clash: found[0].first().copied().filter(|_| want_clash),
+                    ovpn: found[1].first().copied().filter(|_| want_ovpn),
+                    cloudflared: found[2].clone(),
+                }
+            },
+        )
     }
 
     fn mode_string(&self) -> String {
@@ -741,20 +780,14 @@ impl WebInfo {
         let now_cpu_cores = sysinfo::cpu_jiffies_per_core();
         let now_self = sysinfo::self_cpu_jiffies();
 
-        let clash_pid = self
-            .stat
-            .mode
-            .via_clash()
-            .then(|| sysinfo::find_pid_by_name(&["clash", "mihomo", "clash-meta"]))
-            .flatten();
+        let pids = self.tracked_pids();
+        let clash_pid = pids.clash;
         let now_clash = clash_pid.and_then(|p| sysinfo::process_cpu_jiffies(p).map(|j| (p, j)));
 
-        let ovpn_pid = (self.stat.mode == OutboundMode::Ovpn)
-            .then(|| sysinfo::find_pid_by_name(&["openvpn"]))
-            .flatten();
+        let ovpn_pid = pids.ovpn;
         let now_ovpn = ovpn_pid.and_then(|p| sysinfo::process_cpu_jiffies(p).map(|j| (p, j)));
 
-        let cf_pids = sysinfo::find_pids_by_name(&["cloudflared"]);
+        let cf_pids = pids.cloudflared;
         let now_cf: Vec<(u32, u64)> = cf_pids
             .iter()
             .filter_map(|&p| sysinfo::process_cpu_jiffies(p).map(|j| (p, j)))
@@ -774,7 +807,8 @@ impl WebInfo {
         let mut cf_uptime = None;
 
         {
-            let mut s = self.sample.lock().unwrap();
+
+            let mut s = self.sample.lock().unwrap_or_else(|e| e.into_inner());
             let total_delta = match (s.cpu, now_cpu) {
                 (Some(prev), Some(cur)) => cur.0.saturating_sub(prev.0),
                 _ => 0,
@@ -858,6 +892,19 @@ impl WebInfo {
         let conns = self.conn_stats(&all);
         let mapped = self.shared.fakeip.as_ref().map(|p| p.len());
 
+        let pool = self.shared.outbound.socks5_pool().map(|p| {
+            let cfg = p.cfg();
+            serde_json::json!({
+                "idle": p.idle_len(),
+                "min": cfg.min,
+                "max": cfg.max,
+                "cold_acquires": p.cold_acquires(),
+                "acquires": p.acquires(),
+                "discarded_dead": p.discarded_dead(),
+                "warmed": p.warmed(),
+            })
+        });
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -896,6 +943,7 @@ impl WebInfo {
             },
             "fakeip": { "mapped": mapped },
             "connections": conns,
+            "pool": pool,
         })
     }
 
@@ -1429,6 +1477,10 @@ mod tests {
             );
         }
         assert!(dv.get("version").is_none(), "version is static-only");
+        assert!(
+            dv["pool"].is_null(),
+            "direct mode has no SOCKS5 pool, so the field is null: {dv}"
+        );
 
         let av: serde_json::Value =
             serde_json::from_str(&info.info_json(InfoScope::All)).expect("all valid JSON");
@@ -1438,6 +1490,50 @@ mod tests {
         assert!(av["cpu"].get("model").is_some() && av["cpu"].get("usage").is_some());
         assert!(av["fakeip"].get("cidr").is_some() && av["fakeip"].get("mapped").is_some());
         assert!(av["connections"].get("active").is_some());
+    }
+
+    #[tokio::test]
+    async fn dynamic_info_exposes_socks5_pool_pressure() {
+        use sb_web::{InfoScope, InfoSource};
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut c = cfg(false);
+        c.outbound.mode = OutboundMode::Yaml;
+        c.socks5.server = closed;
+        c.socks5.pool_min = 3;
+        c.socks5.pool_max = 9;
+        let shared = Arc::new(SharedState::new(&c));
+        let info = WebInfo::new(Arc::clone(&shared), InfoStatic::from_cfg(&c));
+
+        let pool_json = || -> serde_json::Value {
+            let dv: serde_json::Value =
+                serde_json::from_str(&info.info_json(InfoScope::Dynamic)).unwrap();
+            dv["pool"].clone()
+        };
+        let before = pool_json();
+        assert_eq!(before["min"], 3, "{before}");
+        assert_eq!(before["max"], 9, "{before}");
+        assert_eq!(before["idle"], 0, "{before}");
+        for key in ["cold_acquires", "acquires", "discarded_dead", "warmed"] {
+            assert!(before[key].is_u64(), "pool missing {key}: {before}");
+        }
+
+        let pool = shared
+            .outbound
+            .socks5_pool()
+            .expect("yaml mode dials clash through the pool");
+        assert!(pool.acquire().await.is_err(), "nothing listens upstream");
+        let after = pool_json();
+        for key in ["cold_acquires", "acquires"] {
+            assert_eq!(
+                after[key].as_u64(),
+                before[key].as_u64().map(|n| n + 1),
+                "the endpoint must read the live {key} counter: {before} -> {after}"
+            );
+        }
     }
 
     #[test]

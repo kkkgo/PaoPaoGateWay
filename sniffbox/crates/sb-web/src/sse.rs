@@ -17,7 +17,9 @@ pub async fn write_headers<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
 
 pub async fn event<W: AsyncWrite + Unpin>(w: &mut W, data: &str) -> io::Result<()> {
     let mut buf = Vec::with_capacity(data.len() + 16);
-    for line in data.split('\n') {
+
+    let normalized = data.replace("\r\n", "\n");
+    for line in normalized.split(['\n', '\r']) {
         buf.extend_from_slice(b"data: ");
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
@@ -52,6 +54,24 @@ mod tests {
         let mut out = Vec::new();
         event(&mut out, "line1\nline2").await.unwrap();
         assert_eq!(out, b"data: line1\ndata: line2\n\n");
+    }
+
+    #[tokio::test]
+    async fn event_splits_bare_cr_and_crlf() {
+        let mut out = Vec::new();
+        event(&mut out, "line1\rline2").await.unwrap();
+        assert_eq!(out, b"data: line1\ndata: line2\n\n");
+
+        let mut out = Vec::new();
+        event(&mut out, "line1\r\nline2").await.unwrap();
+        assert_eq!(out, b"data: line1\ndata: line2\n\n");
+    }
+
+    #[tokio::test]
+    async fn event_preserves_blank_lines() {
+        let mut out = Vec::new();
+        event(&mut out, "a\n\nb").await.unwrap();
+        assert_eq!(out, b"data: a\ndata: \ndata: b\n\n");
     }
 
     #[tokio::test]

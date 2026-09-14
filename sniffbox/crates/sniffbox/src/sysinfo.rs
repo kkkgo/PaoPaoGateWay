@@ -784,38 +784,62 @@ pub fn self_rss() -> u64 {
     rss_of_status(&std::fs::read_to_string("/proc/self/status").unwrap_or_default())
 }
 
-pub fn find_pid_by_name(names: &[&str]) -> Option<u32> {
-    let dir = std::fs::read_dir("/proc").ok()?;
+pub fn find_pids_by_names(groups: &[&[&str]]) -> Vec<Vec<u32>> {
+    let mut out = vec![Vec::new(); groups.len()];
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for ent in dir.flatten() {
         let fname = ent.file_name();
         let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-        if names.contains(&comm.trim()) {
-            return Some(pid);
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        let comm = comm.trim();
+        for (names, pids) in groups.iter().zip(out.iter_mut()) {
+            if names.contains(&comm) {
+                pids.push(pid);
+            }
         }
     }
-    None
+    for pids in &mut out {
+        pids.sort_unstable();
+    }
+    out
 }
 
-pub fn find_pids_by_name(names: &[&str]) -> Vec<u32> {
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for ent in dir.flatten() {
-        let fname = ent.file_name();
-        let Some(pid) = fname.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-        if names.contains(&comm.trim()) {
-            out.push(pid);
-        }
+pub fn pid_has_comm(pid: u32, names: &[&str]) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| names.contains(&c.trim()))
+}
+
+pub struct RescanCache<T> {
+    ttl: std::time::Duration,
+    last: Option<(std::time::Instant, T)>,
+}
+
+impl<T: Clone> RescanCache<T> {
+    pub const fn new(ttl: std::time::Duration) -> Self {
+        Self { ttl, last: None }
     }
-    out.sort_unstable();
-    out
+
+    pub fn get(
+        &mut self,
+        now: std::time::Instant,
+        still_valid: impl FnOnce(&T) -> bool,
+        scan: impl FnOnce() -> T,
+    ) -> T {
+        if let Some((at, v)) = &self.last
+            && now.saturating_duration_since(*at) < self.ttl
+            && still_valid(v)
+        {
+            return v.clone();
+        }
+        let v = scan();
+        self.last = Some((now, v.clone()));
+        v
+    }
 }
 
 pub fn process_rss(pid: u32) -> u64 {
@@ -1102,12 +1126,77 @@ mod tests {
     }
 
     #[test]
-    fn find_pid_by_name_finds_this_test_binary() {
+    fn find_pids_by_names_scans_every_group_in_one_pass() {
         let comm = std::fs::read_to_string("/proc/self/comm").unwrap();
         let comm = comm.trim();
-        let pid = find_pid_by_name(&[comm]).expect("own comm should be found");
-        assert!(process_rss(pid) > 0);
-        assert!(find_pid_by_name(&["definitely-not-a-real-process-xyz"]).is_none());
+        let me = std::process::id();
+        let found = find_pids_by_names(&[
+            &[comm],
+            &["definitely-not-a-real-process-xyz"],
+            &["another-missing-name", comm],
+        ]);
+        assert_eq!(found.len(), 3, "one result per group");
+        assert!(
+            found[0].contains(&me),
+            "own comm should be found: {found:?}"
+        );
+        assert!(found[1].is_empty(), "{found:?}");
+        assert!(
+            found[2].contains(&me),
+            "any name in a group matches: {found:?}"
+        );
+        assert!(found[0].windows(2).all(|w| w[0] < w[1]), "pids are sorted");
+        assert!(process_rss(me) > 0);
+
+        assert!(pid_has_comm(me, &[comm]));
+        assert!(!pid_has_comm(me, &["definitely-not-a-real-process-xyz"]));
+        assert!(
+            !pid_has_comm(u32::MAX, &[comm]),
+            "a pid that does not exist"
+        );
+    }
+
+    #[test]
+    fn rescan_cache_reuses_until_expired_or_invalid() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let scans = Cell::new(0u32);
+        let scan = || {
+            scans.set(scans.get() + 1);
+            scans.get()
+        };
+        let mut c = RescanCache::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+
+        assert_eq!(c.get(t0, |_| true, scan), 1, "first call scans");
+        assert_eq!(
+            c.get(t0 + Duration::from_secs(1), |_| true, scan),
+            1,
+            "reused within ttl"
+        );
+        assert_eq!(
+            c.get(t0 + Duration::from_secs(4), |_| true, scan),
+            1,
+            "still within ttl"
+        );
+        assert_eq!(scans.get(), 1);
+
+        assert_eq!(
+            c.get(t0 + Duration::from_secs(4), |_| false, scan),
+            2,
+            "an invalid cached value is rescanned immediately"
+        );
+        assert_eq!(
+            c.get(t0 + Duration::from_secs(8), |_| true, scan),
+            2,
+            "ttl restarts at the rescan"
+        );
+        assert_eq!(
+            c.get(t0 + Duration::from_secs(9), |_| true, scan),
+            3,
+            "expired"
+        );
+        assert_eq!(scans.get(), 3);
     }
 
     #[test]

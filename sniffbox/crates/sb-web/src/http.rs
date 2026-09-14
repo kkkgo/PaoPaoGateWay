@@ -266,24 +266,31 @@ pub async fn relay_body<R, W>(
     dst: &mut W,
     framing: Framing,
     prefix: &[u8],
-) -> io::Result<()>
+) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     match framing {
-        Framing::None => Ok(()),
+
+        Framing::None => Ok(prefix.to_vec()),
         Framing::Length(total) => relay_counted(src, dst, total, prefix).await,
         Framing::Eof => {
+
             dst.write_all(prefix).await?;
             tokio::io::copy(src, dst).await?;
-            Ok(())
+            Ok(Vec::new())
         }
         Framing::Chunked => relay_chunked(src, dst, prefix).await,
     }
 }
 
-async fn relay_counted<R, W>(src: &mut R, dst: &mut W, total: u64, prefix: &[u8]) -> io::Result<()>
+async fn relay_counted<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    total: u64,
+    prefix: &[u8],
+) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -304,10 +311,10 @@ where
         dst.write_all(&tmp[..n]).await?;
         remaining -= n as u64;
     }
-    Ok(())
+    Ok(prefix[take..].to_vec())
 }
 
-async fn relay_chunked<R, W>(src: &mut R, dst: &mut W, prefix: &[u8]) -> io::Result<()>
+async fn relay_chunked<R, W>(src: &mut R, dst: &mut W, prefix: &[u8]) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -327,7 +334,7 @@ where
                 }
             }
             dst.flush().await?;
-            return Ok(());
+            return Ok(rdr.rest().to_vec());
         }
         rdr.copy_exact(dst, size as usize + 2).await?;
     }
@@ -346,6 +353,10 @@ impl<'a, R: AsyncRead + Unpin> PrefixedReader<'a, R> {
             prefix,
             pos: 0,
         }
+    }
+
+    fn rest(&self) -> &[u8] {
+        &self.prefix[self.pos.min(self.prefix.len())..]
     }
 
     async fn read_byte(&mut self) -> io::Result<u8> {

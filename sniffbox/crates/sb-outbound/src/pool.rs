@@ -38,7 +38,12 @@ struct IdleConn {
 
 #[derive(Default)]
 struct Pressure {
-    cold_acquires: AtomicU64,
+
+    cold_pending: AtomicU64,
+
+    acquires_total: AtomicU64,
+
+    cold_total: AtomicU64,
     discarded_dead: AtomicU64,
     new_warmed: AtomicU64,
 }
@@ -100,7 +105,11 @@ impl SocksPool {
     }
 
     pub fn cold_acquires(&self) -> u64 {
-        self.inner.pressure.cold_acquires.load(Ordering::Relaxed)
+        self.inner.pressure.cold_total.load(Ordering::Relaxed)
+    }
+
+    pub fn acquires(&self) -> u64 {
+        self.inner.pressure.acquires_total.load(Ordering::Relaxed)
     }
 
     pub fn discarded_dead(&self) -> u64 {
@@ -123,12 +132,17 @@ impl SocksPool {
     }
 
     pub async fn acquire(&self) -> Result<TcpStream, OutboundErr> {
+        self.inner
+            .pressure
+            .acquires_total
+            .fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let cfg = self.cfg();
         let mut dead = 0u64;
         let mut dropped_stale = false;
+        let mut below_min = false;
         let chosen: Option<TcpStream> = loop {
-            let cand = {
+            let (cand, left) = {
                 let mut g = self.inner.idle.lock();
 
                 while let Some(front) = g.front() {
@@ -139,12 +153,14 @@ impl SocksPool {
                         break;
                     }
                 }
-                g.pop_front()
+                let cand = g.pop_front();
+                (cand, g.len())
             };
             match cand {
                 None => break None,
                 Some(ic) => {
                     if is_stream_alive(&ic.stream) {
+                        below_min = left < cfg.min;
                         break Some(ic.stream);
                     }
                     dead += 1;
@@ -157,7 +173,8 @@ impl SocksPool {
                 .discarded_dead
                 .fetch_add(dead, Ordering::Relaxed);
         }
-        if dead > 0 || dropped_stale {
+
+        if dead > 0 || dropped_stale || below_min {
             self.inner.warm_notify.notify_one();
         }
         if let Some(s) = chosen {
@@ -166,7 +183,11 @@ impl SocksPool {
 
         self.inner
             .pressure
-            .cold_acquires
+            .cold_pending
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pressure
+            .cold_total
             .fetch_add(1, Ordering::Relaxed);
         self.inner.warm_notify.notify_one();
         let s = dial_and_handshake(self.inner.target, self.inner.auth.as_deref()).await?;
@@ -209,15 +230,19 @@ impl SocksPool {
     }
 
     pub fn spawn_warmer(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.spawn_warmer_every(WARM_TICK)
+    }
+
+    fn spawn_warmer_every(self: &Arc<Self>, tick: Duration) -> tokio::task::JoinHandle<()> {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            pool.warmer_loop().await;
+            pool.warmer_loop(tick).await;
         })
     }
 
-    async fn warmer_loop(self: Arc<Self>) {
+    async fn warmer_loop(self: Arc<Self>, tick: Duration) {
 
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -232,28 +257,38 @@ impl SocksPool {
 
         self.evict_stale();
         let cfg = self.cfg();
-        let cur_idle = self.idle_len();
-        if cur_idle >= cfg.min {
+        if self.idle_len() >= cfg.min {
             return;
         }
 
         let pressure_boost = self
             .inner
             .pressure
-            .cold_acquires
+            .cold_pending
             .swap(0, Ordering::Relaxed)
-            .min(cfg.max as u64) as usize;
+            .min(cfg.min as u64) as usize;
         let target = (cfg.min + pressure_boost).min(cfg.max);
-        let need = target.saturating_sub(cur_idle);
 
-        let batch = need.min(cfg.min.max(4));
-
-        let mut consecutive_fail = 0usize;
         const MAX_CONSECUTIVE_FAIL: usize = 3;
-        for _ in 0..batch {
-            match dial_and_handshake(self.inner.target, self.inner.auth.as_deref()).await {
-                Ok(s) => {
+        let mut consecutive_fail = 0usize;
+        let mut lanes = 1usize;
+        let mut dials = tokio::task::JoinSet::new();
+        loop {
+
+            while consecutive_fail < MAX_CONSECUTIVE_FAIL
+                && dials.len() < lanes
+                && self.idle_len() + dials.len() < target
+            {
+                let (addr, auth) = (self.inner.target, self.inner.auth.clone());
+                dials.spawn(async move { dial_and_handshake(addr, auth.as_deref()).await });
+            }
+            let Some(joined) = dials.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok(Ok(s)) => {
                     consecutive_fail = 0;
+                    lanes = WARM_PARALLEL;
                     self.inner
                         .pressure
                         .new_warmed
@@ -265,17 +300,16 @@ impl SocksPool {
                             stream: s,
                             put_at: Instant::now(),
                         });
-                    } else {
-                        drop(g);
-
                     }
+
+                }
+                Ok(Err(e)) => {
+                    consecutive_fail += 1;
+                    tracing::debug!(?e, consecutive_fail, target = %self.inner.target, "warmer dial failed");
                 }
                 Err(e) => {
                     consecutive_fail += 1;
-                    tracing::debug!(?e, consecutive_fail, target = %self.inner.target, "warmer dial failed");
-                    if consecutive_fail >= MAX_CONSECUTIVE_FAIL {
-                        break;
-                    }
+                    tracing::debug!(?e, "warmer dial task failed");
                 }
             }
         }
@@ -297,6 +331,10 @@ impl SocksPool {
 }
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+const WARM_TICK: Duration = Duration::from_secs(5);
+
+const WARM_PARALLEL: usize = 8;
 
 async fn dial_and_handshake(
     target: SocketAddr,
@@ -373,8 +411,50 @@ fn is_stream_alive(s: &TcpStream) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    async fn wait_for(mut cond: impl FnMut() -> bool, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn spawn_slow_socks(delay: Duration) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let peak_seen = Arc::clone(&peak);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (in_flight, peak) = (Arc::clone(&in_flight), Arc::clone(&peak));
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut hdr = [0u8; 3];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = sock.write_all(&[0x05, 0x00]).await;
+                    let mut buf = [0u8; 1];
+                    let _ = sock.read_exact(&mut buf).await;
+                });
+            }
+        });
+        (addr, peak_seen)
+    }
 
     #[test]
     fn default_cfg_sane() {
@@ -563,6 +643,186 @@ mod tests {
             pool.idle_len() >= 2,
             "warmer should fill with auth, got {}",
             pool.idle_len()
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_acquire_metric_is_cumulative_across_warmer_cycles() {
+
+        let addr = pick_port().await;
+        let pool = SocksPool::new(
+            addr,
+            PoolCfg {
+                min: 0,
+                max: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+        );
+        for _ in 0..3 {
+            let _ = pool.acquire().await;
+        }
+        assert_eq!(
+            pool.cold_acquires(),
+            3,
+            "three cold acquires must be counted"
+        );
+
+        pool.warm_once().await;
+        assert_eq!(
+            pool.cold_acquires(),
+            3,
+            "the warmer consumes its own signal, not the cumulative metric"
+        );
+        let _ = pool.acquire().await;
+        assert_eq!(pool.cold_acquires(), 4, "metric keeps climbing");
+        assert_eq!(
+            pool.acquires(),
+            4,
+            "failed cold dials still count as acquires"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquires_counts_pool_hits_and_cold_dials() {
+        let addr = pick_port().await;
+        let (_srv, _kill) = spawn_fake_socks(addr).await;
+        let pool = SocksPool::new(
+            addr,
+            PoolCfg {
+                min: 2,
+                max: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+        );
+        drop(pool.acquire().await.unwrap());
+        drop(pool.acquire().await.unwrap());
+        assert_eq!(
+            (pool.acquires(), pool.cold_acquires()),
+            (2, 2),
+            "an empty pool dials cold"
+        );
+        pool.warm_once().await;
+        assert!(pool.idle_len() >= 2);
+        drop(pool.acquire().await.unwrap());
+        assert_eq!(
+            (pool.acquires(), pool.cold_acquires()),
+            (3, 2),
+            "a pool hit is an acquire, not a cold dial"
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_below_min_wakes_the_warmer_without_a_miss() {
+        let addr = pick_port().await;
+        let (_srv, _kill) = spawn_fake_socks(addr).await;
+        let pool = Arc::new(SocksPool::new(
+            addr,
+            PoolCfg {
+                min: 4,
+                max: 8,
+                idle_timeout: Duration::from_secs(60),
+            },
+        ));
+
+        let _h = pool.spawn_warmer_every(Duration::from_secs(3600));
+        assert!(
+            wait_for(|| pool.idle_len() >= 4, Duration::from_secs(5)).await,
+            "initial fill"
+        );
+        let cold0 = pool.cold_acquires();
+        let taken = [
+            pool.acquire().await.unwrap(),
+            pool.acquire().await.unwrap(),
+            pool.acquire().await.unwrap(),
+        ];
+        assert_eq!(pool.cold_acquires(), cold0, "all three came from the pool");
+        assert!(
+            wait_for(|| pool.idle_len() >= 4, Duration::from_secs(3)).await,
+            "taking the pool below min must refill it without waiting for a miss or the tick (idle {})",
+            pool.idle_len()
+        );
+        drop(taken);
+    }
+
+    #[tokio::test]
+    async fn refill_dials_in_parallel_once_upstream_answers() {
+        const HANDSHAKE: Duration = Duration::from_millis(300);
+        let (addr, peak) = spawn_slow_socks(HANDSHAKE).await;
+        let pool = SocksPool::new(
+            addr,
+            PoolCfg {
+                min: 8,
+                max: 16,
+                idle_timeout: Duration::from_secs(60),
+            },
+        );
+        let t0 = Instant::now();
+        pool.warm_once().await;
+        let took = t0.elapsed();
+        assert_eq!(pool.idle_len(), 8, "one round fills to min");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=WARM_PARALLEL).contains(&peak),
+            "handshakes in flight at once: {peak}"
+        );
+
+        assert!(
+            took < Duration::from_secs(2),
+            "eight 300 ms handshakes must not run one after another (took {took:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_upstream_is_probed_one_dial_at_a_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+        let pool = SocksPool::new(
+            addr,
+            PoolCfg {
+                min: 8,
+                max: 16,
+                idle_timeout: Duration::from_secs(60),
+            },
+        );
+        pool.warm_once().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.idle_len(), 0);
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "a round against an upstream that never completes a handshake stops after three serial tries"
+        );
+    }
+
+    #[tokio::test]
+    async fn pressure_boost_adds_at_most_one_min() {
+        let addr = pick_port().await;
+        let (_srv, _kill) = spawn_fake_socks(addr).await;
+        let pool = SocksPool::new(
+            addr,
+            PoolCfg {
+                min: 2,
+                max: 16,
+                idle_timeout: Duration::from_secs(60),
+            },
+        );
+        for _ in 0..10 {
+            drop(pool.acquire().await.unwrap());
+        }
+        assert_eq!(pool.cold_acquires(), 10);
+        pool.warm_once().await;
+        assert_eq!(
+            pool.idle_len(),
+            4,
+            "ten cold dials boost this round's target from min 2 to 2 x min, not to 12"
         );
     }
 

@@ -103,6 +103,18 @@ impl WebProxies {
         Arc::clone(&self.warm)
     }
 
+    fn cache_lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn last_fetch_lock(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        self.last_fetch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cached(&self) -> Option<String> {
+        self.cache_lock().clone()
+    }
+
     fn fetch(&self) -> Option<String> {
         let sock = &self.clash_sock;
         let px: RawProxies = clash_get(sock, "/proxies")
@@ -141,8 +153,8 @@ impl WebProxies {
 
     pub fn refresh(&self) -> bool {
         if let Some(json) = self.fetch() {
-            *self.cache.lock().unwrap() = Some(json);
-            *self.last_fetch.lock().unwrap() = Some(std::time::Instant::now());
+            *self.cache_lock() = Some(json);
+            *self.last_fetch_lock() = Some(std::time::Instant::now());
             true
         } else {
             false
@@ -151,9 +163,7 @@ impl WebProxies {
 
     fn refresh_rate_limited(&self) {
         let recent = self
-            .last_fetch
-            .lock()
-            .unwrap()
+            .last_fetch_lock()
             .is_some_and(|t| t.elapsed() < FRESH_MIN_INTERVAL);
         if !recent {
             self.refresh();
@@ -164,25 +174,17 @@ impl WebProxies {
 impl sb_web::ProxiesSource for WebProxies {
     fn proxies_json(&self) -> String {
 
-        if let Some(j) = self.cache.lock().unwrap().clone() {
+        if let Some(j) = self.cached() {
             return j;
         }
 
         self.refresh();
-        self.cache
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())
+        self.cached().unwrap_or_else(|| "{}".to_string())
     }
 
     fn proxies_json_fresh(&self) -> String {
         self.refresh_rate_limited();
-        self.cache
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())
+        self.cached().unwrap_or_else(|| "{}".to_string())
     }
 
     fn mode_json(&self) -> String {
@@ -199,18 +201,16 @@ impl sb_web::ProxiesSource for WebProxies {
 
     fn smart_fix(&self, group: &str, node: Option<&str>) -> (u16, String) {
 
-        if self.cache.lock().unwrap().is_none() {
+        if self.cached().is_none() {
             self.refresh();
         }
-        let snap: Value = match self
-            .cache
-            .lock()
-            .unwrap()
-            .as_deref()
-            .map(serde_json::from_str)
-        {
-            Some(Ok(v)) => v,
-            _ => return (503, err_json("clash not ready")),
+
+        let Some(raw) = self.cached() else {
+            return (503, err_json("clash not ready"));
+        };
+        let snap: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return (503, err_json("clash not ready")),
         };
         let Some(g) = snap.get("proxies").and_then(|p| p.get(group)) else {
             return (404, err_json("group not found"));
@@ -241,7 +241,7 @@ impl sb_web::ProxiesSource for WebProxies {
             }
         }
 
-        *self.last_fetch.lock().unwrap() = None;
+        *self.last_fetch_lock() = None;
         self.refresh();
         (
             200,
@@ -305,13 +305,19 @@ fn find_provider_node(providers_body: &[u8], name: &str) -> Option<String> {
 }
 
 pub(crate) fn pct_encode_segment(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len() * 3);
     for &b in s.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
         }
     }
     out

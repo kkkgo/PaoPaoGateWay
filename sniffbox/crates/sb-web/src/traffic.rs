@@ -2,7 +2,7 @@
 
 pub trait TrafficSource: Send + Sync {
 
-    fn snapshot_json(&self) -> String;
+    fn snapshot_json(&self) -> std::sync::Arc<String>;
 
     fn totals(&self) -> (u64, u64);
 

@@ -40,6 +40,10 @@ const REPLY_SLOT_CAP: usize = 4096;
 
 const PENDING_QUEUE_CAP: usize = 8;
 
+const MAX_SESSIONS_PER_CLIENT: usize = 1024;
+
+const MAX_FLOWS_PER_CLIENT: usize = 16384;
+
 struct Pending<T> {
 
     queue: Mutex<Option<Vec<T>>>,
@@ -79,6 +83,60 @@ enum SymSlot {
 enum FcSlot {
     Pending(Arc<Pending<(SocketAddr, Vec<u8>)>>),
     Ready(Arc<FullconeSession>),
+}
+
+struct ClientBudget {
+    counts: DashMap<IpAddr, usize>,
+}
+
+impl ClientBudget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            counts: DashMap::new(),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr, limit: usize) -> Option<BudgetToken> {
+        if limit == 0 {
+            return None;
+        }
+        let mut n = self.counts.entry(ip).or_insert(0);
+        if *n >= limit {
+            return None;
+        }
+        *n += 1;
+        Some(BudgetToken {
+            budget: Arc::clone(self),
+            ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn used(&self, ip: IpAddr) -> usize {
+        self.counts.get(&ip).map_or(0, |n| *n)
+    }
+}
+
+struct BudgetToken {
+    budget: Arc<ClientBudget>,
+    ip: IpAddr,
+}
+
+impl Drop for BudgetToken {
+    fn drop(&mut self) {
+        if let Entry::Occupied(mut e) = self.budget.counts.entry(self.ip) {
+            if *e.get() <= 1 {
+                e.remove();
+            } else {
+                *e.get_mut() -= 1;
+            }
+        }
+    }
+}
+
+struct Budgeted<T> {
+    slot: T,
+    _budget: BudgetToken,
 }
 
 pub struct SymmetricSession {
@@ -124,9 +182,9 @@ impl Drop for FullconeSession {
 
 pub struct UdpEngine {
 
-    symmetric: Arc<DashMap<(SocketAddr, SocketAddr), SymSlot>>,
+    symmetric: Arc<DashMap<(SocketAddr, SocketAddr), Budgeted<SymSlot>>>,
 
-    fullcone: Arc<DashMap<SocketAddr, FcSlot>>,
+    fullcone: Arc<DashMap<SocketAddr, Budgeted<FcSlot>>>,
 
     flow_path: Arc<DashMap<(SocketAddr, SocketAddr), FlowEntry>>,
     spoof_cache: Arc<SpoofCache>,
@@ -139,14 +197,59 @@ pub struct UdpEngine {
     pub pkts_reply_fc: AtomicU64,
 
     cloudflared: bool,
+
+    session_budget: Arc<ClientBudget>,
+    flow_budget: Arc<ClientBudget>,
+    max_sessions_per_client: usize,
+    max_flows_per_client: usize,
+
+    drops_flow: AtomicU64,
+    drops_session: AtomicU64,
+
+    last_drop_client: Mutex<Option<IpAddr>>,
 }
 
 struct FlowEntry {
     kind: FlowKind,
     last_seen_ms: AtomicU64,
+    _budget: BudgetToken,
 }
 
 impl UdpEngine {
+    fn new(
+        idle_timeout: Duration,
+        spoof_cache_cap: usize,
+        cloudflared: bool,
+        max_flows_per_client: usize,
+        max_sessions_per_client: usize,
+    ) -> Self {
+        Self {
+            symmetric: Arc::new(DashMap::new()),
+            fullcone: Arc::new(DashMap::new()),
+            flow_path: Arc::new(DashMap::new()),
+            spoof_cache: Arc::new(SpoofCache::new(spoof_cache_cap)),
+            started: Instant::now(),
+            idle_timeout,
+            pkts_fwd_sym: AtomicU64::new(0),
+            pkts_fwd_fc: AtomicU64::new(0),
+            pkts_reply_sym: AtomicU64::new(0),
+            pkts_reply_fc: AtomicU64::new(0),
+            cloudflared,
+            session_budget: ClientBudget::new(),
+            flow_budget: ClientBudget::new(),
+            max_sessions_per_client,
+            max_flows_per_client,
+            drops_flow: AtomicU64::new(0),
+            drops_session: AtomicU64::new(0),
+            last_drop_client: Mutex::new(None),
+        }
+    }
+
+    fn note_drop(&self, counter: &AtomicU64, client: IpAddr) {
+        counter.fetch_add(1, Ordering::Relaxed);
+        *self.last_drop_client.lock() = Some(client);
+    }
+
     pub fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
@@ -206,19 +309,13 @@ pub fn start_udp_engine(
         "tproxy udp listening (REUSEPORT multi-worker + recvmmsg)"
     );
 
-    let engine = Arc::new(UdpEngine {
-        symmetric: Arc::new(DashMap::new()),
-        fullcone: Arc::new(DashMap::new()),
-        flow_path: Arc::new(DashMap::new()),
-        spoof_cache: Arc::new(SpoofCache::new(spoof_cache_cap)),
-        started: Instant::now(),
+    let engine = Arc::new(UdpEngine::new(
         idle_timeout,
-        pkts_fwd_sym: AtomicU64::new(0),
-        pkts_fwd_fc: AtomicU64::new(0),
-        pkts_reply_sym: AtomicU64::new(0),
-        pkts_reply_fc: AtomicU64::new(0),
+        spoof_cache_cap,
         cloudflared,
-    });
+        MAX_FLOWS_PER_CLIENT,
+        MAX_SESSIONS_PER_CLIENT,
+    ));
 
     {
         let engine = Arc::clone(&engine);
@@ -231,6 +328,8 @@ pub fn start_udp_engine(
             let mut last_fwd_fc: u64 = 0;
             let mut last_reply_sym: u64 = 0;
             let mut last_reply_fc: u64 = 0;
+            let mut last_drops_flow: u64 = 0;
+            let mut last_drops_session: u64 = 0;
             loop {
                 tokio::select! {
                     biased;
@@ -241,6 +340,27 @@ pub fn start_udp_engine(
                             tracing::debug!(symmetric_removed=sym_rm, fullcone_removed=fc_rm, flow_path_removed=fp_rm,
                                 alive=engine.len(), spoof_cached=engine.spoof_cache.len(), "udp idle sweep");
                         }
+
+                        let drops_flow = engine.drops_flow.load(Ordering::Relaxed);
+                        let drops_session = engine.drops_session.load(Ordering::Relaxed);
+                        let d_flow = drops_flow.saturating_sub(last_drops_flow);
+                        let d_session = drops_session.saturating_sub(last_drops_session);
+                        if d_flow + d_session > 0 {
+                            let client = (*engine.last_drop_client.lock())
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                window_s = 10,
+                                dropped_new_flows = d_flow,
+                                dropped_new_sessions = d_session,
+                                max_sessions_per_client = engine.max_sessions_per_client,
+                                max_flows_per_client = engine.max_flows_per_client,
+                                last_client = %client,
+                                "udp per-client budget exhausted, new flows dropped (LAN host scanning or flooding?)"
+                            );
+                        }
+                        last_drops_flow = drops_flow;
+                        last_drops_session = drops_session;
                         let fwd_sym = engine.pkts_fwd_sym.load(Ordering::Relaxed);
                         let fwd_fc = engine.pkts_fwd_fc.load(Ordering::Relaxed);
                         let reply_sym = engine.pkts_reply_sym.load(Ordering::Relaxed);
@@ -346,7 +466,10 @@ async fn dispatch_packet(
         return Ok(());
     }
 
-    let kind = decide_flow_kind(engine, shared, peer, orig_dst, payload);
+    let Some(kind) = decide_flow_kind(engine, shared, peer, orig_dst, payload) else {
+        tracing::debug!(%peer, %orig_dst, "udp flow budget exhausted for client; drop");
+        return Ok(());
+    };
     match kind {
         FlowKind::Symmetric => {
             handle_symmetric(engine, shared, peer, orig_dst, payload, tx_buf).await
@@ -363,10 +486,10 @@ fn decide_flow_kind(
     peer: SocketAddr,
     orig_dst: SocketAddr,
     payload: &[u8],
-) -> FlowKind {
+) -> Option<FlowKind> {
     if let Some(entry) = engine.flow_path.get(&(peer, orig_dst)) {
         entry.last_seen_ms.store(engine.now_ms(), Ordering::Relaxed);
-        return entry.kind;
+        return Some(entry.kind);
     }
     let is_fakeip = shared
         .fakeip
@@ -378,14 +501,31 @@ fn decide_flow_kind(
     } else {
         FlowKind::Fullcone
     };
-    engine.flow_path.insert(
-        (peer, orig_dst),
-        FlowEntry {
-            kind,
-            last_seen_ms: AtomicU64::new(engine.now_ms()),
-        },
-    );
-    kind
+
+    let limit = match kind {
+        FlowKind::Symmetric => engine.max_flows_per_client,
+        FlowKind::Fullcone => engine
+            .max_flows_per_client
+            .saturating_sub(engine.max_sessions_per_client),
+    };
+    match engine.flow_budget.try_acquire(peer.ip(), limit) {
+        Some(budget) => {
+            engine.flow_path.insert(
+                (peer, orig_dst),
+                FlowEntry {
+                    kind,
+                    last_seen_ms: AtomicU64::new(engine.now_ms()),
+                    _budget: budget,
+                },
+            );
+            Some(kind)
+        }
+        None if matches!(kind, FlowKind::Fullcone) => Some(kind),
+        None => {
+            engine.note_drop(&engine.drops_flow, peer.ip());
+            None
+        }
+    }
 }
 
 async fn handle_symmetric(
@@ -398,7 +538,7 @@ async fn handle_symmetric(
 ) -> io::Result<()> {
     let key = (peer, orig_dst);
 
-    let slot = engine.symmetric.get(&key).map(|e| e.value().clone());
+    let slot = engine.symmetric.get(&key).map(|e| e.value().slot.clone());
     match slot {
         Some(SymSlot::Ready(session)) => {
             session
@@ -413,7 +553,7 @@ async fn handle_symmetric(
         None => match engine.symmetric.entry(key) {
 
             Entry::Occupied(e) => {
-                let slot = e.get().clone();
+                let slot = e.get().slot.clone();
                 drop(e);
                 match slot {
                     SymSlot::Ready(session) => {
@@ -430,8 +570,19 @@ async fn handle_symmetric(
                 }
             }
             Entry::Vacant(v) => {
+                let Some(budget) = engine
+                    .session_budget
+                    .try_acquire(peer.ip(), engine.max_sessions_per_client)
+                else {
+                    engine.note_drop(&engine.drops_session, peer.ip());
+                    tracing::debug!(%peer, %orig_dst, "udp session budget exhausted for client; drop");
+                    return Ok(());
+                };
                 let pending = Arc::new(Pending::new(payload.to_vec(), engine.now_ms()));
-                v.insert(SymSlot::Pending(Arc::clone(&pending)));
+                v.insert(Budgeted {
+                    slot: SymSlot::Pending(Arc::clone(&pending)),
+                    _budget: budget,
+                });
                 spawn_open_symmetric(engine, shared, peer, orig_dst, payload, pending);
                 Ok(())
             }
@@ -507,8 +658,10 @@ fn spawn_open_symmetric(
 
                 let installed = match engine.symmetric.entry(key) {
                     Entry::Occupied(mut e) => {
-                        if matches!(e.get(), SymSlot::Pending(p) if Arc::ptr_eq(p, &pending)) {
-                            e.insert(SymSlot::Ready(Arc::clone(&s)));
+                        if matches!(&e.get().slot, SymSlot::Pending(p) if Arc::ptr_eq(p, &pending))
+                        {
+
+                            e.get_mut().slot = SymSlot::Ready(Arc::clone(&s));
                             true
                         } else {
                             false
@@ -558,7 +711,7 @@ fn spawn_open_symmetric(
                 pending.close();
                 engine.symmetric.remove_if(
                     &key,
-                    |_, v| matches!(v, SymSlot::Pending(p) if Arc::ptr_eq(p, &pending)),
+                    |_, v| matches!(&v.slot, SymSlot::Pending(p) if Arc::ptr_eq(p, &pending)),
                 );
 
             }
@@ -722,7 +875,7 @@ async fn handle_fullcone(
     payload: &[u8],
     tx_buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let slot = engine.fullcone.get(&peer).map(|e| e.value().clone());
+    let slot = engine.fullcone.get(&peer).map(|e| e.value().slot.clone());
     match slot {
         Some(FcSlot::Ready(session)) => {
             session
@@ -736,7 +889,7 @@ async fn handle_fullcone(
         }
         None => match engine.fullcone.entry(peer) {
             Entry::Occupied(e) => {
-                let slot = e.get().clone();
+                let slot = e.get().slot.clone();
                 drop(e);
                 match slot {
                     FcSlot::Ready(session) => {
@@ -752,8 +905,19 @@ async fn handle_fullcone(
                 }
             }
             Entry::Vacant(v) => {
+                let Some(budget) = engine
+                    .session_budget
+                    .try_acquire(peer.ip(), engine.max_sessions_per_client)
+                else {
+                    engine.note_drop(&engine.drops_session, peer.ip());
+                    tracing::debug!(%peer, %orig_dst, "udp session budget exhausted for client; drop");
+                    return Ok(());
+                };
                 let pending = Arc::new(Pending::new((orig_dst, payload.to_vec()), engine.now_ms()));
-                v.insert(FcSlot::Pending(Arc::clone(&pending)));
+                v.insert(Budgeted {
+                    slot: FcSlot::Pending(Arc::clone(&pending)),
+                    _budget: budget,
+                });
                 spawn_open_fullcone(engine, shared, peer, orig_dst, payload, pending);
                 Ok(())
             }
@@ -816,8 +980,8 @@ fn spawn_open_fullcone(
             Ok(s) => {
                 let installed = match engine.fullcone.entry(peer) {
                     Entry::Occupied(mut e) => {
-                        if matches!(e.get(), FcSlot::Pending(p) if Arc::ptr_eq(p, &pending)) {
-                            e.insert(FcSlot::Ready(Arc::clone(&s)));
+                        if matches!(&e.get().slot, FcSlot::Pending(p) if Arc::ptr_eq(p, &pending)) {
+                            e.get_mut().slot = FcSlot::Ready(Arc::clone(&s));
                             true
                         } else {
                             false
@@ -857,7 +1021,7 @@ fn spawn_open_fullcone(
                 pending.close();
                 engine.fullcone.remove_if(
                     &peer,
-                    |_, v| matches!(v, FcSlot::Pending(p) if Arc::ptr_eq(p, &pending)),
+                    |_, v| matches!(&v.slot, FcSlot::Pending(p) if Arc::ptr_eq(p, &pending)),
                 );
             }
         }
@@ -1340,7 +1504,7 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
         .symmetric
         .iter()
         .filter(|e| {
-            let last = match e.value() {
+            let last = match &e.value().slot {
                 SymSlot::Ready(s) => s.last_seen_ms.load(Ordering::Relaxed),
                 SymSlot::Pending(p) => p.created_ms,
             };
@@ -1350,7 +1514,14 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
         .collect();
     for k in &dead_sym {
 
-        if let Some((_, SymSlot::Ready(s))) = engine.symmetric.remove(k) {
+        if let Some((
+            _,
+            Budgeted {
+                slot: SymSlot::Ready(s),
+                ..
+            },
+        )) = engine.symmetric.remove(k)
+        {
             shared.conn_table.close(s.rec.id);
         }
         engine.flow_path.remove(k);
@@ -1360,7 +1531,7 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
         .fullcone
         .iter()
         .filter(|e| {
-            let last = match e.value() {
+            let last = match &e.value().slot {
                 FcSlot::Ready(s) => s.last_seen_ms.load(Ordering::Relaxed),
                 FcSlot::Pending(p) => p.created_ms,
             };
@@ -1369,7 +1540,14 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
         .map(|e| *e.key())
         .collect();
     for k in &dead_fc {
-        if let Some((_, FcSlot::Ready(s))) = engine.fullcone.remove(k) {
+        if let Some((
+            _,
+            Budgeted {
+                slot: FcSlot::Ready(s),
+                ..
+            },
+        )) = engine.fullcone.remove(k)
+        {
             shared.conn_table.close(s.rec.id);
         }
     }
@@ -1468,10 +1646,10 @@ mod tests {
 
             let dns = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
             let k = decide_flow_kind(&engine, &shared, peer, dst, dns);
-            assert!(matches!(k, FlowKind::Fullcone));
+            assert!(matches!(k, Some(FlowKind::Fullcone)));
 
             let k2 = decide_flow_kind(&engine, &shared, peer, dst, dns);
-            assert!(matches!(k2, FlowKind::Fullcone));
+            assert!(matches!(k2, Some(FlowKind::Fullcone)));
         });
     }
 
@@ -1490,13 +1668,13 @@ mod tests {
             let not_quic = b"\x00\x01\x02\x03 not a quic initial";
             assert!(matches!(
                 decide_flow_kind(&engine, &shared, peer, dst, not_quic),
-                FlowKind::Symmetric
+                Some(FlowKind::Symmetric)
             ));
 
             let real: SocketAddr = "1.1.1.1:443".parse().unwrap();
             assert!(matches!(
                 decide_flow_kind(&engine, &shared, peer, real, not_quic),
-                FlowKind::Fullcone
+                Some(FlowKind::Fullcone)
             ));
         });
     }
@@ -1522,14 +1700,13 @@ mod tests {
             direct: false,
             rec: dummy_rec(),
         });
-        engine.symmetric.insert((peer, dst), SymSlot::Ready(sym));
-        engine.flow_path.insert(
+        engine.symmetric.insert(
             (peer, dst),
-            FlowEntry {
-                kind: FlowKind::Symmetric,
-                last_seen_ms: AtomicU64::new(engine.now_ms()),
-            },
+            session_slot(&engine, peer, SymSlot::Ready(sym)),
         );
+        engine
+            .flow_path
+            .insert((peer, dst), flow_entry(&engine, peer, FlowKind::Symmetric));
 
         let relay_fc = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let reader_fc = tokio::spawn(async { std::future::pending::<()>().await });
@@ -1540,13 +1717,12 @@ mod tests {
             direct: false,
             rec: dummy_rec(),
         });
-        engine.fullcone.insert(peer, FcSlot::Ready(fc));
+        engine
+            .fullcone
+            .insert(peer, session_slot(&engine, peer, FcSlot::Ready(fc)));
         engine.flow_path.insert(
             (peer, "9.9.9.9:53".parse().unwrap()),
-            FlowEntry {
-                kind: FlowKind::Fullcone,
-                last_seen_ms: AtomicU64::new(engine.now_ms()),
-            },
+            flow_entry(&engine, peer, FlowKind::Fullcone),
         );
 
         assert_eq!(engine.symmetric.len(), 1);
@@ -1561,6 +1737,16 @@ mod tests {
         assert_eq!(engine.symmetric.len(), 0);
         assert_eq!(engine.fullcone.len(), 0);
         assert_eq!(engine.flow_path.len(), 0);
+        assert_eq!(
+            engine.session_budget.used(peer.ip()),
+            0,
+            "swept sessions return their budget"
+        );
+        assert_eq!(
+            engine.flow_budget.used(peer.ip()),
+            0,
+            "swept flows return their budget"
+        );
     }
 
     #[tokio::test]
@@ -1570,17 +1756,11 @@ mod tests {
 
         engine.flow_path.insert(
             (peer, "1.1.1.1:443".parse().unwrap()),
-            FlowEntry {
-                kind: FlowKind::Symmetric,
-                last_seen_ms: AtomicU64::new(engine.now_ms()),
-            },
+            flow_entry(&engine, peer, FlowKind::Symmetric),
         );
         engine.flow_path.insert(
             (peer, "8.8.8.8:53".parse().unwrap()),
-            FlowEntry {
-                kind: FlowKind::Fullcone,
-                last_seen_ms: AtomicU64::new(engine.now_ms()),
-            },
+            flow_entry(&engine, peer, FlowKind::Fullcone),
         );
         assert_eq!(engine.flow_path.len(), 2);
         assert_eq!(engine.symmetric.len(), 0);
@@ -1591,6 +1771,11 @@ mod tests {
         let (_, _, fp_removed) = sweep_idle(&engine, &shared);
         assert_eq!(fp_removed, 2, "orphan flow_path should be reclaimed");
         assert_eq!(engine.flow_path.len(), 0);
+        assert_eq!(
+            engine.flow_budget.used(peer.ip()),
+            0,
+            "reclaimed orphans return their budget"
+        );
     }
 
     #[tokio::test]
@@ -1598,18 +1783,19 @@ mod tests {
         let engine = make_test_engine();
         let peer: SocketAddr = "10.0.0.7:7777".parse().unwrap();
         let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        engine.symmetric.insert(
-            (peer, dst),
-            SymSlot::Pending(Arc::new(Pending::new(vec![1u8], engine.now_ms()))),
-        );
-        engine.fullcone.insert(
-            peer,
-            FcSlot::Pending(Arc::new(Pending::new((dst, vec![2u8]), engine.now_ms()))),
-        );
+        let sym = SymSlot::Pending(Arc::new(Pending::new(vec![1u8], engine.now_ms())));
+        engine
+            .symmetric
+            .insert((peer, dst), session_slot(&engine, peer, sym));
+        let fc = FcSlot::Pending(Arc::new(Pending::new((dst, vec![2u8]), engine.now_ms())));
+        engine
+            .fullcone
+            .insert(peer, session_slot(&engine, peer, fc));
         tokio::time::sleep(Duration::from_millis(30)).await;
         let shared = make_test_shared(None);
         sweep_idle(&engine, &shared);
         assert!(engine.symmetric.is_empty() && engine.fullcone.is_empty());
+        assert_eq!(engine.session_budget.used(peer.ip()), 0);
     }
 
     #[tokio::test]
@@ -1631,6 +1817,11 @@ mod tests {
         assert!(
             engine.symmetric.is_empty(),
             "failed open must clear pending slot"
+        );
+        assert_eq!(
+            engine.session_budget.used(peer.ip()),
+            0,
+            "failed open must return the session budget"
         );
     }
 
@@ -1676,7 +1867,7 @@ mod tests {
         );
         assert!(
             matches!(
-                engine.fullcone.get(&peer).map(|e| e.value().clone()),
+                engine.fullcone.get(&peer).map(|e| e.value().slot.clone()),
                 Some(FcSlot::Ready(_))
             ),
             "slot must be Ready after open"
@@ -1757,7 +1948,7 @@ mod tests {
                 engine
                     .symmetric
                     .get(&(peer, dst))
-                    .map(|e| e.value().clone()),
+                    .map(|e| e.value().slot.clone()),
                 Some(SymSlot::Ready(_))
             ),
             "slot must be Ready after open"
@@ -1916,6 +2107,255 @@ mod tests {
         assert_eq!(canon, Some(real.ip()));
     }
 
+    #[test]
+    fn client_budget_caps_per_ip_and_releases_on_drop() {
+        let b = ClientBudget::new();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let c: IpAddr = "10.0.0.2".parse().unwrap();
+        let t1 = b.try_acquire(a, 2).expect("first token");
+        let t2 = b.try_acquire(a, 2).expect("second token");
+        assert!(
+            b.try_acquire(a, 2).is_none(),
+            "third token must exceed the per-IP cap"
+        );
+        assert!(
+            b.try_acquire(a, 1).is_none(),
+            "a lower limit sees the same count"
+        );
+        let other = b
+            .try_acquire(c, 2)
+            .expect("another client has its own budget");
+        assert_eq!(b.used(a), 2);
+        drop(t1);
+        assert_eq!(b.used(a), 1, "dropping a token returns it");
+        let t3 = b.try_acquire(a, 2).expect("a returned token can be reused");
+        drop((t2, t3, other));
+        assert_eq!(b.used(a), 0);
+        assert!(
+            b.counts.is_empty(),
+            "zero counts must not linger in the table"
+        );
+        assert!(b.try_acquire(a, 0).is_none());
+        assert!(b.counts.is_empty(), "a zero limit must not create an entry");
+    }
+
+    #[test]
+    fn client_budget_never_exceeds_cap_under_contention() {
+        let b = ClientBudget::new();
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        std::thread::scope(|s| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let b = &b;
+                    s.spawn(move || {
+                        (0..64)
+                            .filter_map(|_| b.try_acquire(ip, 16))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let held: Vec<BudgetToken> = workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect();
+            assert_eq!(held.len(), 16, "exactly `cap` tokens across racing threads");
+            assert_eq!(b.used(ip), 16);
+        });
+        assert_eq!(b.used(ip), 0, "all tokens returned once dropped");
+    }
+
+    #[test]
+    fn decide_flow_kind_respects_flow_budget() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let engine = make_test_engine_caps(4, 2);
+            let shared = make_test_shared(Some("7.0.0.0/8"));
+            let peer: SocketAddr = "10.0.0.1:1111".parse().unwrap();
+            let plain = b"\x00\x01 plain udp";
+            for i in 1..=3u8 {
+                let dst = SocketAddr::from(([1, 1, 1, i], 3478));
+                assert!(matches!(
+                    decide_flow_kind(&engine, &shared, peer, dst, plain),
+                    Some(FlowKind::Fullcone)
+                ));
+            }
+            assert_eq!(
+                engine.flow_path.len(),
+                2,
+                "fullcone decisions past (flows - sessions) are not cached"
+            );
+            for i in 1..=2u8 {
+                let dst = SocketAddr::from(([7, 0, 0, i], 443));
+                assert!(
+                    matches!(
+                        decide_flow_kind(&engine, &shared, peer, dst, plain),
+                        Some(FlowKind::Symmetric)
+                    ),
+                    "fakeip flows keep the reserved room"
+                );
+            }
+            let over = SocketAddr::from(([7, 0, 0, 9], 443));
+            assert!(
+                decide_flow_kind(&engine, &shared, peer, over, plain).is_none(),
+                "a symmetric flow over budget must be dropped"
+            );
+            assert_eq!(engine.drops_flow.load(Ordering::Relaxed), 1);
+            assert_eq!(*engine.last_drop_client.lock(), Some(peer.ip()));
+            let cached = SocketAddr::from(([7, 0, 0, 1], 443));
+            assert!(
+                matches!(
+                    decide_flow_kind(&engine, &shared, peer, cached, plain),
+                    Some(FlowKind::Symmetric)
+                ),
+                "cached flows still resolve"
+            );
+            let other: SocketAddr = "10.0.0.2:1111".parse().unwrap();
+            assert!(
+                matches!(
+                    decide_flow_kind(&engine, &shared, other, over, plain),
+                    Some(FlowKind::Symmetric)
+                ),
+                "another client has its own budget"
+            );
+        });
+    }
+
+    fn free_mode_shared() -> Arc<SharedState> {
+        use crate::config::{Config, OutboundCfg, OutboundMode};
+        let cfg = Config {
+            outbound: OutboundCfg {
+                mode: OutboundMode::Free,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Arc::new(SharedState::new(&cfg))
+    }
+
+    #[tokio::test]
+    async fn session_budget_caps_new_sessions_per_client() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = upstream.local_addr().unwrap();
+        let engine = make_test_engine_caps(MAX_FLOWS_PER_CLIENT, 3);
+        let shared = free_mode_shared();
+        let host: IpAddr = "10.0.0.1".parse().unwrap();
+        let from = |ip: [u8; 4], port: u16| SocketAddr::from((ip, port));
+        let pkt = b"\x00\x01plain-udp";
+        let mut tx = Vec::new();
+        for port in 40000..40004u16 {
+            dispatch_packet(
+                &engine,
+                &shared,
+                from([10, 0, 0, 1], port),
+                dst,
+                pkt,
+                &mut tx,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            engine.fullcone.len(),
+            3,
+            "new sessions per client must be capped"
+        );
+        assert!(engine.fullcone.get(&from([10, 0, 0, 1], 40003)).is_none());
+        assert_eq!(engine.session_budget.used(host), 3);
+        assert_eq!(engine.drops_session.load(Ordering::Relaxed), 1);
+
+        dispatch_packet(
+            &engine,
+            &shared,
+            from([10, 0, 0, 1], 40000),
+            dst,
+            pkt,
+            &mut tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.drops_session.load(Ordering::Relaxed),
+            1,
+            "an existing session is never refused"
+        );
+
+        dispatch_packet(
+            &engine,
+            &shared,
+            from([10, 0, 0, 2], 40000),
+            dst,
+            pkt,
+            &mut tx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            engine.fullcone.get(&from([10, 0, 0, 2], 40000)).is_some(),
+            "another client is unaffected"
+        );
+
+        engine.fullcone.remove(&from([10, 0, 0, 1], 40001));
+        assert_eq!(
+            engine.session_budget.used(host),
+            2,
+            "removing the table entry returns its budget"
+        );
+        dispatch_packet(
+            &engine,
+            &shared,
+            from([10, 0, 0, 1], 40003),
+            dst,
+            pkt,
+            &mut tx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            engine.fullcone.get(&from([10, 0, 0, 1], 40003)).is_some(),
+            "freed budget admits a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn budgets_released_when_sweep_reclaims() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = upstream.local_addr().unwrap();
+        let engine = make_test_engine();
+        let shared = free_mode_shared();
+        let host: IpAddr = "10.0.0.3".parse().unwrap();
+        let mut tx = Vec::new();
+        for port in [5000u16, 5001] {
+            dispatch_packet(
+                &engine,
+                &shared,
+                SocketAddr::new(host, port),
+                dst,
+                b"\x00\x01plain",
+                &mut tx,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(engine.session_budget.used(host), 2);
+        assert_eq!(engine.flow_budget.used(host), 2);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        sweep_idle(&engine, &shared);
+        assert!(engine.fullcone.is_empty() && engine.flow_path.is_empty());
+        assert_eq!(
+            engine.session_budget.used(host),
+            0,
+            "swept sessions return their budget"
+        );
+        assert_eq!(
+            engine.flow_budget.used(host),
+            0,
+            "swept flows return their budget"
+        );
+    }
+
     #[tokio::test]
     async fn quic_initial_classified_symmetric_when_block_off() {
         let engine = make_test_engine();
@@ -1936,19 +2376,44 @@ mod tests {
     }
 
     fn make_test_engine_kind(cloudflared: bool) -> Arc<UdpEngine> {
-        Arc::new(UdpEngine {
+        Arc::new(UdpEngine::new(
+            Duration::from_millis(5),
+            64,
             cloudflared,
-            symmetric: Arc::new(DashMap::new()),
-            fullcone: Arc::new(DashMap::new()),
-            flow_path: Arc::new(DashMap::new()),
-            spoof_cache: Arc::new(SpoofCache::new(64)),
-            started: Instant::now(),
-            idle_timeout: Duration::from_millis(5),
-            pkts_fwd_sym: AtomicU64::new(0),
-            pkts_fwd_fc: AtomicU64::new(0),
-            pkts_reply_sym: AtomicU64::new(0),
-            pkts_reply_fc: AtomicU64::new(0),
-        })
+            MAX_FLOWS_PER_CLIENT,
+            MAX_SESSIONS_PER_CLIENT,
+        ))
+    }
+
+    fn make_test_engine_caps(flows: usize, sessions: usize) -> Arc<UdpEngine> {
+        Arc::new(UdpEngine::new(
+            Duration::from_millis(5),
+            64,
+            false,
+            flows,
+            sessions,
+        ))
+    }
+
+    fn session_slot<T>(engine: &UdpEngine, peer: SocketAddr, slot: T) -> Budgeted<T> {
+        Budgeted {
+            slot,
+            _budget: engine
+                .session_budget
+                .try_acquire(peer.ip(), usize::MAX)
+                .unwrap(),
+        }
+    }
+
+    fn flow_entry(engine: &UdpEngine, peer: SocketAddr, kind: FlowKind) -> FlowEntry {
+        FlowEntry {
+            kind,
+            last_seen_ms: AtomicU64::new(engine.now_ms()),
+            _budget: engine
+                .flow_budget
+                .try_acquire(peer.ip(), usize::MAX)
+                .unwrap(),
+        }
     }
 
     fn make_test_shared(fake_cidr: Option<&str>) -> Arc<SharedState> {

@@ -27,12 +27,24 @@ fn is_hop_by_hop(lname: &str) -> bool {
     )
 }
 
+const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub async fn proxy(
     client: &mut TcpStream,
     req: &ReqHead,
     body_prefix: &[u8],
     clash_sock: &Path,
-) -> io::Result<ProxyOutcome> {
+) -> io::Result<(ProxyOutcome, Vec<u8>)> {
+    proxy_inner(client, req, body_prefix, clash_sock, UPSTREAM_HEAD_TIMEOUT).await
+}
+
+async fn proxy_inner(
+    client: &mut TcpStream,
+    req: &ReqHead,
+    body_prefix: &[u8],
+    clash_sock: &Path,
+    head_timeout: std::time::Duration,
+) -> io::Result<(ProxyOutcome, Vec<u8>)> {
     let mut up = match UnixStream::connect(clash_sock).await {
         Ok(u) => u,
         Err(_e) => {
@@ -47,11 +59,15 @@ pub async fn proxy(
                 ka,
             )
             .await?;
-            return Ok(if ka {
-                ProxyOutcome::KeepAlive
-            } else {
-                ProxyOutcome::Close
-            });
+
+            return Ok((
+                if ka {
+                    ProxyOutcome::KeepAlive
+                } else {
+                    ProxyOutcome::Close
+                },
+                body_prefix.to_vec(),
+            ));
         }
     };
 
@@ -60,11 +76,39 @@ pub async fn proxy(
     let head = build_upstream_head(req, upgrade);
     up.write_all(&head).await?;
     let req_framing = req.framing()?;
-    http::relay_body(client, &mut up, req_framing, body_prefix).await?;
+    let leftover = http::relay_body(client, &mut up, req_framing, body_prefix).await?;
     up.flush().await?;
 
     let mut up_buf = Vec::new();
-    let rhl = http::read_head(&mut up, &mut up_buf).await?;
+    let rhl = match tokio::time::timeout(head_timeout, http::read_head(&mut up, &mut up_buf)).await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            tracing::warn!(
+                path = %req.path,
+                timeout_s = head_timeout.as_secs(),
+                "clash did not answer in time; giving up on this request"
+            );
+            let ka = req.keep_alive();
+            respond::send(
+                client,
+                504,
+                "Gateway Timeout",
+                &[("Content-Type", "text/plain")],
+                b"upstream timed out\n",
+                ka,
+            )
+            .await?;
+            return Ok((
+                if ka {
+                    ProxyOutcome::KeepAlive
+                } else {
+                    ProxyOutcome::Close
+                },
+                leftover,
+            ));
+        }
+    };
     let resp = http::parse_response(&up_buf[..rhl])?;
     let resp_prefix: Vec<u8> = up_buf[rhl..].to_vec();
 
@@ -76,7 +120,7 @@ pub async fn proxy(
         client.flush().await?;
 
         let _ = tokio::io::copy_bidirectional(client, &mut up).await;
-        return Ok(ProxyOutcome::Close);
+        return Ok((ProxyOutcome::Close, Vec::new()));
     }
 
     let head_request = req.method.eq_ignore_ascii_case("HEAD");
@@ -84,14 +128,18 @@ pub async fn proxy(
     let client_ka = req.keep_alive() && resp_framing != http::Framing::Eof;
     let out_head = build_downstream_head(&resp, client_ka);
     client.write_all(&out_head).await?;
-    http::relay_body(&mut up, client, resp_framing, &resp_prefix).await?;
+
+    let _ = http::relay_body(&mut up, client, resp_framing, &resp_prefix).await?;
     client.flush().await?;
 
-    Ok(if client_ka {
-        ProxyOutcome::KeepAlive
-    } else {
-        ProxyOutcome::Close
-    })
+    Ok((
+        if client_ka {
+            ProxyOutcome::KeepAlive
+        } else {
+            ProxyOutcome::Close
+        },
+        leftover,
+    ))
 }
 
 fn build_upstream_head(req: &ReqHead, upgrade: bool) -> Vec<u8> {
@@ -193,6 +241,55 @@ mod tests {
         assert!(s.contains("Upgrade: websocket\r\n"));
         assert!(s.contains("Sec-WebSocket-Key: abc\r\n"));
         assert!(!s.contains("Connection: close"));
+    }
+
+    #[tokio::test]
+    async fn upstream_that_never_answers_times_out_instead_of_hanging() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("silent.sock");
+        let ul = UnixListener::bind(&sock).unwrap();
+
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = ul.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                held.push(s);
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client_side = TcpStream::connect(addr).await.unwrap();
+        let mut server_side = accept.await.unwrap();
+
+        let req = parse_request(b"GET /group/AUTO/delay HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let started = std::time::Instant::now();
+        let (outcome, _leftover) = proxy_inner(
+            &mut server_side,
+            &req,
+            b"",
+            &sock,
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must give up quickly, took {elapsed:?}"
+        );
+        assert_eq!(outcome, ProxyOutcome::KeepAlive);
+        let mut got = vec![0u8; 256];
+        let n = client_side.read(&mut got).await.unwrap();
+        let head = String::from_utf8_lossy(&got[..n]).into_owned();
+        assert!(head.starts_with("HTTP/1.1 504 "), "should be 504: {head}");
+        let _ = client_side.shutdown().await;
     }
 
     #[test]

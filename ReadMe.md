@@ -143,28 +143,25 @@ max_rec=5000
 - 6 `openport`设置是否向局域网开启代理端口（socks5 http 1080代理），默认值为`no`，需要开启可以设置为`yes`。
     - 当`openport=yes`且**没有**配置`openport_auth`时，外部可以直接通过`1080`端口免认证访问。
     - 可配置`openport_auth="username:password"`添加认证，格式为`"用户名:密码"`。
-- 6a `admin_cidr` / `proxy_cidr`（可选）：网关访问控制。`admin_cidr`限定可访问`:80`Web控制面板的源网段，空则全放行；`proxy_cidr`限定可走TPROXY/入站代理的源网段，空则全放行。多个网段用逗号分隔。
-- 7 `udp_enable`: 是否允许UDP流量通过网关，默认值为no，设置为no则禁止UDP流量进入网关。注意：如果你的节点不支持UDP或者不稳定不建议开启，开启UDP将会导致QUIC失败导致网站有时候上不去的现象。   
-- 8 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。如果socks5有用户验证，可以指定`socks5_username`和`socks5_password`。
-- 9 `ovpnfile`，`ovpn_username`和`ovpn_password`: ovpn运行模式的专用设置。`ovpnfile`支持两种写法：①**文件名**（如`ovpnfile="custom.ovpn"`），系统将从`ppgw.ini`的同一目录（本地`:7889`路径）下载该文件；②**完整远程URL**（如`ovpnfile="http://example.com/example.ovpn"`），系统将直接从该URL下载。若镜像内已内嵌`custom.ovpn`（见下文「内嵌`custom.ovpn`」），则优先使用内嵌文件。如果你的ovpn需要用户名和密码认证，可以指定`ovpn_username`和`ovpn_password`。openvpn进程的拉起、结束与健康看护统一由常驻的sniffbox负责：`mode=ovpn`下sniffbox每30秒检查`tun114`接口与openvpn进程，发现缺失则自动冷重启openvpn（单周期最多重试5次，超阈值等下个周期再试），并在配置变化时自动加载新的ovpn配置。
-- 10 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并循环刷新检测配置文件变化，值发生变化则重载网关。
-- 11 `suburl`和`subtime`和`subcron`: suburl运行模式的专用配置，`suburl`指定订阅的地址（记得加英文半角双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔。注意如果开了`fast_node`功能，检测不通的时候会主动拉新订阅。`subcron`参数支持指定每天0-23时刷新订阅，比如`subcron=5`每天凌晨5点内刷新订阅。该参数启用的时候`subtime`参数会失效。    
-- 12 `fast_node`、`test_node_url`和`ext_node`：测试最快的节点并自动选择该节点的功能。`fast_node`默认值为no。如果`fast_node`值为空，并且yaml模式或者suburl的配置文件中不包含rules，则会被设置为yes。`test_node_url`是用于测速的网址，将会使用clash的api测试延迟，默认值是`http://cp.cloudflare.com/generate_204`。`ext_node`是排除测速的节点，多个关键字用竖线隔开，默认值是`ext_node="Traffic|Expire| GB|Days|Date"`。`fast_node`的行为如下：
-  - 当`fast_node=yes`或者`fast_node=check`，系统将会定时检测`test_node_url`是否可达，若可达，则不进行任何操作；若不可达，则立即停止clash并秒重载网关配置，如果是suburl模式，还会在重载前拉新订阅配置。**在 PPSUB 模式下（`suburl` 以 `ppsub@` 开头），`fast_node=check` 的代理连通性检测不会执行，因为 PPSUB 有独立的全局健康监测。**
-  - 仅当`fast_node=yes`，在网关重载后对所有节点（不包括`ext_node`）进行测速，并自动选择延迟最低的节点。***`fast_node=yes`会忽略加载`rules：`规则并开启`global`模式***。  
-  - 当`fast_node=yes`仅会在`test_node_url`不可达的时候主动切换节点，不会影响你在Web手动选择节点使用。因此强烈建议习惯单节点使用的开启该项功能。或者可以使用`fast_node=check`来实现当`test_node_url`不可达的时候主动拉新订阅而不主动选择节点（PPSUB 模式除外）。
-  - 注意，设置为`check`不会测速，设置为`yes`测速失败到阈值会杀死进程并终止应用网关并重载，而`check`不会杀死进程，仅重载所有配置并关闭所有现有的旧连接。  
-  - 如果你的所有的节点都延迟过高不稳定，建议设置为`no`避免增加意外的断流的情况，同时你需要手动切换节点。  
-  - `fall_direct`选项设置为`yes`在`fast_node`测试全部节点失败的时候，若互联网路由可达，则尝试切换到`DIRECT`直连。（仅在开启`fast_node=yes`的时候生效）        
-- 14 `dns_burn`选项和`ex_dns`选项：`dns_burn`功能可以把所有节点的域名解析成所有可能的IP结果，把server字段替换为解析的IP结果，以`节点名@IP最后一位`的名称作为新节点加入，临时硬编码到配置文件中。上面设置的`dns_ip`和`dns_port`，和`ex_dns`选项会被用于`dns_burn`功能，`ex_dns`选项用于指定额外的DNS用于解析节点，建议设置为境内DNS以获得不同的结果，如果为空默认值为`223.5.5.5:53`，如果配合PaoPaoDNS使用，则可以设置为PaoPaoDNSIP:53。你也可以设置多个`ex_dns`，格式为逗号分隔，比如`ex_dns=223.5.5.5:53,1.0.0.1:53`。适用于`suburl`模式和`yaml`模式，依赖于`fast_node=yes`。该功能的优点和应用场景如下：
+- 7 `admin_cidr` / `proxy_cidr`（可选）：网关访问控制。`admin_cidr`限定可访问`:80`Web控制面板的源网段，空则全放行；`proxy_cidr`限定可走TPROXY/入站代理的源网段，空则全放行。多个网段用逗号分隔。
+- 8 `udp_enable`: 是否允许UDP流量通过网关，默认值为no，设置为no则禁止UDP流量进入网关。注意：如果你的节点不支持UDP或者不稳定不建议开启，开启UDP将会导致QUIC失败导致网站有时候上不去的现象。   
+- 9 `socks5_ip`和`socks5_port`: socks5运行模式的专用设置，指定socks5的服务器IP和端口。如果socks5有用户验证，可以指定`socks5_username`和`socks5_password`。
+- 10 `ovpnfile`，`ovpn_username`和`ovpn_password`: ovpn运行模式的专用设置。`ovpnfile`支持两种写法：①**文件名**（如`ovpnfile="custom.ovpn"`），系统将从`ppgw.ini`的同一目录（本地`:7889`路径）下载该文件；②**完整远程URL**（如`ovpnfile="http://example.com/example.ovpn"`），系统将直接从该URL下载。若镜像内已内嵌`custom.ovpn`（见下文「内嵌`custom.ovpn`」），则优先使用内嵌文件。如果你的ovpn需要用户名和密码认证，可以指定`ovpn_username`和`ovpn_password`。openvpn进程的拉起、结束与健康看护统一由常驻的sniffbox负责：`mode=ovpn`下sniffbox每30秒检查`tun114`接口与openvpn进程，发现缺失则自动冷重启openvpn（单周期最多重试5次，超阈值等下个周期再试），并在配置变化时自动加载新的ovpn配置。
+- 11 `yamlfile`: yaml运行模式的专用设置，指定yaml的文件名，系统将会从`ppgw.ini`的同一目录下载该文件，并循环刷新检测配置文件变化，值发生变化则重载网关。
+- 12 `suburl`和`subtime`和`subcron`: suburl运行模式的专用配置，`suburl`指定订阅的地址（记得加英文半角双引号），而`subtime`则指定刷新订阅的时间间隔，单位可以是m（分钟），h（小时）或者d（天），默认值为1d。与yaml模式不同，suburl模式使用单独的刷新间隔，因为订阅一般都是动态生成，每次刷新都不一样，会导致刷新网关必定重载。需要注意的是`subtime`仅配置订阅的时间间隔。注意如果开了`fast_node`功能，检测不通的时候会主动拉新订阅。`subcron`参数支持指定每天0-23时刷新订阅，比如`subcron=5`每天凌晨5点内刷新订阅。该参数启用的时候`subtime`参数会失效。    
+- 13 `fast_node`、`test_node_url`、`ext_node`和`fall_direct`：适用于`yaml`模式和普通`suburl`订阅的自动测速选节点功能。**PPSUB模式（`suburl`以`ppsub@`开头）和`free`模式下`fast_node`、`ext_node`、`fall_direct`会被忽略（强制`fast_node=no`、`fall_direct=no`），PPSUB用户请改用功能更精细的节点组「测速模式」，见下文《PPSUB 组合订阅使用指南》。**注意`test_node_url`在任何模式下都会作为Web代理页「测速URL」的默认地址（页面上可临时自定义，留空即使用此地址）。取值说明：
+  - `fast_node=yes`：忽略`rules:`规则并以`global`模式运行，网关重载后对所有节点测速并自动选择延迟最低的节点，可用`ext_node`按关键字排除测速节点（多个关键字用竖线隔开，默认值`"Traffic|Expire| GB|Days|Date"`）。之后定时检测`test_node_url`（默认`http://cp.cloudflare.com/generate_204`），不可达时重新拉取订阅并测速切换节点；如果全部节点测速失败，`fall_direct=yes`且直连实测可达则切换`DIRECT`直连，否则重启clash并重载配置。该功能不影响你在Web手动选择节点，适合习惯单节点使用的场景。
+  - `fast_node=check`：只定时检测`test_node_url`，不可达时拉新订阅并重载配置、关闭旧连接，但不测速、不主动切换节点、不杀死进程（PPSUB模式下该检测不会执行，由PPSUB自身的全局健康监测负责）。
+  - `fast_node=no`：不自动测速切换，在Web手动选择节点。如果你的所有节点延迟都过高不稳定，建议用`no`避免意外断流。
+  - 留空（默认）：自动判定，配置不含`rules:`时按`yes`处理，否则按`no`处理。
+- 14 `dns_burn`选项和`ex_dns`选项：`dns_burn`功能可以把所有节点的域名解析成所有可能的IP结果，把server字段替换为解析的IP结果，以`节点名@IP最后一位`的名称作为新节点加入，临时硬编码到配置文件中。上面设置的`dns_ip`和`dns_port`，和`ex_dns`选项会被用于`dns_burn`功能，`ex_dns`选项用于指定额外的DNS用于解析节点，建议设置为境内DNS以获得不同的结果，如果为空默认值为`223.5.5.5:53,1.0.0.1:53`，如果配合PaoPaoDNS使用，则可以设置为PaoPaoDNSIP:53。你也可以设置多个`ex_dns`，格式为逗号分隔，比如`ex_dns=223.5.5.5:53,1.0.0.1:53`。适用于`suburl`模式和`yaml`模式，非PPSUB模式下依赖于`fast_node=yes`；PPSUB模式下由订阅处理流程直接支持，不依赖`fast_node`。该功能的优点和应用场景如下：
     - 1、节点使用了分区域解析，只有使用了境内DNS才能连接，参见[issue](https://github.com/kkkgo/PaoPaoGateWay/issues/20)，`dns_burn`功能可以额外对节点进行解析。
     - 2、节点DNS解析存在多个解析入口，`dns_burn`功能会把所有可能的入口都作为新节点加入到配置文件中，在测速的时候就可以选择到速度最好的入口，而不是随机选择。
     - 3、节点的所有可能的解析结果都会被临时硬编码到配置文件中，除非所有节点都测速失败或者订阅更新，该配置文件不会变化，可以减少节点的DNS查询，使用IP直连，并有效避免节点临时出现可能的DNS污染或者DNS故障的情况，比如节点域名忘记续费导致解析失败。
 - 15 `net_rec`选项：网络流量记录功能，可以记录网关连接了哪些域名、上传下载消耗了多少流量、客户端IP，并默认按照消耗流量的大小排序，该功能可以根据实际情况方便地调整分析自己的域名规则列表。设置为`yes`开启该功能后可以在web界面查看、统计分析和下载记录。其中`max_rec`选项指定最大记录数，默认为5000。注意事项：  
-    - 1、重启或者修改ppgw的密码、`max_rec`选项、调整任何和`net_rec`相关选项会导致sniffbox重启并清空历史记录。
-    - 2、如果流量太小连接持续时间过短，有可能在记录之前连接已经关闭，流量有可能会显示为0B。
-    - 3、理论上会略微增加资源占用，取决于你的并发连接数量以及`max_rec`，可适当增加运行资源。
-`net_cleanday=1-31`选项，指定每个月某一天清空网络流量数据记录，比如`net_cleanday=15`每月15日清空网络流量数据记录。如果指定值大于当月有效天数，比如2月份指定31，将会取该月最大值执行，该值为空的时候只有达到了max_rec限制才会清理。    
+    - 1、历史记录保存在sniffbox内存中，重启网关或者开关`net_rec`等触发sniffbox冷重启的操作会清空历史记录；而修改`max_rec`、`net_cleanday`等选项只会触发热重载，历史记录会保留。
+    - 2、理论上会略微增加内存占用，根据你的并发连接数量以及`max_rec`，可适当增加运行资源。
+`net_cleanday=1-31`选项，指定每个月某一天清空网络流量数据记录，比如`net_cleanday=15`每月15日清空网络流量数据记录（按UTC+8时区判定）。注意是按日期精确匹配：如果指定的日期在当月不存在（比如2月份指定31），该月将不会执行清理；留空或大于31则禁用定期清理，此时记录只会在超过`max_rec`上限（从最久未活动的记录开始裁剪）时被移除。    
 - 16 `box`: 高级转发核心项目调整，以逗号分隔，一般不需要调整。可调整项目示例`route.block_bittorrent=true,route.block_quic=true,route.block_unknown=false`。 block_bittorrent：禁止bt下载（默认true）；block_quic：禁止quic流量(默认true)，block_unknown：禁止非http/tls的未识别流量（默认false）。   
 - 17 `cloudflared_token`选项：在网关内直接跑Cloudflared，参考[使用cloudflared快速安全地进行内网穿透](https://blog.03k.org/post/cloudflared.html)。把你的隧道 token（`eyJhIjoi...`那一长串）填进来即可，留空或不写则完全不启用。
     - **单副本 / 双副本**：默认（`cf_proxy=yes`）只起**一个**经网关代理出网的 Replica（Connector）。填`cf_proxy=both`则用同一个 token 起两个 —— 一个**直连**出网、一个**经代理**出网，这正是 Cloudflare 官方的 Replica 用法：边缘会在两者间分流，任何一个断了（代理挂了、或者直连无法连上了）都会秒级切到另一个，隧道不中断，面板上能看到两个 Replica（Connector） ID。详见下面的`cf_proxy`。
@@ -227,8 +224,9 @@ max_rec=5000
 #### PPSUB 模式下的配置项说明
 
 **被禁用的选项**：
-- fast_node 相关选项（fast_node/test_node_url/ext_node/fall_direct）
+- fast_node 相关选项（fast_node/ext_node/fall_direct）
 - 相关功能请在节点组中定义；其中 `fast_node=check` 在 PPSUB 模式下不会执行代理连通性检测，由 PPSUB 自身的全局健康监测负责
+- `test_node_url` 不参与 PPSUB 的自动检测，但仍作为 Web 代理页「测速URL」的默认地址生效
 
 **参考使用的选项**：
 - `dns_burn=yes`：当节点是域名，会把节点再次额外解析成 IP 节点，以节点名@+IP最后一位增加到节点组

@@ -58,9 +58,10 @@ impl SmartFixed {
     }
 
     pub fn retain_groups(&self, keep: &[String]) {
+        let keep: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
         let mut m = self.lock();
         let before = m.len();
-        m.retain(|g, _| keep.iter().any(|k| k == g));
+        m.retain(|g, _| keep.contains(g.as_str()));
         let changed = m.len() != before;
         drop(m);
         if changed {

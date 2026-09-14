@@ -67,6 +67,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const MAX_NATIVE_BODY: usize = 32 * 1024;
 
+const MAX_DRAIN_BODY: u64 = 1024 * 1024;
+
 pub async fn serve(cfg: Arc<ServerConfig>, shutdown: watch::Receiver<bool>) -> io::Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     run(listener, cfg, shutdown).await
@@ -110,8 +112,10 @@ pub async fn run(
                     Err(e) => { tracing::warn!(%e, "web accept failed"); continue; }
                 };
                 let cfg = cfg.clone();
+
+                let sd = shutdown.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, peer, cfg).await {
+                    if let Err(e) = handle_conn(stream, peer, cfg, sd).await {
                         tracing::debug!(%peer, %e, "web conn closed with error");
                     }
                 });
@@ -126,6 +130,7 @@ async fn handle_conn(
     mut stream: TcpStream,
     peer: SocketAddr,
     cfg: Arc<ServerConfig>,
+    shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
 
     if !cfg.admin.load().allows(peer.ip()) {
@@ -221,9 +226,10 @@ async fn handle_conn(
                 let is_delete = req.method.eq_ignore_ascii_case("DELETE");
                 let self_serve = is_conn && !(cfg.clash_enabled && is_delete);
                 if let Some(src) = cfg.connections.as_ref().filter(|_| self_serve) {
+
                     match connections::handle(&mut stream, &req, path, src, ka).await? {
                         connections::Outcome::KeepAlive => {
-                            carry = Vec::new();
+                            carry = consume_body(&mut stream, req.framing()?, body_prefix).await?;
                             continue;
                         }
                         connections::Outcome::Close => return Ok(()),
@@ -241,11 +247,11 @@ async fn handle_conn(
                     .await?;
                 } else {
 
-                    match proxy_unix::proxy(&mut stream, &req, &body_prefix, &cfg.clash_sock)
-                        .await?
-                    {
+                    let (outcome, leftover) =
+                        proxy_unix::proxy(&mut stream, &req, &body_prefix, &cfg.clash_sock).await?;
+                    match outcome {
                         proxy_unix::ProxyOutcome::KeepAlive => {
-                            carry = Vec::new();
+                            carry = leftover;
                             continue;
                         }
                         proxy_unix::ProxyOutcome::Close => return Ok(()),
@@ -311,7 +317,9 @@ async fn handle_conn(
                     .await?;
                 } else {
 
-                    match proxy_unix::proxy(&mut stream, &req, &body, &cfg.clash_sock).await? {
+                    let (outcome, _) =
+                        proxy_unix::proxy(&mut stream, &req, &body, &cfg.clash_sock).await?;
+                    match outcome {
                         proxy_unix::ProxyOutcome::KeepAlive => {}
                         proxy_unix::ProxyOutcome::Close => return Ok(()),
                     }
@@ -376,7 +384,7 @@ async fn handle_conn(
                     Err(e) => return Err(e),
                 };
 
-                if native::handle(&mut stream, &req, &cfg, ka, &body).await? {
+                if native::handle(&mut stream, &req, &cfg, ka, &body, &shutdown).await? {
                     carry = leftover;
                     if !ka {
                         return Ok(());
@@ -439,6 +447,12 @@ async fn consume_body(
     match framing {
         Framing::None => Ok(prefix),
         Framing::Length(n) => {
+            if n > MAX_DRAIN_BODY {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "declared body too large to drain",
+                ));
+            }
             let n = n as usize;
             if prefix.len() >= n {
                 Ok(prefix[n..].to_vec())
@@ -459,9 +473,10 @@ async fn consume_body(
             }
         }
         Framing::Chunked => {
+
             let mut sink = tokio::io::sink();
-            http::relay_body(stream, &mut sink, Framing::Chunked, &prefix).await?;
-            Ok(Vec::new())
+            let mut bounded = AsyncReadExt::take(stream, MAX_DRAIN_BODY);
+            http::relay_body(&mut bounded, &mut sink, Framing::Chunked, &prefix).await
         }
         Framing::Eof => Ok(Vec::new()),
     }

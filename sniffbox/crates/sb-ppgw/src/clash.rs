@@ -131,7 +131,7 @@ impl ClashClient {
                 buf
             }
             Target::Tcp(hp) => {
-                let mut s = TcpStream::connect(hp)?;
+                let mut s = connect_tcp(hp, self.timeout)?;
                 s.set_read_timeout(Some(self.timeout))?;
                 s.set_write_timeout(Some(self.timeout))?;
                 s.write_all(&req)?;
@@ -423,6 +423,18 @@ fn hex_upper(n: u8) -> char {
     }
 }
 
+fn connect_tcp(hp: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let mut last =
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address to connect to");
+    for addr in std::net::ToSocketAddrs::to_socket_addrs(hp)? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 fn system_load_delay_ms() -> u128 {
     let start = Instant::now();
     match std::process::Command::new("ps").output() {
@@ -444,6 +456,30 @@ mod tests {
         let t = ClashClient::from_api_url("http://127.0.0.1:9090", "sek");
         assert!(t.requires_secret());
         assert!(matches!(t.target, Target::Tcp(ref hp) if hp == "127.0.0.1:9090"));
+    }
+
+    #[test]
+    fn tcp_target_connect_gives_up_at_the_timeout() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let addr = listener.local_addr().unwrap();
+
+        let mut c = ClashClient::from_api_url(&format!("http://{addr}"), "sek");
+        c.set_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let r = c.get_mode();
+        let took = started.elapsed();
+        assert!(
+            r.is_err(),
+            "a connection that is never accepted cannot succeed"
+        );
+        assert!(
+            took < Duration::from_secs(10),
+            "connect must give up at the configured timeout, took {took:?}"
+        );
+        drop(listener);
     }
 
     #[test]

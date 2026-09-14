@@ -28,6 +28,12 @@ const ERR_BACKOFF: Duration = Duration::from_secs(15);
 
 const WAIT_CLASH: Duration = Duration::from_secs(5);
 
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+
+const SELECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+const MAX_RESP_BYTES: u64 = 64 * 1024 * 1024;
+
 const JITTER_WEIGHT: f64 = 1.5;
 const LOSS_PENALTY_MS: f64 = 2000.0;
 
@@ -80,39 +86,54 @@ pub struct SmartStats(Mutex<HashMap<String, Value>>);
 
 impl SmartStats {
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn group_scores(&self, group: &str) -> Option<Value> {
-        self.0.lock().unwrap().get(group).cloned()
+        self.lock().get(group).cloned()
     }
 
     fn publish(&self, group: &str, hist: &HashMap<String, NodeHist>) {
-        let mut obj = serde_json::Map::new();
-        for (name, h) in hist {
-            let score = h.score();
-            let samples: Vec<Value> = h
-                .samples
-                .iter()
-                .map(|s| s.map(Value::from).unwrap_or(Value::Null))
-                .collect();
-            obj.insert(
-                name.clone(),
-                serde_json::json!({
-                    "score": if score.is_finite() { Value::from(score.round() as u64) } else { Value::Null },
-                    "samples": samples,
-                }),
-            );
+        let obj: serde_json::Map<String, Value> = hist
+            .iter()
+            .map(|(name, h)| (name.clone(), node_json(h)))
+            .collect();
+        self.lock().insert(group.to_string(), Value::Object(obj));
+    }
+
+    fn publish_node(&self, group: &str, name: &str, h: &NodeHist) {
+        let v = node_json(h);
+        let mut g = self.lock();
+        match g.get_mut(group) {
+            Some(Value::Object(obj)) => {
+                obj.insert(name.to_string(), v);
+            }
+            _ => {
+                let mut obj = serde_json::Map::new();
+                obj.insert(name.to_string(), v);
+                g.insert(group.to_string(), Value::Object(obj));
+            }
         }
-        self.0
-            .lock()
-            .unwrap()
-            .insert(group.to_string(), Value::Object(obj));
     }
 
     fn retain_groups(&self, keep: &[SmartGroup]) {
-        self.0
-            .lock()
-            .unwrap()
-            .retain(|k, _| keep.iter().any(|g| g.name == *k));
+        let keep: std::collections::HashSet<&str> = keep.iter().map(|g| g.name.as_str()).collect();
+        self.lock().retain(|k, _| keep.contains(k.as_str()));
     }
+}
+
+fn node_json(h: &NodeHist) -> Value {
+    let score = h.score();
+    let samples: Vec<Value> = h
+        .samples
+        .iter()
+        .map(|s| s.map(Value::from).unwrap_or(Value::Null))
+        .collect();
+    serde_json::json!({
+        "score": if score.is_finite() { Value::from(score.round() as u64) } else { Value::Null },
+        "samples": samples,
+    })
 }
 
 macro_rules! st_log {
@@ -238,6 +259,10 @@ pub(crate) fn needs_providers(proxies: &RawProxies, group: &str) -> bool {
 
 type SharedStates = Arc<Mutex<HashMap<String, GroupState>>>;
 
+fn lock_states(states: &SharedStates) -> std::sync::MutexGuard<'_, HashMap<String, GroupState>> {
+    states.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct Runner {
     names: Vec<String>,
     cancel: watch::Sender<bool>,
@@ -270,10 +295,11 @@ async fn supervise(
         } else {
             Vec::new()
         };
-        states
-            .lock()
-            .unwrap()
-            .retain(|k, _| groups.iter().any(|g| g.name == *k));
+        {
+            let live: std::collections::HashSet<&str> =
+                groups.iter().map(|g| g.name.as_str()).collect();
+            lock_states(&states).retain(|k, _| live.contains(k.as_str()));
+        }
         stats.retain_groups(&groups);
         let names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
 
@@ -385,9 +411,9 @@ async fn runner(
             if *cancel.borrow() {
                 return;
             }
-            let mut st = states.lock().unwrap().remove(&g.name).unwrap_or_default();
+            let mut st = lock_states(&states).remove(&g.name).unwrap_or_default();
             let r = run_group_pass(&sock, &g.name, &url, &mut st, &stats, &fixed, &cancel).await;
-            states.lock().unwrap().insert(g.name.clone(), st);
+            lock_states(&states).insert(g.name.clone(), st);
             if let Err(e) = r {
                 tracing::warn!(
                     "[PaoPaoGW Smart Test] {}: clash api error ({e}), retry in {}s",
@@ -436,7 +462,9 @@ async fn run_group_pass(
         st_log!("{group}: no testable member, skip this cycle");
         return Ok(());
     }
-    st.hist.retain(|k, _| members.iter().any(|m| m.name == *k));
+
+    let live: std::collections::HashSet<&str> = members.iter().map(|m| m.name.as_str()).collect();
+    st.hist.retain(|k, _| live.contains(k.as_str()));
 
     let mut locked = fixed.get(group);
     if let Some(l) = &locked
@@ -451,6 +479,8 @@ async fn run_group_pass(
     if seeded > 0 {
         st_log!("{group}: seeded history for {seeded} node(s) from clash delay data");
     }
+
+    stats.publish(group, &st.hist);
 
     let no_data: Vec<&Member> = members
         .iter()
@@ -485,11 +515,12 @@ async fn run_group_pass(
                 .map(|m| m.name.clone())
         });
         if let Some(pick) = pick {
-            select_node(sock, group, &pick).await?;
-            st_info!(
-                "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{pick}`"
-            );
-            current = pick;
+            if select_node(sock, group, &pick).await? {
+                st_info!(
+                    "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{pick}`"
+                );
+                current = pick;
+            }
         }
     }
 
@@ -506,7 +537,9 @@ async fn run_group_pass(
         let d = test_member(sock, cur, url, REGULAR_TIMEOUT_MS).await;
         st.push(&cur.name, d);
         log_result(group, &cur.name, d, st.score(&cur.name));
-        stats.publish(group, &st.hist);
+        if let Some(h) = st.hist.get(&cur.name) {
+            stats.publish_node(group, &cur.name, h);
+        }
     }
 
     if let Some(l) = locked.clone()
@@ -519,8 +552,8 @@ async fn run_group_pass(
 
     if let Some(l) = locked.clone()
         && current != l
+        && select_node(sock, group, &l).await?
     {
-        select_node(sock, group, &l).await?;
         st_info!("{group}: hold on user-locked `{l}` (was `{current}`)");
         current = l;
     }
@@ -533,14 +566,16 @@ async fn run_group_pass(
         let d = test_member(sock, m, url, REGULAR_TIMEOUT_MS).await;
         st.push(&m.name, d);
         log_result(group, &m.name, d, st.score(&m.name));
-        stats.publish(group, &st.hist);
+        if let Some(h) = st.hist.get(&m.name) {
+            stats.publish_node(group, &m.name, h);
+        }
 
         if locked.is_some() {
             continue;
         }
         let (cand, cur) = (st.score(&m.name), st.score(&current));
-        if cand < cur {
-            select_node(sock, group, &m.name).await?;
+
+        if cand < cur && select_node(sock, group, &m.name).await? {
             st_info!(
                 "{group}: switch `{current}` -> `{}` (score {} < {})",
                 m.name,
@@ -660,10 +695,10 @@ async fn ladder_pass(
         let best = pick_ladder_best(&results, locked);
         st_log!("{group}: ladder timeout={t}ms -> {ok}/{} ok", refs.len());
         if let Some((m, d)) = best {
-            if m.name != now {
-                select_node(sock, group, &m.name).await?;
+
+            if m.name == now || select_node(sock, group, &m.name).await? {
+                st_info!("{group}: initial pick `{}` ({d}ms, lowest delay)", m.name);
             }
-            st_info!("{group}: initial pick `{}` ({d}ms, lowest delay)", m.name);
             return Ok(());
         }
     }
@@ -710,11 +745,15 @@ async fn test_member(sock: &Path, m: &Member, url: &str, timeout_ms: u64) -> Opt
         None => format!("/proxies/{enc}/delay{query}"),
     };
 
-    let fut = uds_request(sock, "GET", &path, None);
-    let (status, body) = tokio::time::timeout(Duration::from_millis(timeout_ms + 3000), fut)
-        .await
-        .ok()?
-        .ok()?;
+    let (status, body) = uds_request(
+        sock,
+        "GET",
+        &path,
+        None,
+        Duration::from_millis(timeout_ms + 3000),
+    )
+    .await
+    .ok()?;
     if status != 200 {
         return None;
     }
@@ -725,10 +764,10 @@ async fn test_member(sock: &Path, m: &Member, url: &str, timeout_ms: u64) -> Opt
         .map(|d| d as u32)
 }
 
-async fn select_node(sock: &Path, group: &str, name: &str) -> std::io::Result<()> {
+async fn select_node(sock: &Path, group: &str, name: &str) -> std::io::Result<bool> {
     let path = format!("/proxies/{}", crate::web_proxies::pct_encode_segment(group));
     let body = serde_json::json!({ "name": name }).to_string();
-    let (status, _) = uds_request(sock, "PUT", &path, Some(&body)).await?;
+    let (status, _) = uds_request(sock, "PUT", &path, Some(&body), SELECT_TIMEOUT).await?;
     if !(200..300).contains(&status) {
         tracing::warn!(
             group,
@@ -736,15 +775,16 @@ async fn select_node(sock: &Path, group: &str, name: &str) -> std::io::Result<()
             status,
             "smart speedtest: select rejected by clash"
         );
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn fetch_typed<T: serde::de::DeserializeOwned>(
     sock: &Path,
     path: &str,
 ) -> std::io::Result<T> {
-    let (status, body) = uds_request(sock, "GET", path, None).await?;
+    let (status, body) = uds_request(sock, "GET", path, None, SNAPSHOT_TIMEOUT).await?;
     if status != 200 {
         return Err(std::io::Error::other(format!("clash {path} -> {status}")));
     }
@@ -752,6 +792,23 @@ async fn fetch_typed<T: serde::de::DeserializeOwned>(
 }
 
 async fn uds_request(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> std::io::Result<(u16, Vec<u8>)> {
+    tokio::time::timeout(timeout, uds_request_inner(sock, method, path, body))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("clash {path} did not answer within {timeout:?}"),
+            )
+        })?
+}
+
+async fn uds_request_inner(
     sock: &Path,
     method: &str,
     path: &str,
@@ -774,7 +831,9 @@ async fn uds_request(
     let chunked = matches!(resp.framing(false), Ok(sb_web::http::Framing::Chunked));
     let mut data = buf.split_off(hl);
     let mut rest = Vec::new();
-    up.read_to_end(&mut rest).await?;
+    tokio::io::AsyncReadExt::take(&mut up, MAX_RESP_BYTES)
+        .read_to_end(&mut rest)
+        .await?;
     data.extend_from_slice(&rest);
     if chunked {
         data = dechunk(&data);
@@ -1073,6 +1132,154 @@ mod tests {
             h.push(*s);
         }
         h
+    }
+
+    #[test]
+    fn incremental_publish_matches_full_rebuild() {
+        let mut st = GroupState::default();
+        for (name, s) in [
+            ("A", Some(120)),
+            ("B", None),
+            ("C", Some(80)),
+            ("D", Some(300)),
+        ] {
+            st.push(name, s);
+        }
+        let incremental = SmartStats::default();
+        incremental.publish("G", &st.hist);
+
+        for (name, s) in [
+            ("C", Some(75)),
+            ("A", None),
+            ("D", Some(250)),
+            ("D", Some(260)),
+            ("E", Some(90)),
+            ("B", Some(500)),
+        ] {
+            st.push(name, s);
+            incremental.publish_node("G", name, st.hist.get(name).unwrap());
+        }
+
+        let full = SmartStats::default();
+        full.publish("G", &st.hist);
+        assert_eq!(
+            incremental.group_scores("G"),
+            full.group_scores("G"),
+            "incremental updates must converge to the full rebuild"
+        );
+        let v = incremental.group_scores("G").unwrap();
+        assert_eq!(v["D"]["samples"], json!([300, 250, 260]));
+        assert_eq!(v["E"]["samples"], json!([90]));
+    }
+
+    #[test]
+    fn publish_node_creates_missing_group() {
+        let stats = SmartStats::default();
+        stats.publish_node("G", "N1", &hist_of(&[Some(100)]));
+        let v = stats
+            .group_scores("G")
+            .expect("group must be created on first node");
+        assert_eq!(v["N1"]["samples"], json!([100]));
+        assert_eq!(v["N1"]["score"], 100);
+
+        stats.publish_node("H", "N2", &hist_of(&[None]));
+        assert_eq!(stats.group_scores("H").unwrap()["N2"]["score"], Value::Null);
+        assert!(stats.group_scores("G").unwrap().get("N2").is_none());
+    }
+
+    fn mock_clash_uds(dir: &tempfile::TempDir, reply: Option<&'static str>) -> PathBuf {
+        let sock = dir.path().join("clash.sock");
+        let ul = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut s, _)) = ul.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                match reply {
+                    Some(r) => {
+                        let _ = s.write_all(r.as_bytes()).await;
+                        let _ = s.flush().await;
+                    }
+
+                    None => held.push(s),
+                }
+            }
+        });
+        sock
+    }
+
+    #[tokio::test]
+    async fn uds_request_gives_up_when_clash_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = mock_clash_uds(&dir, None);
+        let started = std::time::Instant::now();
+        let e = uds_request(&sock, "GET", "/proxies", None, Duration::from_millis(200))
+            .await
+            .expect_err("must not hang");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "should bail at the deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn select_node_reports_whether_clash_accepted_it() {
+        let ok_dir = tempfile::tempdir().unwrap();
+        let ok = mock_clash_uds(
+            &ok_dir,
+            Some("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"),
+        );
+        assert!(
+            select_node(&ok, "G", "N1").await.unwrap(),
+            "2xx means the switch really happened"
+        );
+
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad = mock_clash_uds(
+            &bad_dir,
+            Some("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"),
+        );
+        assert!(
+            !select_node(&bad, "G", "ghost").await.unwrap(),
+            "a rejected switch must not be reported as success"
+        );
+    }
+
+    #[test]
+    fn poisoned_stats_lock_still_serves_reads_and_writes() {
+        let stats = Arc::new(SmartStats::default());
+        let mut hist = HashMap::new();
+        hist.insert("N1".to_string(), hist_of(&[Some(100)]));
+        stats.publish("G", &hist);
+
+        let poisoner = Arc::clone(&stats);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+
+        assert!(
+            stats.group_scores("G").is_some(),
+            "reads must survive a poisoned lock"
+        );
+        stats.publish("G2", &hist);
+        assert!(
+            stats.group_scores("G2").is_some(),
+            "writes must survive a poisoned lock"
+        );
+        stats.publish_node("G2", "N9", &hist_of(&[Some(5)]));
+        assert!(
+            stats.group_scores("G2").unwrap().get("N9").is_some(),
+            "incremental writes must survive a poisoned lock"
+        );
+        stats.retain_groups(&[SmartGroup {
+            name: "G2".into(),
+            url: String::new(),
+        }]);
+        assert!(stats.group_scores("G").is_none(), "retain must still prune");
     }
 
     #[test]

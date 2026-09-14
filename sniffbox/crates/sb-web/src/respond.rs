@@ -30,6 +30,23 @@ pub async fn send<W: AsyncWrite + Unpin>(
     w.flush().await
 }
 
+pub async fn not_modified<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    etag: &str,
+    keep_alive: bool,
+) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: no-cache\r\n{}\r\n",
+        if keep_alive {
+            "Connection: keep-alive\r\n"
+        } else {
+            "Connection: close\r\n"
+        }
+    );
+    w.write_all(head.as_bytes()).await?;
+    w.flush().await
+}
+
 pub async fn redirect<W: AsyncWrite + Unpin>(
     w: &mut W,
     location: &str,
