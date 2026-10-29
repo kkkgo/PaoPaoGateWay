@@ -1,7 +1,7 @@
 # Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/sniffbox",
     "crates/sb-tproxy",
@@ -20,44 +20,41 @@ exclude = [
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
 license      = "GPL-3.0-only"
 authors      = ["blog.03k.org"]
 repository   = "https://github.com/kkkgo/PaoPaoGateWay"
 
 [workspace.dependencies]
 
-tokio             = { version = "1", features = ["net", "io-util", "sync", "time", "signal", "macros", "rt-multi-thread", "fs"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
-futures-util      = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio        = { version = "1", features = ["net", "io-util", "sync", "time", "signal", "macros", "rt-multi-thread", "fs"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-nix      = { version = "0.29", features = ["net", "socket", "uio"] }
-socket2  = { version = "0.5", features = ["all"] }
+nix      = { version = "0.31", features = ["net"] }
+socket2  = { version = "0.6", features = ["all"] }
 libc     = "0.2"
 
 bytes           = "1"
 httparse        = "1"
-sha2            = "0.10"
+sha2            = "0.11"
 hex             = "0.4"
 crossbeam-utils = "0.8"
 dashmap         = "6"
-parking_lot     = "0.12"
+parking_lot     = "0.13"
 tempfile        = "3"
-time            = { version = "0.3", features = ["formatting", "macros", "serde"] }
+time            = { version = "0.3", features = ["formatting", "macros"] }
 thiserror       = "2"
-humantime-serde = "1"
 arc-swap        = "1"
-ipnet           = { version = "2", features = ["serde"] }
+ipnet           = "2"
 
-yaml-rust2      = "0.11"
+yaml-rust2      = "0.13"
 
-wreq            = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "socks", "gzip", "brotli", "deflate", "zstd", "stream"] }
+wreq            = { version = "=6.0.0-rc.31", default-features = false, features = ["tokio-rt", "socks", "gzip", "brotli", "deflate", "zstd", "stream"] }
 
 wreq-util       = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation"] }
 
@@ -66,9 +63,9 @@ regex-lite      = "0.1"
 btls            = "0.5"
 tokio-btls      = "0.5"
 
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
-criterion       = { version = "0.5", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+criterion       = { version = "0.8", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
 
 sb-tproxy   = { path = "crates/sb-tproxy" }
 sb-sniff    = { path = "crates/sb-sniff" }
@@ -83,17 +80,25 @@ lto           = "fat"
 codegen-units = 1
 strip         = true
 panic         = "abort"
-opt-level     = 3
 
 [profile.release-small]
-lto           = "fat"
 inherits  = "release"
 opt-level = "z"
-strip = true
-debug = false
-codegen-units = 1
-panic = "abort"
 
-[profile.dev]
-opt-level = 0
-debug     = true
+[profile.release-small.package]
+sb-sniff         = { opt-level = 3 }
+sb-dns           = { opt-level = 3 }
+sb-tproxy        = { opt-level = 3 }
+sb-stats         = { opt-level = 3 }
+sb-outbound      = { opt-level = 3 }
+aes              = { opt-level = 3 }
+aes-gcm          = { opt-level = 3 }
+ghash            = { opt-level = 3 }
+polyval          = { opt-level = 3 }
+sha2             = { opt-level = 3 }
+hkdf             = { opt-level = 3 }
+hmac             = { opt-level = 3 }
+cipher           = { opt-level = 3 }
+universal-hash   = { opt-level = 3 }
+chacha20poly1305 = { opt-level = 3 }
+chacha20         = { opt-level = 3 }

@@ -175,11 +175,14 @@ fn fill_gaps(
     let prev = yaml_rust2::YamlLoader::load_from_str(&prev_text)
         .ok()
         .and_then(|d| d.into_iter().next());
-    let resolution = to_resolution(&st);
+    let resolution = to_resolution(&st, &sub_results, ipv6);
     let yaml = super::emit_config(cfg, &sub_results, &resolution, st.dns_burn, prev.as_ref())
         .map_err(|e| e.to_string())?;
     write_atomic(&st.output, &yaml).map_err(|e| format!("write {}: {e}", st.output))?;
     st.output_hash = state::file_hash(&st.output);
+    if !fresh_subs.is_empty() {
+        refresh_subinfo(&super::subinfo::file(), &st, &fresh_subs);
+    }
 
     combine_and_reload(&st.output, io)?;
     note("retry: gap-fill applied, clash reloaded");
@@ -204,7 +207,7 @@ fn fill_subdns(
         }
 
         let full = fresh.iter().any(|n| n == &r.name);
-        let todo: Vec<(String, Vec<String>)> = super::proxies::sub_domains(r)
+        let todo: Vec<(String, Vec<String>)> = super::proxies::lookup_domains(r)
             .into_iter()
             .filter_map(|d| {
                 let want = specs_to_retry(&st.subs[idx], &d, &specs, full);
@@ -270,15 +273,7 @@ fn fill_burn(st: &mut RetryState, sub_results: &[SubResult], ipv6: bool) -> usiz
     if servers.is_empty() {
         return 0;
     }
-    let mut todo: Vec<String> = Vec::new();
-    for r in sub_results.iter().filter(|r| r.success) {
-        for d in super::proxies::sub_domains(r) {
-            let empty = st.burn.get(&d).map(|v| v.is_empty()).unwrap_or(true);
-            if empty && !todo.contains(&d) {
-                todo.push(d);
-            }
-        }
-    }
+    let todo = burn_todo(st, sub_results);
     if todo.is_empty() {
         return 0;
     }
@@ -297,6 +292,19 @@ fn fill_burn(st: &mut RetryState, sub_results: &[SubResult], ipv6: bool) -> usiz
     added
 }
 
+fn burn_todo(st: &RetryState, sub_results: &[SubResult]) -> Vec<String> {
+    let mut todo: Vec<String> = Vec::new();
+    for r in sub_results.iter().filter(|r| r.success) {
+        for d in super::proxies::lookup_domains(r) {
+            let empty = st.burn.get(&d).map(|v| v.is_empty()).unwrap_or(true);
+            if empty && !todo.contains(&d) {
+                todo.push(d);
+            }
+        }
+    }
+    todo
+}
+
 fn taken_over(st: &RetryState) -> bool {
     state::file_hash(&st.output) != st.output_hash
 }
@@ -313,7 +321,11 @@ fn merge_ips(known: &mut Vec<String>, fresh: &[IpAddr]) -> usize {
     added
 }
 
-fn to_resolution(st: &RetryState) -> super::proxies::Resolution {
+fn to_resolution(
+    st: &RetryState,
+    sub_results: &[SubResult],
+    ipv6: bool,
+) -> super::proxies::Resolution {
     let parse =
         |v: &Vec<String>| -> Vec<IpAddr> { v.iter().filter_map(|s| s.parse().ok()).collect() };
     let burn = st
@@ -340,6 +352,7 @@ fn to_resolution(st: &RetryState) -> super::proxies::Resolution {
         burn,
         subdns,
         failed: HashMap::new(),
+        hosts: super::proxies::static_hosts(sub_results, ipv6),
     }
 }
 
@@ -348,11 +361,12 @@ fn load_cached(s: &SubState) -> Option<SubResult> {
         return None;
     }
     let raw = std::fs::read_to_string(&s.cache).ok()?;
-    let proxies = super::sub::extract_proxies(&raw, &s.name);
+    let (proxies, hosts) = super::sub::parse_payload(&raw, &s.name);
     Some(SubResult {
         name: s.name.clone(),
         success: true,
         proxies,
+        hosts,
         userinfo: s.userinfo.clone(),
         raw_yaml: raw,
         error: String::new(),
@@ -367,10 +381,31 @@ fn adopt_fresh(s: &mut SubState, r: &SubResult) {
         s.cache = path;
     }
     s.specs = super::proxies::sub_dns_servers(&r.raw_yaml);
-    s.domains = super::proxies::sub_domains(r)
+    s.domains = super::proxies::lookup_domains(r)
         .into_iter()
         .map(|d| (d, DomainState::default()))
         .collect::<BTreeMap<_, _>>();
+}
+
+fn refresh_subinfo(path: &str, st: &RetryState, fresh: &[String]) {
+    let mut entries = super::subinfo::load(path);
+    let at = super::subinfo::now();
+    for s in st.subs.iter().filter(|s| fresh.contains(&s.name)) {
+        let e = super::subinfo::Entry {
+            name: s.name.clone(),
+            info: s.userinfo.clone(),
+            at,
+        };
+        match entries.iter_mut().find(|x| x.name == s.name) {
+            Some(x) => *x = e,
+            None => entries.push(e),
+        }
+    }
+    if let Err(e) = super::subinfo::save(path, &entries) {
+        note_warn(&format!(
+            "retry: cannot update subscription usage file: {e}"
+        ));
+    }
 }
 
 fn combine_and_reload(output: &str, io: &mut crate::Io) -> Result<(), String> {
@@ -591,7 +626,7 @@ mod tests {
             ..Default::default()
         });
 
-        let res = to_resolution(&st);
+        let res = to_resolution(&st, &[], false);
         assert_eq!(res.burn.len(), 1, "empty burn entries are dropped");
         assert_eq!(res.subdns["S"].len(), 1, "empty domains are dropped");
         assert_eq!(
@@ -695,6 +730,66 @@ mod tests {
     }
 
     #[test]
+    fn subinfo_follows_a_gap_filled_sub() {
+        use super::super::{UserInfo, subinfo};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("subinfo.json");
+        let p = p.to_str().unwrap();
+        let kept = subinfo::Entry {
+            name: "A".into(),
+            info: Some(UserInfo {
+                total: 10,
+                ..Default::default()
+            }),
+            at: 123,
+        };
+        let missed = subinfo::Entry {
+            name: "B".into(),
+            info: None,
+            at: 0,
+        };
+        subinfo::save(p, &[kept.clone(), missed]).unwrap();
+
+        let fresh_info = UserInfo {
+            total: 50,
+            download: 5,
+            expire: 1_700_000_000,
+            ..Default::default()
+        };
+        let st = RetryState {
+            subs: vec![
+                SubState {
+                    name: "A".into(),
+                    ok: true,
+                    userinfo: Some(UserInfo {
+                        total: 999,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                SubState {
+                    name: "B".into(),
+                    ok: true,
+                    userinfo: Some(fresh_info.clone()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        refresh_subinfo(p, &st, &["B".to_string()]);
+
+        let back = subinfo::load(p);
+        assert_eq!(back.len(), 2);
+        assert_eq!(
+            back[0], kept,
+            "subs that were not re-downloaded stay as they were"
+        );
+        assert_eq!(back[1].name, "B", "order is kept");
+        assert_eq!(back[1].info, Some(fresh_info));
+        assert!(back[1].at > 0, "a freshly fetched sub gets a timestamp");
+    }
+
+    #[test]
     fn lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("retry.lock");
@@ -759,5 +854,94 @@ mod tests {
         assert_eq!(specs_to_retry(&sub, "unknown.com", &all, false), all);
 
         assert_eq!(specs_to_retry(&sub, "clean.com", &all, true), all);
+    }
+
+    fn cached_sub(name: &str, yaml: &str) -> SubResult {
+        let (proxies, hosts) = super::super::sub::parse_payload(yaml, name);
+        SubResult {
+            name: name.into(),
+            success: true,
+            proxies,
+            hosts,
+            userinfo: None,
+            raw_yaml: yaml.into(),
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn burn_retry_includes_alias_targets() {
+        let r = cached_sub(
+            "S",
+            "hosts:\n  hk.example.com: entry.example.net\nproxies:\n  - {name: HK, server: hk.example.com}\n",
+        );
+        let subs = std::slice::from_ref(&r);
+        let mut st = RetryState {
+            dns_burn: true,
+            ..Default::default()
+        };
+        st.burn
+            .insert("hk.example.com".into(), vec!["11.0.0.1".into()]);
+        assert_eq!(
+            burn_todo(&st, subs),
+            vec!["entry.example.net"],
+            "never recorded → re-ask"
+        );
+        st.burn.insert("entry.example.net".into(), vec![]);
+        assert_eq!(
+            burn_todo(&st, subs),
+            vec!["entry.example.net"],
+            "came back empty → re-ask"
+        );
+        st.burn
+            .insert("entry.example.net".into(), vec!["11.0.0.3".into()]);
+        assert!(burn_todo(&st, subs).is_empty());
+    }
+
+    #[test]
+    fn gap_fill_rebuild_keeps_hosts_nodes() {
+        let r = cached_sub(
+            "S",
+            "hosts:\n  hk.example.com: entry.example.net\n  jp.example.com: 12.0.0.7\nproxies:\n  - {name: HK, server: hk.example.com, type: ss}\n  - {name: JP, server: jp.example.com, type: ss}\n",
+        );
+        let mut st = RetryState {
+            dns_burn: true,
+            ..Default::default()
+        };
+        st.burn
+            .insert("hk.example.com".into(), vec!["11.0.0.1".into()]);
+        st.burn
+            .insert("entry.example.net".into(), vec!["11.0.0.3".into()]);
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            "entry.example.net".to_string(),
+            DomainState {
+                ips: vec!["11.0.1.3".into()],
+                failed_specs: vec![],
+            },
+        );
+        st.subs.push(SubState {
+            name: "S".into(),
+            ok: true,
+            domains,
+            ..Default::default()
+        });
+        let subs = [r];
+        let res = to_resolution(&st, &subs, false);
+        let names: Vec<String> = super::super::proxies::build_proxies(&subs, &res, true)
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "S_HK@subdns3",
+                "S_JP@hosts7",
+                "S_HK",
+                "S_HK@1",
+                "S_HK@3",
+                "S_JP"
+            ]
+        );
     }
 }

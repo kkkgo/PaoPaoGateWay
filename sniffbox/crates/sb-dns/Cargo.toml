@@ -4,7 +4,6 @@
 name          = "sb-dns"
 version       = { workspace = true }
 edition       = { workspace = true }
-rust-version  = { workspace = true }
 license       = { workspace = true }
 
 [dependencies]
@@ -16,4 +15,3 @@ ipnet       = { workspace = true }
 [dev-dependencies]
 
 sha2      = { workspace = true }
-criterion = { workspace = true }

@@ -4,10 +4,10 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if let Some(arg0) = args.first() {
-        if sb_ppgw::invoked_as_ppgw(arg0) {
-            return sb_ppgw::cli_main(args);
-        }
+    if let Some(arg0) = args.first()
+        && sb_ppgw::invoked_as_ppgw(arg0)
+    {
+        return sb_ppgw::cli_main(args);
     }
     if args.get(1).map(|s| s == "ppgw").unwrap_or(false) {
 

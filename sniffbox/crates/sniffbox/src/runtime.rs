@@ -62,6 +62,7 @@ impl AtomicRoute {
 }
 
 pub struct SharedState {
+    pub(crate) udp_budget: crate::udp_budget::UdpBudget,
 
     pub route: AtomicRoute,
 
@@ -98,6 +99,8 @@ pub struct SharedState {
     sniff_timeout_ms: AtomicU64,
 
     max_rec: AtomicUsize,
+
+    stats_enabled: bool,
 
     net_cleanday: AtomicU8,
 
@@ -163,6 +166,10 @@ impl SharedState {
         let fakeip = build_fakeip(cfg);
         Self {
             route: AtomicRoute::new(&cfg.route),
+            udp_budget: crate::udp_budget::UdpBudget::new(
+                cfg.inbound.udp_max_sessions,
+                cfg.inbound.udp_reserved_sessions,
+            ),
             outbound,
             outbound_mode: cfg.outbound.mode,
             listen_addr: cfg.inbound.listen,
@@ -180,6 +187,7 @@ impl SharedState {
             splice_threshold: AtomicU64::new(cfg.inbound.splice_threshold),
             sniff_timeout_ms: AtomicU64::new(cfg.inbound.sniff_timeout.as_millis() as u64),
             max_rec: AtomicUsize::new(stats_max_rec(cfg)),
+            stats_enabled: stats_enabled(cfg),
             net_cleanday: AtomicU8::new(stats_net_cleanday(cfg)),
             web_admin: admin_handle(AdminAcl::new(cfg.web.admin_cidr.nets().to_vec())),
             web_token: token_handle(derive_secret(&cfg.web.password)),
@@ -216,6 +224,10 @@ impl SharedState {
 
     pub fn max_rec(&self) -> usize {
         self.max_rec.load(Ordering::Relaxed)
+    }
+
+    pub fn stats_enabled(&self) -> bool {
+        self.stats_enabled
     }
 
     pub fn net_cleanday(&self) -> u8 {
@@ -265,6 +277,16 @@ impl SharedState {
     }
 
     pub fn reload(&self, new_cfg: &Config) {
+        if self.udp_budget.sessions.limits()
+            != [
+                new_cfg.inbound.udp_max_sessions,
+                new_cfg.inbound.udp_reserved_sessions,
+            ]
+        {
+            tracing::warn!(
+                "UDP session limits changed on reload — restart required to take effect"
+            );
+        }
         self.route.store(&new_cfg.route);
 
         self.splice_copy
@@ -346,8 +368,8 @@ pub struct WebConnections {
 }
 
 impl sb_web::ConnectionsSource for WebConnections {
-    fn connections_json(&self) -> String {
-        connections_snapshot(&self.shared)
+    fn connections_json(&self) -> Arc<String> {
+        Arc::new(connections_snapshot(&self.shared))
     }
     fn close_all(&self) {
 
@@ -366,15 +388,15 @@ pub struct WebClashConnections {
 }
 
 impl sb_web::ConnectionsSource for WebClashConnections {
-    fn connections_json(&self) -> String {
+    fn connections_json(&self) -> Arc<String> {
 
         self.shared
             .clash_conns_last_access
             .store(sb_stats::now_epoch_ms(), Ordering::Relaxed);
         match self.shared.clash_conns_cache.load_full() {
-            Some(blob) => (*blob).clone(),
+            Some(blob) => blob,
 
-            None => r#"{"downloadTotal":0,"uploadTotal":0,"connections":[]}"#.to_string(),
+            None => Arc::new(r#"{"downloadTotal":0,"uploadTotal":0,"connections":[]}"#.to_string()),
         }
     }
 }
@@ -831,16 +853,16 @@ impl WebInfo {
                 self_pct = sysinfo::process_cpu_pct(cur.saturating_sub(prev), total_delta);
             }
 
-            if let (Some((pp, prev)), Some((cp, cur))) = (s.proc_clash, now_clash) {
-                if pp == cp {
-                    clash_pct = sysinfo::process_cpu_pct(cur.saturating_sub(prev), total_delta);
-                }
+            if let (Some((pp, prev)), Some((cp, cur))) = (s.proc_clash, now_clash)
+                && pp == cp
+            {
+                clash_pct = sysinfo::process_cpu_pct(cur.saturating_sub(prev), total_delta);
             }
 
-            if let (Some((pp, prev)), Some((cp, cur))) = (s.proc_ovpn, now_ovpn) {
-                if pp == cp {
-                    ovpn_pct = sysinfo::process_cpu_pct(cur.saturating_sub(prev), total_delta);
-                }
+            if let (Some((pp, prev)), Some((cp, cur))) = (s.proc_ovpn, now_ovpn)
+                && pp == cp
+            {
+                ovpn_pct = sysinfo::process_cpu_pct(cur.saturating_sub(prev), total_delta);
             }
 
             for (cp, cur) in &now_cf {
@@ -1107,6 +1129,10 @@ fn rfc3339_ms(epoch_ms: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z")
+}
+
+fn stats_enabled(cfg: &Config) -> bool {
+    cfg.stats.as_ref().is_some_and(|s| s.enabled)
 }
 
 fn stats_max_rec(cfg: &Config) -> usize {
@@ -1534,6 +1560,43 @@ mod tests {
                 "the endpoint must read the live {key} counter: {before} -> {after}"
             );
         }
+    }
+
+    #[test]
+    fn clash_connections_share_cache_and_keep_inflight_snapshot() {
+        use sb_web::ConnectionsSource;
+
+        let shared = Arc::new(SharedState::new(&cfg(true)));
+        let source = WebClashConnections {
+            shared: Arc::clone(&shared),
+        };
+        let empty = source.connections_json();
+        assert_eq!(
+            empty.as_str(),
+            r#"{"downloadTotal":0,"uploadTotal":0,"connections":[]}"#
+        );
+        assert!(shared.clash_conns_last_access.load(Ordering::Relaxed) > 0);
+
+        let old = Arc::new(format!(
+            r#"{{"downloadTotal":12,"uploadTotal":34,"connections":[{{"id":"{}"}}]}}"#,
+            "x".repeat(1024 * 1024)
+        ));
+        shared.clash_conns_cache.store(Some(Arc::clone(&old)));
+        shared.clash_conns_last_access.store(0, Ordering::Relaxed);
+        let inflight = source.connections_json();
+        let concurrent = source.connections_json();
+        assert!(Arc::ptr_eq(&old, &inflight));
+        assert!(Arc::ptr_eq(&inflight, &concurrent));
+        assert!(shared.clash_conns_last_access.load(Ordering::Relaxed) > 0);
+
+        let new = Arc::new(r#"{"downloadTotal":56,"uploadTotal":78,"connections":[]}"#.into());
+        shared.clash_conns_cache.store(Some(Arc::clone(&new)));
+        assert!(Arc::ptr_eq(&source.connections_json(), &new));
+        assert_eq!(inflight.as_str(), old.as_str());
+        assert!(!Arc::ptr_eq(&inflight, &new));
+        shared.clash_conns_cache.store(None);
+        assert_eq!(source.connections_json().as_str(), empty.as_str());
+        assert_eq!(inflight.as_str(), old.as_str());
     }
 
     #[test]

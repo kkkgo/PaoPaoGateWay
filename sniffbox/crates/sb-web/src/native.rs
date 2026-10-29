@@ -449,10 +449,10 @@ async fn info_get(
         return respond::not_found(stream, ka).await;
     };
 
-    if scope != crate::info::InfoScope::Dynamic {
-        if let Some(p) = cfg.proxies.as_ref() {
-            p.warm();
-        }
+    if scope != crate::info::InfoScope::Dynamic
+        && let Some(p) = cfg.proxies.as_ref()
+    {
+        p.warm();
     }
 
     let src = src.clone();

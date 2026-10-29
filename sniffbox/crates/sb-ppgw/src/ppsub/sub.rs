@@ -1,5 +1,6 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+use super::hosts::SubHosts;
 use super::{SubProvider, SubResult, UserInfo, pp_log, pp_warn};
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -38,14 +39,14 @@ pub fn download_subscription(sub: &SubProvider) -> SubResult {
                     .userinfo
                     .as_deref()
                     .and_then(parse_subscription_userinfo);
-                let proxies = extract_proxies(&data, &sub.name);
+                let (proxies, hosts) = parse_payload(&data, &sub.name);
                 pp_log(&format!(
                     "[{}] OK: {} downloaded, {} proxy node(s) parsed",
                     sub.name,
                     human_bytes(data.len()),
                     proxies.len()
                 ));
-                if let Some(ui) = &userinfo {
+                if let Some(ui) = userinfo.as_ref().filter(|u| u.total > 0) {
                     let gb = 1_073_741_824f64;
                     let used = (ui.upload + ui.download) as f64 / gb;
                     let total = ui.total as f64 / gb;
@@ -58,6 +59,7 @@ pub fn download_subscription(sub: &SubProvider) -> SubResult {
                     name: sub.name.clone(),
                     success: true,
                     proxies,
+                    hosts,
                     userinfo,
                     raw_yaml: data,
                     error: String::new(),
@@ -77,20 +79,27 @@ pub fn download_subscription(sub: &SubProvider) -> SubResult {
         name: sub.name.clone(),
         success: false,
         proxies: Vec::new(),
+        hosts: SubHosts::default(),
         userinfo: None,
         raw_yaml: String::new(),
         error: last_err,
     }
 }
 
-pub(crate) fn extract_proxies(data: &str, sub_name: &str) -> Vec<Yaml> {
-    let mut out = Vec::new();
+pub(crate) fn parse_payload(data: &str, sub_name: &str) -> (Vec<Yaml>, SubHosts) {
     let Ok(docs) = YamlLoader::load_from_str(data) else {
-        return out;
+        return (Vec::new(), SubHosts::default());
     };
     let Some(doc) = docs.first() else {
-        return out;
+        return (Vec::new(), SubHosts::default());
     };
+    let proxies = prefixed_proxies(doc, sub_name);
+    let hosts = super::hosts::parse(doc, &super::proxies::server_domains(&proxies));
+    (proxies, hosts)
+}
+
+fn prefixed_proxies(doc: &Yaml, sub_name: &str) -> Vec<Yaml> {
+    let mut out = Vec::new();
     let Some(arr) = doc["proxies"].as_vec() else {
         return out;
     };
@@ -131,7 +140,7 @@ pub fn parse_subscription_userinfo(header: &str) -> Option<UserInfo> {
             _ => {}
         }
     }
-    if u.total > 0 && u.expire > 0 {
+    if u.total > 0 || u.expire > 0 {
         Some(u)
     } else {
         None
@@ -167,19 +176,47 @@ mod tests {
         assert_eq!(u.upload, 100);
         assert_eq!(u.total, 1073741824);
         assert_eq!(u.expire, 1700000000);
-
         assert!(parse_subscription_userinfo("upload=1").is_none());
-        assert!(parse_subscription_userinfo("total=5").is_none());
+        assert!(parse_subscription_userinfo("total=0; expire=0").is_none());
+        assert_eq!(
+            parse_subscription_userinfo("total=5").map(|u| u.total),
+            Some(5)
+        );
+        assert_eq!(
+            parse_subscription_userinfo("upload=1; expire=1700000000").map(|u| u.expire),
+            Some(1700000000)
+        );
     }
 
     #[test]
     fn extract_prefixes_names() {
         let data =
             "proxies:\n  - {name: HK, server: a.com, type: ss}\n  - {name: US, server: b.com}\n";
-        let ps = extract_proxies(data, "MySub");
+        let (ps, hosts) = parse_payload(data, "MySub");
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[0]["name"].as_str(), Some("MySub_HK"));
         assert_eq!(ps[1]["name"].as_str(), Some("MySub_US"));
         assert_eq!(ps[0]["type"].as_str(), Some("ss"), "remaining fields kept");
+        assert_eq!(hosts, SubHosts::default(), "no hosts section, no mapping");
+    }
+
+    #[test]
+    fn payload_maps_only_this_subs_node_domains() {
+        let data = "hosts:\n  hk.example.com: entry.example.net\n  1.2.3.4: 5.6.7.8\n  other.example.com: 9.9.9.9\nproxies:\n  - {name: HK, server: hk.example.com, type: ss}\n  - {name: IP, server: 1.2.3.4, type: ss}\n";
+        let (ps, hosts) = parse_payload(data, "S");
+        assert_eq!(ps.len(), 2);
+        let keys: Vec<&str> = hosts.map.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["hk.example.com"], "{hosts:?}");
+        assert_eq!(
+            hosts.map["hk.example.com"],
+            super::super::hosts::Mapping::Alias("entry.example.net".into())
+        );
+    }
+
+    #[test]
+    fn unparsable_payload_yields_nothing() {
+        let (ps, hosts) = parse_payload("proxies: [unclosed", "S");
+        assert!(ps.is_empty());
+        assert_eq!(hosts, SubHosts::default());
     }
 }

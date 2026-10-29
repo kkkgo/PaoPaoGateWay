@@ -181,13 +181,13 @@ fn download_rules(url: &str) -> Result<Vec<String>, String> {
                 let data = std::fs::read_to_string(&tmp).map_err(|e| e.to_string())?;
                 let _ = std::fs::remove_file(&tmp);
                 let docs = YamlLoader::load_from_str(&data).map_err(|e| e.to_string())?;
-                if let Some(doc) = docs.first() {
-                    if let Some(rules) = doc["rules"].as_vec() {
-                        return Ok(rules
-                            .iter()
-                            .filter_map(|r| r.as_str().map(String::from))
-                            .collect());
-                    }
+                if let Some(doc) = docs.first()
+                    && let Some(rules) = doc["rules"].as_vec()
+                {
+                    return Ok(rules
+                        .iter()
+                        .filter_map(|r| r.as_str().map(String::from))
+                        .collect());
                 }
                 return Err("rules not found in downloaded data".to_string());
             }

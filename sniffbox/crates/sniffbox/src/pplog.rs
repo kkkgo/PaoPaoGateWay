@@ -1,7 +1,7 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use sb_stats::ConnRecord;
 use sb_stats::types::{InboundKind, RecordKind, SniffedProto, Transport};
 use sha2::{Digest, Sha256};
@@ -232,7 +232,7 @@ impl Crypto {
         let ct = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &nonce.into(),
                 Payload {
                     msg: &pt,
                     aad: &header,
@@ -355,7 +355,7 @@ mod tests {
         let nonce = &pkt[6..18];
         let pt = cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                nonce.try_into().unwrap(),
                 Payload {
                     msg: &pkt[18..],
                     aad: header,
@@ -377,6 +377,16 @@ mod tests {
     }
 
     #[test]
+    fn seal_matches_independent_chacha20poly1305() {
+        let mut c = Crypto::new(UUID);
+        c.session_id = [0xde, 0xad, 0xbe, 0xef];
+        assert_eq!(
+            hex::encode(c.seal(7, 3, b"kat payload")),
+            "504c70666336deadbeef00000007000000006689e9ce94e23e16405306976f433de58ca2a024a510c55d9aa23d5aaa687d05b90b"
+        );
+    }
+
+    #[test]
     fn wrong_uuid_fails_decrypt() {
         let c = Crypto::new(UUID);
         let pkt = c.seal(0, LEVEL_OPEN, b"x");
@@ -389,7 +399,7 @@ mod tests {
         assert!(
             cipher
                 .decrypt(
-                    Nonce::from_slice(&pkt[6..18]),
+                    pkt[6..18].try_into().unwrap(),
                     Payload {
                         msg: &pkt[18..],
                         aad: &pkt[0..18]

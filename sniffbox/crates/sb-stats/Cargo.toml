@@ -4,7 +4,6 @@
 name          = "sb-stats"
 version       = { workspace = true }
 edition       = { workspace = true }
-rust-version  = { workspace = true }
 license       = { workspace = true }
 
 [dependencies]
@@ -12,17 +11,12 @@ tokio           = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 tracing         = { workspace = true }
-thiserror       = { workspace = true }
 crossbeam-utils = { workspace = true }
 dashmap         = { workspace = true }
 parking_lot     = { workspace = true }
-tempfile        = { workspace = true }
 time            = { workspace = true }
 libc            = { workspace = true }
 arc-swap        = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-
-[features]
-default = []

@@ -53,10 +53,11 @@ pub fn dns_burn(
     let mut domains: Vec<String> = Vec::new();
     let mut domain_seen: HashSet<String> = HashSet::new();
     for p in &proxies {
-        if let Some(server) = p["server"].as_str() {
-            if server.parse::<IpAddr>().is_err() && domain_seen.insert(server.to_string()) {
-                domains.push(server.to_string());
-            }
+        if let Some(server) = p["server"].as_str()
+            && server.parse::<IpAddr>().is_err()
+            && domain_seen.insert(server.to_string())
+        {
+            domains.push(server.to_string());
         }
     }
 
@@ -141,7 +142,7 @@ fn generate_subdns_node_name(base: &str, ip: &str, used: &HashSet<String>) -> St
     generate_node_name_with_prefix(base, ip, used, "subdns")
 }
 
-fn generate_node_name_with_prefix(
+pub(crate) fn generate_node_name_with_prefix(
     base: &str,
     ip: &str,
     used: &HashSet<String>,

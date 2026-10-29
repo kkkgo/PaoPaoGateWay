@@ -36,11 +36,23 @@ enum FlowKind {
     Fullcone,
 }
 
-const REPLY_SLOT_CAP: usize = 4096;
+const REPLY_SLOT_CAP: usize = 65536;
 
 const PENDING_QUEUE_CAP: usize = 8;
+const PENDING_BYTES_CAP: usize = 65536;
 
 const MAX_SESSIONS_PER_CLIENT: usize = 1024;
+
+const QUERY_PROTO_IDLE: Duration = Duration::from_secs(10);
+
+const SWEEP_TICK: Duration = Duration::from_secs(5);
+
+fn idle_for_dst(port: u16, default_idle: Duration) -> Duration {
+    match port {
+        53 | 123 | 3478 | 3479 => QUERY_PROTO_IDLE.min(default_idle),
+        _ => default_idle,
+    }
+}
 
 const MAX_FLOWS_PER_CLIENT: usize = 16384;
 
@@ -51,16 +63,38 @@ struct Pending<T> {
     created_ms: u64,
 }
 
-impl<T> Pending<T> {
+trait PendingPacket {
+    fn payload_len(&self) -> usize;
+}
+
+impl PendingPacket for Vec<u8> {
+    fn payload_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl PendingPacket for (SocketAddr, Vec<u8>) {
+    fn payload_len(&self) -> usize {
+        self.1.len()
+    }
+}
+
+impl<T: PendingPacket> Pending<T> {
     fn new(first: T, now_ms: u64) -> Self {
         Self {
-            queue: Mutex::new(Some(vec![first])),
+            queue: Mutex::new(Some(if first.payload_len() <= PENDING_BYTES_CAP {
+                vec![first]
+            } else {
+                Vec::new()
+            })),
             created_ms: now_ms,
         }
     }
     fn push(&self, item: T) {
         if let Some(q) = self.queue.lock().as_mut()
             && q.len() < PENDING_QUEUE_CAP
+            && item.payload_len()
+                <= PENDING_BYTES_CAP.saturating_sub(q.iter().map(PendingPacket::payload_len).sum())
         {
             q.push(item);
         }
@@ -106,6 +140,7 @@ impl ClientBudget {
         }
         *n += 1;
         Some(BudgetToken {
+            global: None,
             budget: Arc::clone(self),
             ip,
         })
@@ -118,6 +153,7 @@ impl ClientBudget {
 }
 
 struct BudgetToken {
+    global: Option<Arc<crate::udp_budget::Permit>>,
     budget: Arc<ClientBudget>,
     ip: IpAddr,
 }
@@ -140,6 +176,7 @@ struct Budgeted<T> {
 }
 
 pub struct SymmetricSession {
+    _permit: Option<Arc<crate::udp_budget::Permit>>,
     relay_udp: Arc<UdpSocket>,
     reader: JoinHandle<()>,
     last_seen_ms: AtomicU64,
@@ -165,9 +202,12 @@ impl Drop for SymmetricSession {
 }
 
 pub struct FullconeSession {
+    _permit: Option<Arc<crate::udp_budget::Permit>>,
     relay_udp: Arc<UdpSocket>,
     reader: JoinHandle<()>,
     last_seen_ms: AtomicU64,
+
+    idle_ms: u64,
 
     direct: bool,
 
@@ -210,6 +250,7 @@ pub struct UdpEngine {
 }
 
 struct FlowEntry {
+    _global: Option<Arc<crate::udp_budget::Permit>>,
     kind: FlowKind,
     last_seen_ms: AtomicU64,
     _budget: BudgetToken,
@@ -322,8 +363,10 @@ pub fn start_udp_engine(
         let shared = Arc::clone(&shared);
         let mut sd = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+
+            let mut ticker = tokio::time::interval(SWEEP_TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks: u32 = 0;
             let mut last_fwd_sym: u64 = 0;
             let mut last_fwd_fc: u64 = 0;
             let mut last_reply_sym: u64 = 0;
@@ -339,6 +382,10 @@ pub fn start_udp_engine(
                         if sym_rm + fc_rm + fp_rm > 0 {
                             tracing::debug!(symmetric_removed=sym_rm, fullcone_removed=fc_rm, flow_path_removed=fp_rm,
                                 alive=engine.len(), spoof_cached=engine.spoof_cache.len(), "udp idle sweep");
+                        }
+                        ticks += 1;
+                        if !ticks.is_multiple_of(2) {
+                            continue;
                         }
 
                         let drops_flow = engine.drops_flow.load(Ordering::Relaxed);
@@ -508,11 +555,36 @@ fn decide_flow_kind(
             .max_flows_per_client
             .saturating_sub(engine.max_sessions_per_client),
     };
-    match engine.flow_budget.try_acquire(peer.ip(), limit) {
-        Some(budget) => {
+    let headroom = if matches!(kind, FlowKind::Fullcone) {
+        shared.udp_budget.sessions.limits()[usize::from(engine.cloudflared)]
+    } else {
+        0
+    };
+    let permits = engine
+        .flow_budget
+        .try_acquire(peer.ip(), limit)
+        .and_then(|local| {
+            shared
+                .udp_budget
+                .flows
+                .acquire_with_headroom(
+                    peer.ip(),
+                    engine.cloudflared,
+                    headroom,
+                    if matches!(kind, FlowKind::Fullcone) {
+                        engine.max_sessions_per_client
+                    } else {
+                        0
+                    },
+                )
+                .map(|global| (local, global))
+        });
+    match permits {
+        Some((budget, global)) => {
             engine.flow_path.insert(
                 (peer, orig_dst),
                 FlowEntry {
+                    _global: Some(global),
                     kind,
                     last_seen_ms: AtomicU64::new(engine.now_ms()),
                     _budget: budget,
@@ -570,7 +642,7 @@ async fn handle_symmetric(
                 }
             }
             Entry::Vacant(v) => {
-                let Some(budget) = engine
+                let Some(mut budget) = engine
                     .session_budget
                     .try_acquire(peer.ip(), engine.max_sessions_per_client)
                 else {
@@ -578,12 +650,21 @@ async fn handle_symmetric(
                     tracing::debug!(%peer, %orig_dst, "udp session budget exhausted for client; drop");
                     return Ok(());
                 };
+                let Some(permit) = shared
+                    .udp_budget
+                    .sessions
+                    .acquire(peer.ip(), engine.cloudflared)
+                else {
+                    engine.note_drop(&engine.drops_session, peer.ip());
+                    return Ok(());
+                };
+                budget.global = Some(Arc::clone(&permit));
                 let pending = Arc::new(Pending::new(payload.to_vec(), engine.now_ms()));
                 v.insert(Budgeted {
                     slot: SymSlot::Pending(Arc::clone(&pending)),
                     _budget: budget,
                 });
-                spawn_open_symmetric(engine, shared, peer, orig_dst, payload, pending);
+                spawn_open_symmetric(engine, shared, peer, orig_dst, payload, pending, permit);
                 Ok(())
             }
         },
@@ -597,6 +678,7 @@ fn spawn_open_symmetric(
     orig_dst: SocketAddr,
     first_payload: &[u8],
     pending: Arc<Pending<Vec<u8>>>,
+    permit: Arc<crate::udp_budget::Permit>,
 ) {
 
     let (is_fakeip, fakeip_host) = resolve_fakeip(shared, orig_dst);
@@ -618,6 +700,7 @@ fn spawn_open_symmetric(
         let opened = match shared.outbound.udp_upstream() {
             UdpUpstream::Socks5 { target, auth } => {
                 open_symmetric_session(
+                    Arc::clone(&permit),
                     &engine,
                     &shared,
                     target,
@@ -637,6 +720,7 @@ fn spawn_open_symmetric(
                 so_mark,
             } => {
                 open_direct_symmetric_session(
+                    Arc::clone(&permit),
                     &engine,
                     &shared,
                     &resolver,
@@ -905,7 +989,7 @@ async fn handle_fullcone(
                 }
             }
             Entry::Vacant(v) => {
-                let Some(budget) = engine
+                let Some(mut budget) = engine
                     .session_budget
                     .try_acquire(peer.ip(), engine.max_sessions_per_client)
                 else {
@@ -913,12 +997,21 @@ async fn handle_fullcone(
                     tracing::debug!(%peer, %orig_dst, "udp session budget exhausted for client; drop");
                     return Ok(());
                 };
+                let Some(permit) = shared
+                    .udp_budget
+                    .sessions
+                    .acquire(peer.ip(), engine.cloudflared)
+                else {
+                    engine.note_drop(&engine.drops_session, peer.ip());
+                    return Ok(());
+                };
+                budget.global = Some(Arc::clone(&permit));
                 let pending = Arc::new(Pending::new((orig_dst, payload.to_vec()), engine.now_ms()));
                 v.insert(Budgeted {
                     slot: FcSlot::Pending(Arc::clone(&pending)),
                     _budget: budget,
                 });
-                spawn_open_fullcone(engine, shared, peer, orig_dst, payload, pending);
+                spawn_open_fullcone(engine, shared, peer, orig_dst, payload, pending, permit);
                 Ok(())
             }
         },
@@ -932,6 +1025,7 @@ fn spawn_open_fullcone(
     orig_dst_hint: SocketAddr,
     first_payload: &[u8],
     pending: Arc<Pending<(SocketAddr, Vec<u8>)>>,
+    permit: Arc<crate::udp_budget::Permit>,
 ) {
 
     let proto = classify_udp_proto(
@@ -947,6 +1041,7 @@ fn spawn_open_fullcone(
         let opened = match shared.outbound.udp_upstream() {
             UdpUpstream::Socks5 { target, auth } => {
                 open_fullcone_session(
+                    Arc::clone(&permit),
                     &engine,
                     &shared,
                     target,
@@ -964,6 +1059,7 @@ fn spawn_open_fullcone(
                 ..
             } => {
                 open_direct_fullcone_session(
+                    Arc::clone(&permit),
                     &engine,
                     &shared,
                     bind_device.as_deref(),
@@ -1083,6 +1179,7 @@ fn symmetric_spoof_src(
 
 #[allow(clippy::too_many_arguments)]
 async fn open_symmetric_session(
+    permit: Arc<crate::udp_budget::Permit>,
     engine: &Arc<UdpEngine>,
     shared: &Arc<SharedState>,
     socks_target: SocketAddr,
@@ -1109,8 +1206,10 @@ async fn open_symmetric_session(
     let engine_ref = Arc::clone(engine);
     let reader_rec = Arc::clone(&rec);
     let reader_shared = Arc::clone(shared);
+    let session_permit = Arc::clone(&permit);
     let reader = tokio::spawn(async move {
-        let mut rx = MmsgRxBuf::new(MMSG_VLEN, REPLY_SLOT_CAP);
+        let _permit = permit;
+        let mut rx = MmsgRxBuf::new(1, REPLY_SLOT_CAP);
         let mut ctrl_buf = [0u8; 1];
 
         let spoof_fd = spoof_udp.as_raw_fd();
@@ -1178,6 +1277,7 @@ async fn open_symmetric_session(
 
     let sniff = !matches!(rec.proto, StatProto::IpGroup(_));
     Ok(Arc::new(SymmetricSession {
+        _permit: Some(session_permit),
         relay_udp,
         reader,
         last_seen_ms: AtomicU64::new(now_ms),
@@ -1193,6 +1293,7 @@ async fn open_symmetric_session(
 
 #[allow(clippy::too_many_arguments)]
 async fn open_fullcone_session(
+    permit: Arc<crate::udp_budget::Permit>,
     engine: &Arc<UdpEngine>,
     shared: &Arc<SharedState>,
     socks_target: SocketAddr,
@@ -1219,7 +1320,9 @@ async fn open_fullcone_session(
     let reader_rec = Arc::clone(&rec);
     let reader_shared = Arc::clone(shared);
     let fallback_src = orig_dst_hint;
+    let session_permit = Arc::clone(&permit);
     let reader = tokio::spawn(async move {
+        let _permit = permit;
         let mut buf = vec![0u8; 64 * 1024];
         let mut ctrl_buf = [0u8; 1];
         loop {
@@ -1261,9 +1364,11 @@ async fn open_fullcone_session(
         reader_shared.conn_table.close(reader_rec.id);
     });
     Ok(Arc::new(FullconeSession {
+        _permit: Some(session_permit),
         relay_udp,
         reader,
         last_seen_ms: AtomicU64::new(now_ms),
+        idle_ms: idle_for_dst(orig_dst_hint.port(), engine.idle_timeout).as_millis() as u64,
         direct: false,
         rec,
     }))
@@ -1271,6 +1376,7 @@ async fn open_fullcone_session(
 
 #[allow(clippy::too_many_arguments)]
 async fn open_direct_symmetric_session(
+    permit: Arc<crate::udp_budget::Permit>,
     engine: &Arc<UdpEngine>,
     shared: &Arc<SharedState>,
     resolver: &Resolver,
@@ -1314,11 +1420,12 @@ async fn open_direct_symmetric_session(
     let engine_ref = Arc::clone(engine);
     let reader_rec = Arc::clone(&rec);
     let reader_shared = Arc::clone(shared);
+    let session_permit = Arc::clone(&permit);
     let reader = tokio::spawn(async move {
+        let _permit = permit;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader_relay.recv(&mut buf).await {
-                Ok(0) => continue,
                 Ok(n) => {
 
                     match spoof_udp.send_to(&buf[..n], peer).await {
@@ -1342,6 +1449,7 @@ async fn open_direct_symmetric_session(
         reader_shared.conn_table.close(reader_rec.id);
     });
     Ok(Arc::new(SymmetricSession {
+        _permit: Some(session_permit),
         relay_udp: relay,
         reader,
         last_seen_ms: AtomicU64::new(now_ms),
@@ -1357,6 +1465,7 @@ async fn open_direct_symmetric_session(
 
 #[allow(clippy::too_many_arguments)]
 async fn open_direct_fullcone_session(
+    permit: Arc<crate::udp_budget::Permit>,
     engine: &Arc<UdpEngine>,
     shared: &Arc<SharedState>,
     bind_device: Option<&str>,
@@ -1381,7 +1490,9 @@ async fn open_direct_fullcone_session(
     let engine_ref = Arc::clone(engine);
     let reader_rec = Arc::clone(&rec);
     let reader_shared = Arc::clone(shared);
+    let session_permit = Arc::clone(&permit);
     let reader = tokio::spawn(async move {
+        let _permit = permit;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader_relay.recv_from(&mut buf).await {
@@ -1418,9 +1529,11 @@ async fn open_direct_fullcone_session(
         reader_shared.conn_table.close(reader_rec.id);
     });
     Ok(Arc::new(FullconeSession {
+        _permit: Some(session_permit),
         relay_udp: relay,
         reader,
         last_seen_ms: AtomicU64::new(now_ms),
+        idle_ms: idle_for_dst(orig_dst_hint.port(), engine.idle_timeout).as_millis() as u64,
         direct: true,
         rec,
     }))
@@ -1500,15 +1613,20 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
     let now = engine.now_ms();
     let horizon = engine.idle_timeout.as_millis() as u64;
 
+    let class_horizon = |port: u16| idle_for_dst(port, engine.idle_timeout).as_millis() as u64;
+
     let dead_sym: Vec<(SocketAddr, SocketAddr)> = engine
         .symmetric
         .iter()
         .filter(|e| {
-            let last = match &e.value().slot {
-                SymSlot::Ready(s) => s.last_seen_ms.load(Ordering::Relaxed),
-                SymSlot::Pending(p) => p.created_ms,
+            let (last, limit) = match &e.value().slot {
+                SymSlot::Ready(s) => (
+                    s.last_seen_ms.load(Ordering::Relaxed),
+                    class_horizon(e.key().1.port()),
+                ),
+                SymSlot::Pending(p) => (p.created_ms, horizon),
             };
-            now.saturating_sub(last) > horizon
+            now.saturating_sub(last) > limit
         })
         .map(|e| *e.key())
         .collect();
@@ -1531,11 +1649,11 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
         .fullcone
         .iter()
         .filter(|e| {
-            let last = match &e.value().slot {
-                FcSlot::Ready(s) => s.last_seen_ms.load(Ordering::Relaxed),
-                FcSlot::Pending(p) => p.created_ms,
+            let (last, limit) = match &e.value().slot {
+                FcSlot::Ready(s) => (s.last_seen_ms.load(Ordering::Relaxed), s.idle_ms),
+                FcSlot::Pending(p) => (p.created_ms, horizon),
             };
-            now.saturating_sub(last) > horizon
+            now.saturating_sub(last) > limit
         })
         .map(|e| *e.key())
         .collect();
@@ -1555,13 +1673,17 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
     let dead_fp: Vec<(SocketAddr, SocketAddr)> = engine
         .flow_path
         .iter()
-        .filter(|e| now.saturating_sub(e.value().last_seen_ms.load(Ordering::Relaxed)) > horizon)
+        .filter(|e| {
+            now.saturating_sub(e.value().last_seen_ms.load(Ordering::Relaxed))
+                > class_horizon(e.key().1.port())
+        })
         .map(|e| *e.key())
         .collect();
     for k in &dead_fp {
 
+        let limit = class_horizon(k.1.port());
         engine.flow_path.remove_if(k, |_, v| {
-            now.saturating_sub(v.last_seen_ms.load(Ordering::Relaxed)) > horizon
+            now.saturating_sub(v.last_seen_ms.load(Ordering::Relaxed)) > limit
         });
     }
 
@@ -1571,6 +1693,267 @@ fn sweep_idle(engine: &Arc<UdpEngine>, shared: &Arc<SharedState>) -> (usize, usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_queue_is_bounded_by_bytes_and_packet_count() {
+        let p = Pending::new(vec![1u8; 32768], 0);
+        p.push(vec![2u8; 32768]);
+        p.push(vec![3u8; 1]);
+        let packets = p.take();
+        assert_eq!(packets.iter().map(Vec::len).sum::<usize>(), 65536);
+        assert_eq!(packets.len(), 2);
+        p.push(vec![4u8]);
+        assert!(p.take().is_empty());
+        let dst = "127.0.0.1:53".parse::<SocketAddr>().unwrap();
+        let p = Pending::new((dst, vec![0; 65507]), 0);
+        p.push((dst, vec![1; 30]));
+        assert_eq!(p.take().len(), 1);
+        let p = Pending::new(Vec::<u8>::new(), 0);
+        for _ in 0..100 {
+            p.push(Vec::new());
+        }
+        assert_eq!(
+            p.take().len(),
+            8,
+            "zero-sized datagrams still consume packet slots"
+        );
+        let p = Pending::new(vec![1u8; 60000], 0);
+        p.close();
+        assert!(p.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn symmetric_reply_retains_large_socks5_frames() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        rx.connect(tx.local_addr().unwrap()).await.unwrap();
+        let mut buffer = MmsgRxBuf::new(1, REPLY_SLOT_CAP);
+        for size in [0, 2049, 4097, 16384, 65497] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let frame = sb_outbound::socks5_udp::encode_udp_request(
+                "127.0.0.1:1234".parse().unwrap(),
+                &payload,
+            );
+            tx.send_to(&frame, rx.local_addr().unwrap()).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), relay_recv_batch(&rx, &mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                1
+            );
+            let received = buffer.iter().next().unwrap();
+            let (_, offset) = decode_udp_reply(received).unwrap();
+            assert_eq!(
+                &received[offset..],
+                payload,
+                "SOCKS5 header must not hide payload truncation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn global_flow_budget_keeps_symmetric_headroom_across_engines() {
+        let mut cfg = crate::config::Config::default();
+        cfg.inbound.udp_max_sessions = 1;
+        cfg.inbound.udp_reserved_sessions = 1;
+        let shared = Arc::new(SharedState::new(&cfg));
+        let first = make_test_engine();
+        let second = make_test_engine();
+        let peer = "10.0.0.1:1234".parse().unwrap();
+        for port in 1..=16 {
+            let engine = if port % 2 == 0 { &first } else { &second };
+            assert!(matches!(
+                decide_flow_kind(
+                    engine,
+                    &shared,
+                    peer,
+                    SocketAddr::from(([1, 1, 1, 1], port)),
+                    b"plain"
+                ),
+                Some(FlowKind::Fullcone)
+            ));
+        }
+        assert_eq!(first.flow_path.len() + second.flow_path.len(), 15);
+        let dst = "1.1.1.1:443".parse().unwrap();
+        assert!(matches!(
+            decide_flow_kind(&first, &shared, peer, dst, &quic_initial_pkt()),
+            Some(FlowKind::Symmetric)
+        ));
+        assert_eq!(shared.udp_budget.flows.used(), [16, 0]);
+        let over = "1.1.1.2:443".parse().unwrap();
+        assert!(decide_flow_kind(&second, &shared, peer, over, &quic_initial_pkt()).is_none());
+        assert!(matches!(
+            decide_flow_kind(&first, &shared, peer, dst, b"short header"),
+            Some(FlowKind::Symmetric)
+        ));
+        let internal = make_test_engine_kind(true);
+        assert!(decide_flow_kind(&internal, &shared, peer, over, &quic_initial_pkt()).is_some());
+        first.flow_path.clear();
+        second.flow_path.clear();
+        internal.flow_path.clear();
+        assert_eq!(shared.udp_budget.flows.used(), [0, 0]);
+        assert!(decide_flow_kind(&second, &shared, peer, over, &quic_initial_pkt()).is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_removal_retains_global_slot_until_handshake_timeout() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let shared = make_test_shared_with(None, tcp.local_addr().unwrap());
+        let engine = make_test_engine();
+        let peer = "10.0.0.1:1234".parse().unwrap();
+        dispatch_packet(
+            &engine,
+            &shared,
+            peer,
+            "1.1.1.1:53".parse().unwrap(),
+            b"plain",
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let (mut upstream, _) = tokio::time::timeout(Duration::from_secs(2), tcp.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut greeting = [0; 3];
+        upstream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(shared.udp_budget.sessions.used(), [1, 0]);
+        engine.fullcone.clear();
+        assert_eq!(
+            shared.udp_budget.sessions.used(),
+            [1, 0],
+            "opening task still owns its socket and Pending payload"
+        );
+        tokio::time::pause();
+        tokio::time::advance(ASSOCIATE_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while shared.udp_budget.sessions.used()[0] != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut end = [0];
+        assert_eq!(upstream.read(&mut end).await.unwrap(), 0);
+        assert!(engine.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_budget_is_shared_by_explicit_udp_and_all_tproxy_engines() {
+        let mut cfg = crate::config::Config::default();
+        cfg.outbound.mode = crate::config::OutboundMode::Free;
+        cfg.inbound.udp_max_sessions = 1;
+        cfg.inbound.udp_reserved_sessions = 1;
+        let shared = Arc::new(SharedState::new(&cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let explicit_shared = Arc::clone(&shared);
+        let explicit = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            crate::inbound_proxy::udp_associate_inbound(
+                stream,
+                peer,
+                explicit_shared,
+                crate::inbound_proxy::InboundProxyParams {
+                    listen_port: 0,
+                    udp: true,
+                    udp_idle: Duration::from_secs(10),
+                    handshake_timeout: Duration::from_secs(2),
+                },
+                InboundKind::Socks5,
+            )
+            .await
+            .unwrap();
+        });
+        let mut ctrl = TcpStream::connect(addr).await.unwrap();
+        let mut response = [0; 10];
+        tokio::time::timeout(Duration::from_secs(2), ctrl.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response[1], 0);
+        assert_eq!(shared.udp_budget.sessions.used(), [1, 0]);
+        let first = make_test_engine();
+        let second = make_test_engine();
+        let internal = make_test_engine_kind(true);
+        let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = origin.local_addr().unwrap();
+        let peer = "10.0.0.1:12345".parse().unwrap();
+        let mut buf = Vec::new();
+        dispatch_packet(&first, &shared, peer, dst, b"plain", &mut buf)
+            .await
+            .unwrap();
+        assert!(
+            first.is_empty(),
+            "explicit association consumes the shared user quota"
+        );
+
+        explicit.abort();
+        let _ = explicit.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while shared.udp_budget.sessions.used() != [0, 0] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        dispatch_packet(&first, &shared, peer, dst, b"plain", &mut buf)
+            .await
+            .unwrap();
+        dispatch_packet(
+            &second,
+            &shared,
+            "[::1]:12345".parse().unwrap(),
+            dst,
+            b"plain",
+            &mut buf,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            second.is_empty(),
+            "another engine and address family cannot bypass quota"
+        );
+        dispatch_packet(&internal, &shared, peer, dst, b"plain", &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(
+            internal.len(),
+            1,
+            "internal traffic has a separate reserved quota"
+        );
+        assert_eq!(shared.udp_budget.sessions.used(), [1, 1]);
+        let mut packet = [0; 64];
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), origin.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        dispatch_packet(&first, &shared, peer, dst, b"existing", &mut buf)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), origin.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &packet[..n],
+            b"existing",
+            "full quota must not break existing traffic"
+        );
+        first.fullcone.clear();
+        internal.fullcone.clear();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while shared.udp_budget.sessions.used() != [0, 0] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     use crate::config::{RouteCfg, SocksCfg};
 
     const DNS_QUERY: &[u8] =
@@ -1689,6 +2072,7 @@ mod tests {
         let relay_sym = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let reader_sym = tokio::spawn(async { std::future::pending::<()>().await });
         let sym = Arc::new(SymmetricSession {
+            _permit: None,
             relay_udp: relay_sym,
             reader: reader_sym,
             last_seen_ms: AtomicU64::new(engine.now_ms()),
@@ -1711,9 +2095,11 @@ mod tests {
         let relay_fc = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let reader_fc = tokio::spawn(async { std::future::pending::<()>().await });
         let fc = Arc::new(FullconeSession {
+            _permit: None,
             relay_udp: relay_fc,
             reader: reader_fc,
             last_seen_ms: AtomicU64::new(engine.now_ms()),
+            idle_ms: engine.idle_timeout.as_millis() as u64,
             direct: false,
             rec: dummy_rec(),
         });
@@ -1823,6 +2209,7 @@ mod tests {
             0,
             "failed open must return the session budget"
         );
+        assert_eq!(shared.udp_budget.sessions.used(), [0, 0]);
     }
 
     #[tokio::test]
@@ -2395,6 +2782,110 @@ mod tests {
         ))
     }
 
+    fn make_aged_engine(idle: Duration) -> Arc<UdpEngine> {
+        let mut e = UdpEngine::new(
+            idle,
+            64,
+            false,
+            MAX_FLOWS_PER_CLIENT,
+            MAX_SESSIONS_PER_CLIENT,
+        );
+        e.started = Instant::now() - Duration::from_secs(3600);
+        Arc::new(e)
+    }
+
+    async fn fullcone_slot(
+        engine: &Arc<UdpEngine>,
+        peer: SocketAddr,
+        first_dst: SocketAddr,
+        last_seen: u64,
+    ) -> Budgeted<FcSlot> {
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let reader = tokio::spawn(async { std::future::pending::<()>().await });
+        let s = Arc::new(FullconeSession {
+            _permit: None,
+            relay_udp: relay,
+            reader,
+            last_seen_ms: AtomicU64::new(last_seen),
+            idle_ms: idle_for_dst(first_dst.port(), engine.idle_timeout).as_millis() as u64,
+            direct: false,
+            rec: dummy_rec(),
+        });
+        session_slot(engine, peer, FcSlot::Ready(s))
+    }
+
+    #[test]
+    fn query_protocols_get_a_shorter_idle() {
+        let default_idle = Duration::from_secs(60);
+        for p in [53u16, 123, 3478, 3479] {
+            assert_eq!(
+                idle_for_dst(p, default_idle),
+                QUERY_PROTO_IDLE,
+                "port {p} is request/response shaped"
+            );
+        }
+        for p in [443u16, 80, 4500, 27015] {
+            assert_eq!(
+                idle_for_dst(p, default_idle),
+                default_idle,
+                "port {p} must keep the configured idle"
+            );
+        }
+
+        assert_eq!(
+            idle_for_dst(53, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_sessions_expire_sooner_than_the_configured_idle() {
+        let engine = make_aged_engine(Duration::from_secs(60));
+        let shared = make_test_shared(None);
+        let now = engine.now_ms();
+
+        let aged = now - 20_000;
+
+        let dns_peer: SocketAddr = "10.0.0.5:33001".parse().unwrap();
+        let quic_peer: SocketAddr = "10.0.0.5:33002".parse().unwrap();
+        let dns_dst: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let quic_dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        engine.fullcone.insert(
+            dns_peer,
+            fullcone_slot(&engine, dns_peer, dns_dst, aged).await,
+        );
+        engine.fullcone.insert(
+            quic_peer,
+            fullcone_slot(&engine, quic_peer, quic_dst, aged).await,
+        );
+        for (peer, dst) in [(dns_peer, dns_dst), (quic_peer, quic_dst)] {
+            let e = flow_entry(&engine, peer, FlowKind::Fullcone);
+            e.last_seen_ms.store(aged, Ordering::Relaxed);
+            engine.flow_path.insert((peer, dst), e);
+        }
+
+        sweep_idle(&engine, &shared);
+
+        assert!(
+            !engine.fullcone.contains_key(&dns_peer),
+            "a DNS session idle for 20s must be reclaimed"
+        );
+        assert!(
+            engine.fullcone.contains_key(&quic_peer),
+            "a QUIC session idle for 20s is still well inside udp_idle=60s"
+        );
+        assert!(
+            !engine.flow_path.contains_key(&(dns_peer, dns_dst)),
+            "the DNS flow entry goes with it"
+        );
+        assert!(engine.flow_path.contains_key(&(quic_peer, quic_dst)));
+        assert_eq!(
+            engine.session_budget.used(dns_peer.ip()),
+            1,
+            "only the QUIC session should still hold budget"
+        );
+    }
+
     fn session_slot<T>(engine: &UdpEngine, peer: SocketAddr, slot: T) -> Budgeted<T> {
         Budgeted {
             slot,
@@ -2407,6 +2898,7 @@ mod tests {
 
     fn flow_entry(engine: &UdpEngine, peer: SocketAddr, kind: FlowKind) -> FlowEntry {
         FlowEntry {
+            _global: None,
             kind,
             last_seen_ms: AtomicU64::new(engine.now_ms()),
             _budget: engine

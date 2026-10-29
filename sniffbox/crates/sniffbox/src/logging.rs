@@ -2,11 +2,13 @@
 
 use sb_web::{LogEvent, LogSource, LogTx};
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
@@ -14,6 +16,127 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 static ANSI: AtomicBool = AtomicBool::new(false);
 
 static LOG_TX: OnceLock<LogTx> = OnceLock::new();
+
+static LOG_SINK: OnceLock<LogSink> = OnceLock::new();
+
+const LOG_QUEUE_CAP: usize = 4096;
+
+#[derive(Default)]
+struct Dropped {
+    pending: AtomicU64,
+    total: AtomicU64,
+}
+
+#[derive(Clone)]
+pub struct LogSink {
+    tx: SyncSender<Msg>,
+    dropped: Arc<Dropped>,
+}
+
+enum Msg {
+    Line(Vec<u8>),
+
+    Flush(SyncSender<()>),
+}
+
+impl LogSink {
+
+    fn new<W: std::io::Write + Send + 'static>(cap: usize, mut out: W) -> Self {
+        let (tx, rx) = sync_channel::<Msg>(cap);
+        let dropped: Arc<Dropped> = Arc::new(Dropped::default());
+        let lost = Arc::clone(&dropped);
+        let spawned = std::thread::Builder::new()
+            .name("sniffbox-log".into())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        Msg::Line(line) => {
+
+                            let n = lost.pending.swap(0, Ordering::Relaxed);
+                            if n > 0 {
+                                let _ = writeln!(
+                                    out,
+                                    " PaoPaoGW BOX  WARN dropped {n} log lines (log consumer too slow)"
+                                );
+                            }
+                            let _ = out.write_all(&line);
+                            let _ = out.flush();
+                        }
+                        Msg::Flush(ack) => {
+                            let _ = out.flush();
+                            let _ = ack.try_send(());
+                        }
+                    }
+                }
+            })
+            .is_ok();
+        if !spawned {
+            tracing::warn!("log writer thread spawn failed; log lines will be dropped");
+        }
+        Self { tx, dropped }
+    }
+
+    fn submit(&self, line: Vec<u8>) {
+        match self.tx.try_send(Msg::Line(line)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.dropped.pending.fetch_add(1, Ordering::Relaxed);
+                self.dropped.total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn dropped_total(&self) -> u64 {
+        self.dropped.total.load(Ordering::Relaxed)
+    }
+
+    fn flush(&self, timeout: Duration) {
+        let (ack_tx, ack_rx) = sync_channel::<()>(1);
+        if self.tx.try_send(Msg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(timeout);
+        }
+    }
+}
+
+pub struct LogLine {
+    sink: LogSink,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for LogLine {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LogLine {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            self.sink.submit(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogSink {
+    type Writer = LogLine;
+    fn make_writer(&'a self) -> Self::Writer {
+        LogLine {
+            sink: self.clone(),
+            buf: Vec::with_capacity(192),
+        }
+    }
+}
+
+pub fn flush(timeout: Duration) {
+    if let Some(sink) = LOG_SINK.get() {
+        sink.flush(timeout);
+    }
+}
 
 pub fn log_sender() -> Option<LogTx> {
     LOG_TX.get().cloned()
@@ -250,7 +373,12 @@ pub fn init(level: &str, timestamp: bool) {
 
     let offset = time::UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is valid");
 
+    let sink = LOG_SINK
+        .get_or_init(|| LogSink::new(LOG_QUEUE_CAP, std::io::stdout()))
+        .clone();
+
     let fmt_layer = fmt::layer()
+        .with_writer(sink)
         .with_ansi(ansi)
         .event_format(PpgwFormat {
             timestamp,
@@ -275,6 +403,108 @@ pub fn init(level: &str, timestamp: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct GatedSink {
+        gate: std::sync::mpsc::Receiver<()>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.gate.recv();
+            self.out.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct OpenSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for OpenSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn log_sink_never_blocks_the_caller_and_reports_drops() {
+        let (tokens, gate) = std::sync::mpsc::channel::<()>();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = LogSink::new(
+            4,
+            GatedSink {
+                gate,
+                out: Arc::clone(&out),
+            },
+        );
+
+        let (done_tx, done) = std::sync::mpsc::channel::<Duration>();
+        let writer = sink.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            for i in 0..500 {
+                writer.submit(format!("line {i}\n").into_bytes());
+            }
+            let _ = done_tx.send(t0.elapsed());
+        });
+        let elapsed = done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("submitting must not wait for the console");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "submitting must not wait for the console: {elapsed:?}"
+        );
+        assert!(
+            sink.dropped_total() >= 400,
+            "a stalled consumer must shed load, dropped={}",
+            sink.dropped_total()
+        );
+
+        for _ in 0..32 {
+            let _ = tokens.send(());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = String::from_utf8_lossy(&out.lock().unwrap()).to_string();
+            if text.contains("dropped") && text.contains("log lines") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer thread must report the dropped lines, got: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn log_sink_delivers_every_line_when_the_consumer_keeps_up() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = LogSink::new(256, OpenSink(Arc::clone(&out)));
+        for i in 0..50 {
+            sink.submit(format!("l{i}\n").into_bytes());
+        }
+        sink.flush(Duration::from_secs(5));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            sink.dropped_total(),
+            0,
+            "no drops when the consumer keeps up"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 50, "got: {text:?}");
+        assert_eq!(lines[0], "l0");
+        assert_eq!(lines[49], "l49");
+    }
 
     fn flow(scheme: Option<&str>, domain: Option<&str>) -> String {
         fmt_flow(

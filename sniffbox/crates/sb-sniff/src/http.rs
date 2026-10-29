@@ -3,41 +3,48 @@
 use crate::error::ParseErr;
 
 pub fn parse_host(buf: &[u8]) -> Result<Option<&str>, ParseErr> {
+    parse_head(buf).map(|(host, _)| host)
+}
+
+pub fn parse_head(buf: &[u8]) -> Result<(Option<&str>, bool), ParseErr> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
-    match req.parse(buf) {
-        Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial) => {
+    let complete = match req.parse(buf) {
+        Ok(httparse::Status::Complete(_)) => true,
 
-            for h in req.headers.iter() {
-                if h.name.eq_ignore_ascii_case("host") {
-                    let s = std::str::from_utf8(h.value)
-                        .map_err(|_| ParseErr::Malformed("host not utf8"))?
-                        .trim();
+        Ok(httparse::Status::Partial) => false,
+        Err(_) => return Err(ParseErr::Malformed("not http")),
+    };
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("host") {
+            let s = std::str::from_utf8(h.value)
+                .map_err(|_| ParseErr::Malformed("host not utf8"))?
+                .trim();
 
-                    let hostname = if let Some(rest) = s.strip_prefix('[') {
-                        match rest.find(']') {
-                            Some(end) => &rest[..end],
-                            None => return Err(ParseErr::Malformed("unmatched '[' in host")),
-                        }
-                    } else {
-                        s.split(':').next().unwrap_or(s)
-                    };
-                    if hostname.is_empty() {
-                        return Ok(None);
-                    }
-
-                    let start = hostname.as_ptr() as usize - buf.as_ptr() as usize;
-                    let end = start + hostname.len();
-                    return Ok(Some(
-                        std::str::from_utf8(&buf[start..end])
-                            .map_err(|_| ParseErr::Malformed("host not utf8"))?,
-                    ));
+            let hostname = if let Some(rest) = s.strip_prefix('[') {
+                match rest.find(']') {
+                    Some(end) => &rest[..end],
+                    None => return Err(ParseErr::Malformed("unmatched '[' in host")),
                 }
+            } else {
+                s.split(':').next().unwrap_or(s)
+            };
+            if hostname.is_empty() {
+                return Ok((None, complete));
             }
-            Ok(None)
+
+            let start = hostname.as_ptr() as usize - buf.as_ptr() as usize;
+            let end = start + hostname.len();
+            return Ok((
+                Some(
+                    std::str::from_utf8(&buf[start..end])
+                        .map_err(|_| ParseErr::Malformed("host not utf8"))?,
+                ),
+                complete,
+            ));
         }
-        Err(_) => Err(ParseErr::Malformed("not http")),
     }
+    Ok((None, complete))
 }
 
 #[cfg(test)]

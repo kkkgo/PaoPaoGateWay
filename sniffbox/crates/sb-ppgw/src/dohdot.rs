@@ -81,15 +81,15 @@ pub fn parse_dns_spec(raw: &str) -> Option<DnsSpec> {
 
 fn split_host_port(s: &str, default_port: u16) -> (String, u16) {
 
-    if let Some(rest) = s.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let host = rest[..end].to_string();
-            let port = rest[end + 1..]
-                .strip_prefix(':')
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(default_port);
-            return (host, port);
-        }
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let host = rest[..end].to_string();
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return (host, port);
     }
     match s.rsplit_once(':') {
         Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().unwrap_or(default_port)),
@@ -270,10 +270,10 @@ fn bootstrap_all(
 fn udp_specs(specs: &[String]) -> Vec<SocketAddr> {
     let mut out: Vec<SocketAddr> = Vec::new();
     for spec in specs {
-        if let Some(DnsSpec::Udp(addr)) = parse_dns_spec(spec) {
-            if !out.iter().any(|a| a.ip() == addr.ip()) {
-                out.push(addr);
-            }
+        if let Some(DnsSpec::Udp(addr)) = parse_dns_spec(spec)
+            && !out.iter().any(|a| a.ip() == addr.ip())
+        {
+            out.push(addr);
         }
     }
     out
@@ -574,10 +574,10 @@ fn resolve_dot(
         if dl.expired() {
             break;
         }
-        if let Some(ips) = dot_query(domain, host, addr, ipv6) {
-            if !ips.is_empty() {
-                return ips;
-            }
+        if let Some(ips) = dot_query(domain, host, addr, ipv6)
+            && !ips.is_empty()
+        {
+            return ips;
         }
     }
     Vec::new()
@@ -932,10 +932,10 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while !stop2.load(Ordering::Relaxed) {
-                if let Ok((n, peer)) = sock.recv_from(&mut buf) {
-                    if let Ok(q) = message::parse_query(&buf[..n]) {
-                        let _ = sock.send_to(&q.answer_a(answer, 60), peer);
-                    }
+                if let Ok((n, peer)) = sock.recv_from(&mut buf)
+                    && let Ok(q) = message::parse_query(&buf[..n])
+                {
+                    let _ = sock.send_to(&q.answer_a(answer, 60), peer);
                 }
             }
         });

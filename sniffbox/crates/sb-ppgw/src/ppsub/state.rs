@@ -15,7 +15,7 @@ pub fn dir_overridden() -> bool {
         .unwrap_or(false)
 }
 
-fn base_dir() -> String {
+pub(crate) fn base_dir() -> String {
     std::env::var(BASE_DIR_ENV)
         .ok()
         .filter(|s| !s.is_empty())

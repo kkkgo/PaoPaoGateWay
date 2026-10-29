@@ -22,6 +22,29 @@ const MAX_CONCURRENT: usize = 16;
 
 const CYCLE_GAP: Duration = Duration::from_secs(30);
 
+const CYCLE_GAP_MAX: Duration = Duration::from_secs(300);
+
+const ANCHOR_CHECK: Duration = Duration::from_secs(30);
+
+#[cfg(not(test))]
+const CONFIRM_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CONFIRM_DELAY: Duration = Duration::from_millis(20);
+
+#[cfg(not(test))]
+const DRAIN_PROBE: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const DRAIN_PROBE: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
+const DRAIN_RECHECK: Duration = Duration::from_secs(12);
+#[cfg(test)]
+const DRAIN_RECHECK: Duration = Duration::from_millis(20);
+
+const BACKOFF_AFTER: u32 = 3;
+
+const BACKOFF_BASE: Duration = Duration::from_secs(120);
+const BACKOFF_MAX: Duration = Duration::from_secs(16 * 60);
+
 const SUPERVISOR_TICK: Duration = Duration::from_secs(30);
 
 const ERR_BACKOFF: Duration = Duration::from_secs(15);
@@ -78,6 +101,15 @@ impl NodeHist {
 
     pub fn last(&self) -> Option<Option<u32>> {
         self.samples.back().copied()
+    }
+
+    fn mean_ok(&self) -> Option<f64> {
+        let ok: Vec<f64> = self.samples.iter().flatten().map(|&d| d as f64).collect();
+        (!ok.is_empty()).then(|| ok.iter().sum::<f64>() / ok.len() as f64)
+    }
+
+    fn has_failures(&self) -> bool {
+        self.samples.iter().any(Option::is_none)
     }
 }
 
@@ -148,12 +180,100 @@ macro_rules! st_info {
     };
 }
 
+fn backoff_delay(streak: u32) -> Option<Duration> {
+    let shift = streak.checked_sub(BACKOFF_AFTER)?.min(16);
+    Some(BACKOFF_BASE.saturating_mul(1 << shift).min(BACKOFF_MAX))
+}
+
+fn next_gap(gap: Duration, settled: bool) -> Duration {
+    if settled {
+        gap.saturating_mul(2).min(CYCLE_GAP_MAX)
+    } else {
+        CYCLE_GAP
+    }
+}
+
+fn via_node(c: &crate::clash_pull::ClashConn, group: &str, old: &str) -> bool {
+    c.chains.first().is_some_and(|n| n == old)
+        && c.chains.iter().any(|g| g == group)
+        && c.inbound_type != "Inner"
+}
+
+fn stalled_on(
+    group: &str,
+    old: &str,
+    before: &[crate::clash_pull::ClashConn],
+    after: &[crate::clash_pull::ClashConn],
+) -> (Vec<String>, Vec<String>) {
+    let prev: HashMap<&str, (u64, u64)> = before
+        .iter()
+        .filter(|c| via_node(c, group, old))
+        .map(|c| (c.id.as_str(), (c.upload, c.download)))
+        .collect();
+    let (mut stalled, mut moving) = (Vec::new(), Vec::new());
+    for c in after.iter().filter(|c| via_node(c, group, old)) {
+        match prev.get(c.id.as_str()) {
+            Some(&bytes) if bytes == (c.upload, c.download) => stalled.push(c.id.clone()),
+            Some(_) => moving.push(c.id.clone()),
+            None => {}
+        }
+    }
+    (stalled, moving)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    streak: u32,
+    until: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassOutcome {
+    settled: bool,
+}
+
 #[derive(Default)]
 struct GroupState {
     hist: HashMap<String, NodeHist>,
+    backoff: HashMap<String, Backoff>,
+
+    anchor: Option<Member>,
 }
 
 impl GroupState {
+
+    fn observe(
+        &mut self,
+        node: &str,
+        sample: Option<u32>,
+        now: tokio::time::Instant,
+    ) -> Option<Duration> {
+        self.push(node, sample);
+        if sample.is_some() {
+            self.backoff.remove(node);
+            return None;
+        }
+        let b = self.backoff.entry(node.to_string()).or_insert(Backoff {
+            streak: 0,
+            until: None,
+        });
+        b.streak += 1;
+        let d = backoff_delay(b.streak);
+        b.until = d.map(|d| now + d);
+        d
+    }
+
+    fn confirmed_down(&self, node: &str) -> bool {
+        !self.latest_ok(node) && self.backoff.get(node).is_some_and(|b| b.streak >= 2)
+    }
+
+    fn in_backoff(&self, node: &str, now: tokio::time::Instant) -> bool {
+        self.backoff
+            .get(node)
+            .and_then(|b| b.until)
+            .is_some_and(|until| now < until)
+    }
+
     fn score(&self, node: &str) -> f64 {
         self.hist
             .get(node)
@@ -397,6 +517,7 @@ async fn runner(
     fixed: Arc<crate::smart_fixed::SmartFixed>,
     mut cancel: watch::Receiver<bool>,
 ) {
+    let mut gap = CYCLE_GAP;
     loop {
 
         if !sock.exists() {
@@ -407,6 +528,7 @@ async fn runner(
             continue;
         }
         let mut any_err = false;
+        let mut settled = true;
         for g in &groups {
             if *cancel.borrow() {
                 return;
@@ -414,19 +536,51 @@ async fn runner(
             let mut st = lock_states(&states).remove(&g.name).unwrap_or_default();
             let r = run_group_pass(&sock, &g.name, &url, &mut st, &stats, &fixed, &cancel).await;
             lock_states(&states).insert(g.name.clone(), st);
-            if let Err(e) = r {
-                tracing::warn!(
-                    "[PaoPaoGW Smart Test] {}: clash api error ({e}), retry in {}s",
-                    g.name,
-                    ERR_BACKOFF.as_secs()
-                );
-                any_err = true;
-                break;
+            match r {
+                Ok(o) => settled &= o.settled,
+                Err(e) => {
+                    tracing::warn!(
+                        "[PaoPaoGW Smart Test] {}: clash api error ({e}), retry in {}s",
+                        g.name,
+                        ERR_BACKOFF.as_secs()
+                    );
+                    any_err = true;
+                    break;
+                }
             }
         }
-        let gap = if any_err { ERR_BACKOFF } else { CYCLE_GAP };
-        if sleep_or_shutdown(gap, &mut cancel).await {
-            return;
+        if any_err {
+            gap = CYCLE_GAP;
+            if sleep_or_shutdown(ERR_BACKOFF, &mut cancel).await {
+                return;
+            }
+            continue;
+        }
+        let prev = gap;
+        gap = next_gap(gap, settled);
+        if gap != prev {
+            st_log!(
+                "`{url}`: next full sweep in {}s, current node(s) checked every {}s meanwhile",
+                gap.as_secs(),
+                ANCHOR_CHECK.as_secs()
+            );
+        }
+        let deadline = tokio::time::Instant::now() + gap;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if sleep_or_shutdown(left.min(ANCHOR_CHECK), &mut cancel).await {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline || *cancel.borrow() {
+                break;
+            }
+            if check_anchors(&sock, &url, &groups, &states, &stats, &fixed).await {
+                gap = CYCLE_GAP;
+                break;
+            }
         }
     }
 }
@@ -438,6 +592,27 @@ async fn sleep_or_shutdown(d: Duration, shutdown: &mut watch::Receiver<bool>) ->
     }
 }
 
+fn observe_and_publish(
+    group: &str,
+    st: &mut GroupState,
+    stats: &SmartStats,
+    name: &str,
+    d: Option<u32>,
+) {
+    let backoff = st.observe(name, d, tokio::time::Instant::now());
+    log_result(group, name, d, st.score(name));
+    if let Some(b) = backoff {
+        st_log!(
+            "{group}: {name} failed {} times in a row, retest in {}s",
+            st.backoff.get(name).map_or(0, |b| b.streak),
+            b.as_secs()
+        );
+    }
+    if let Some(h) = st.hist.get(name) {
+        stats.publish_node(group, name, h);
+    }
+}
+
 async fn run_group_pass(
     sock: &Path,
     group: &str,
@@ -446,7 +621,8 @@ async fn run_group_pass(
     stats: &SmartStats,
     fixed: &crate::smart_fixed::SmartFixed,
     shutdown: &watch::Receiver<bool>,
-) -> std::io::Result<()> {
+) -> std::io::Result<PassOutcome> {
+    let unsettled = PassOutcome { settled: false };
     let px: RawProxies = fetch_typed(sock, "/proxies").await?;
     let providers: Option<RawProviders> = if needs_providers(&px, group) {
         Some(fetch_typed(sock, "/providers/proxies").await?)
@@ -456,15 +632,16 @@ async fn run_group_pass(
     let Some((members, now)) = eligible_members(&px, providers.as_ref(), group) else {
 
         st_log!("{group}: group not present in clash yet, skip this cycle");
-        return Ok(());
+        return Ok(unsettled);
     };
     if members.is_empty() {
         st_log!("{group}: no testable member, skip this cycle");
-        return Ok(());
+        return Ok(unsettled);
     }
 
     let live: std::collections::HashSet<&str> = members.iter().map(|m| m.name.as_str()).collect();
     st.hist.retain(|k, _| live.contains(k.as_str()));
+    st.backoff.retain(|k, _| live.contains(k.as_str()));
 
     let mut locked = fixed.get(group);
     if let Some(l) = &locked
@@ -490,7 +667,7 @@ async fn run_group_pass(
     if no_data.len() == members.len() {
         let r = ladder_pass(sock, group, url, st, &members, &now, locked.as_deref()).await;
         stats.publish(group, &st.hist);
-        return r;
+        return r.map(|()| unsettled);
     }
 
     if !no_data.is_empty() {
@@ -500,11 +677,11 @@ async fn run_group_pass(
             REGULAR_TIMEOUT_MS
         );
         for (m, d) in test_many(sock, &no_data, url, REGULAR_TIMEOUT_MS).await {
-            st.push(&m.name, d);
-            log_result(group, &m.name, d, st.score(&m.name));
+            observe_and_publish(group, st, stats, &m.name, d);
         }
         stats.publish(group, &st.hist);
     }
+    let mut switched = false;
 
     let mut current = now.clone();
     if !members.iter().any(|m| m.name == current) {
@@ -514,13 +691,14 @@ async fn run_group_pass(
                 .min_by(|a, b| st.score(&a.name).total_cmp(&st.score(&b.name)))
                 .map(|m| m.name.clone())
         });
-        if let Some(pick) = pick {
-            if select_node(sock, group, &pick).await? {
-                st_info!(
-                    "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{pick}`"
-                );
-                current = pick;
-            }
+        if let Some(pick) = pick
+            && select_node(sock, group, &pick).await?
+        {
+            st_info!(
+                "{group}: current selection `{current}` invalid (clash reloaded?), reselected `{pick}`"
+            );
+            current = pick;
+            switched = true;
         }
     }
 
@@ -534,13 +712,30 @@ async fn run_group_pass(
             .unwrap_or_default()
     );
     if let Some(cur) = members.iter().find(|m| m.name == anchor) {
-        let d = test_member(sock, cur, url, REGULAR_TIMEOUT_MS).await;
-        st.push(&cur.name, d);
-        log_result(group, &cur.name, d, st.score(&cur.name));
-        if let Some(h) = st.hist.get(&cur.name) {
-            stats.publish_node(group, &cur.name, h);
+        let mut d = test_member(sock, cur, url, REGULAR_TIMEOUT_MS).await;
+
+        if d.is_none() && !st.backoff.contains_key(&cur.name) {
+            st_log!(
+                "{group}: current node `{}` failed, retest in {}s to confirm",
+                cur.name,
+                CONFIRM_DELAY.as_secs()
+            );
+            if sleep_or_shutdown(CONFIRM_DELAY, &mut shutdown.clone()).await {
+                return Ok(unsettled);
+            }
+            d = test_member(sock, cur, url, REGULAR_TIMEOUT_MS).await;
+            if d.is_some() {
+                st_log!(
+                    "{group}: `{}` answered the retest, transient failure ignored",
+                    cur.name
+                );
+            } else {
+                observe_and_publish(group, st, stats, &cur.name, None);
+            }
         }
+        observe_and_publish(group, st, stats, &cur.name, d);
     }
+    let anchor_ok = st.latest_ok(&anchor);
 
     if let Some(l) = locked.clone()
         && !st.latest_ok(&l)
@@ -556,41 +751,118 @@ async fn run_group_pass(
     {
         st_info!("{group}: hold on user-locked `{l}` (was `{current}`)");
         current = l;
+        switched = true;
     }
     let mut rest: Vec<&Member> = members.iter().filter(|m| m.name != anchor).collect();
     rest.sort_by(|a, b| st.score(&a.name).total_cmp(&st.score(&b.name)));
+    let clock = tokio::time::Instant::now();
+    let mut skipped = 0usize;
     for m in rest {
         if *shutdown.borrow() {
             break;
         }
-        let d = test_member(sock, m, url, REGULAR_TIMEOUT_MS).await;
-        st.push(&m.name, d);
-        log_result(group, &m.name, d, st.score(&m.name));
-        if let Some(h) = st.hist.get(&m.name) {
-            stats.publish_node(group, &m.name, h);
+
+        if st.in_backoff(&m.name, clock) {
+            skipped += 1;
+            continue;
         }
+        let d = test_member(sock, m, url, REGULAR_TIMEOUT_MS).await;
+        observe_and_publish(group, st, stats, &m.name, d);
 
         if locked.is_some() {
             continue;
         }
-        let (cand, cur) = (st.score(&m.name), st.score(&current));
 
-        if cand < cur && select_node(sock, group, &m.name).await? {
-            st_info!(
-                "{group}: switch `{current}` -> `{}` (score {} < {})",
-                m.name,
-                cand.round() as u64,
-                cur.round() as u64
-            );
+        let cur_down = st.confirmed_down(&current);
+        let cand = st.score(&m.name);
+        let cur = if cur_down {
+            f64::INFINITY
+        } else {
+            st.score(&current)
+        };
+
+        if st.latest_ok(&m.name) && cand < cur && select_node(sock, group, &m.name).await? {
+            if cur_down {
+                st_info!(
+                    "{group}: switch `{current}` -> `{}` (current node failed twice in a row)",
+                    m.name
+                );
+
+                spawn_drain(sock.to_path_buf(), group.to_string(), current.clone());
+            } else {
+                st_info!(
+                    "{group}: switch `{current}` -> `{}` (score {} < {})",
+                    m.name,
+                    cand.round() as u64,
+                    cur.round() as u64
+                );
+            }
             current = m.name.clone();
+            switched = true;
         }
     }
     st_log!(
-        "{group}: sweep done, selected `{current}` (score {}){}",
+        "{group}: sweep done, selected `{current}` (score {}){}{}",
         fmt_score(st.score(&current)),
-        if locked.is_some() { " [locked]" } else { "" }
+        if locked.is_some() { " [locked]" } else { "" },
+        if skipped > 0 {
+            format!(", {skipped} node(s) in backoff skipped")
+        } else {
+            String::new()
+        }
     );
-    Ok(())
+
+    let cur_score = st.score(&current);
+    let recovering = members.iter().any(|m| {
+        m.name != current
+            && st.latest_ok(&m.name)
+            && st.hist.get(&m.name).is_some_and(|h| {
+                h.has_failures() && h.mean_ok().is_some_and(|mean| mean < cur_score)
+            })
+    });
+    let keep = locked.unwrap_or(current);
+    st.anchor = members.iter().find(|m| m.name == keep).cloned();
+    Ok(PassOutcome {
+        settled: !switched && anchor_ok && !recovering,
+    })
+}
+
+async fn check_anchors(
+    sock: &Path,
+    url: &str,
+    groups: &[SmartGroup],
+    states: &SharedStates,
+    stats: &SmartStats,
+    fixed: &crate::smart_fixed::SmartFixed,
+) -> bool {
+    let mut failed = false;
+    for g in groups {
+        let mut st = lock_states(states).remove(&g.name).unwrap_or_default();
+
+        let target = match (fixed.get(&g.name), st.anchor.clone()) {
+            (Some(l), Some(a)) if a.name != l => None,
+            (_, a) => a,
+        };
+        if let Some(m) = target {
+
+            match test_member(sock, &m, url, REGULAR_TIMEOUT_MS).await {
+                Some(d) => observe_and_publish(&g.name, &mut st, stats, &m.name, Some(d)),
+                None => {
+                    st_info!(
+                        "{}: current node `{}` failed its check, full sweep now",
+                        g.name,
+                        m.name
+                    );
+                    failed = true;
+                }
+            }
+        }
+        lock_states(states).insert(g.name.clone(), st);
+        if failed {
+            break;
+        }
+    }
+    failed
 }
 
 fn log_result(group: &str, name: &str, delay: Option<u32>, score: f64) {
@@ -778,6 +1050,69 @@ async fn select_node(sock: &Path, group: &str, name: &str) -> std::io::Result<bo
         return Ok(false);
     }
     Ok(true)
+}
+
+async fn fetch_connections(sock: &Path) -> std::io::Result<Vec<crate::clash_pull::ClashConn>> {
+    let (status, body) = uds_request(sock, "GET", "/connections", None, SNAPSHOT_TIMEOUT).await?;
+    if status != 200 {
+        return Err(std::io::Error::other(format!(
+            "clash /connections -> {status}"
+        )));
+    }
+    Ok(crate::clash_pull::parse_connections(
+        &String::from_utf8_lossy(&body),
+    ))
+}
+
+async fn close_connections(sock: &Path, ids: &[String]) -> usize {
+    let mut n = 0;
+    for id in ids {
+        let path = format!(
+            "/connections/{}",
+            crate::web_proxies::pct_encode_segment(id)
+        );
+        if let Ok((status, _)) = uds_request(sock, "DELETE", &path, None, SELECT_TIMEOUT).await
+            && (200..300).contains(&status)
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn spawn_drain(sock: PathBuf, group: String, old: String) {
+    tokio::spawn(async move {
+        let Ok(first) = fetch_connections(&sock).await else {
+            return;
+        };
+        if !first.iter().any(|c| via_node(c, &group, &old)) {
+            return;
+        }
+        tokio::time::sleep(DRAIN_PROBE).await;
+        let Ok(second) = fetch_connections(&sock).await else {
+            return;
+        };
+        let (stalled, mut moving) = stalled_on(&group, &old, &first, &second);
+        let mut closed = close_connections(&sock, &stalled).await;
+        if !moving.is_empty() {
+            tokio::time::sleep(DRAIN_RECHECK).await;
+            if let Ok(third) = fetch_connections(&sock).await {
+                let keep: std::collections::HashSet<&str> =
+                    moving.iter().map(String::as_str).collect();
+                let second: Vec<_> = second
+                    .into_iter()
+                    .filter(|c| keep.contains(c.id.as_str()))
+                    .collect();
+                let (later, still) = stalled_on(&group, &old, &second, &third);
+                closed += close_connections(&sock, &later).await;
+                moving = still;
+            }
+        }
+        st_info!(
+            "{group}: moved off `{old}`: closed {closed} stalled/idle connection(s), kept {} still moving data",
+            moving.len()
+        );
+    });
 }
 
 async fn fetch_typed<T: serde::de::DeserializeOwned>(
@@ -1280,6 +1615,504 @@ mod tests {
             url: String::new(),
         }]);
         assert!(stats.group_scores("G").is_none(), "retain must still prune");
+    }
+
+    #[test]
+    fn backoff_starts_at_the_third_failure_doubles_and_caps() {
+        assert_eq!(backoff_delay(1), None);
+        assert_eq!(backoff_delay(2), None);
+        assert_eq!(backoff_delay(3), Some(Duration::from_secs(120)));
+        assert_eq!(backoff_delay(4), Some(Duration::from_secs(240)));
+        assert_eq!(backoff_delay(5), Some(Duration::from_secs(480)));
+        assert_eq!(backoff_delay(6), Some(Duration::from_secs(960)));
+        assert_eq!(backoff_delay(7), Some(BACKOFF_MAX));
+        assert_eq!(backoff_delay(u32::MAX), Some(BACKOFF_MAX));
+    }
+
+    #[test]
+    fn gap_doubles_while_settled_and_snaps_back_on_any_change() {
+        let mut g = CYCLE_GAP;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            g = next_gap(g, true);
+            seen.push(g.as_secs());
+        }
+        assert_eq!(seen, vec![60, 120, 240, 300, 300, 300]);
+        assert_eq!(next_gap(CYCLE_GAP_MAX, false), CYCLE_GAP);
+    }
+
+    #[test]
+    fn observe_counts_consecutive_failures_and_success_clears() {
+        let mut st = GroupState::default();
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(st.observe("N", None, t0), None);
+        assert_eq!(st.observe("N", None, t0), None);
+        assert!(!st.in_backoff("N", t0), "two misses are not enough");
+        assert_eq!(st.observe("N", None, t0), Some(BACKOFF_BASE));
+        assert!(st.in_backoff("N", t0 + Duration::from_secs(60)));
+        assert!(!st.in_backoff("N", t0 + BACKOFF_BASE), "backoff expires");
+        assert_eq!(st.observe("N", None, t0), Some(BACKOFF_BASE * 2));
+        assert_eq!(st.observe("N", Some(80), t0), None);
+        assert!(st.backoff.is_empty(), "one success resets the streak");
+        assert_eq!(
+            st.hist["N"].samples.len(),
+            5,
+            "every result still feeds the score"
+        );
+    }
+
+    struct FakeClash {
+        _dir: tempfile::TempDir,
+        sock: PathBuf,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeClash {
+        fn requests(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    fn fake_clash(proxies: Value, delays: &[(&str, &[Option<u32>])]) -> FakeClash {
+        fake_clash_with_conns(proxies, delays, Vec::new())
+    }
+
+    fn fake_clash_with_conns(
+        proxies: Value,
+        delays: &[(&str, &[Option<u32>])],
+        conns: Vec<Value>,
+    ) -> FakeClash {
+        let mut conns: VecDeque<String> = conns.iter().map(Value::to_string).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("clash.sock");
+        let ul = tokio::net::UnixListener::bind(&sock).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut delays: HashMap<String, VecDeque<Option<u32>>> = delays
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.iter().copied().collect()))
+            .collect();
+        let body = proxies.to_string();
+        let lg = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = ul.accept().await {
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                let method = first.next().unwrap_or("").to_string();
+                let path = first
+                    .next()
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                lg.lock().unwrap().push(format!("{method} {path}"));
+                let delay_of = path
+                    .strip_prefix("/proxies/")
+                    .and_then(|p| p.strip_suffix("/delay"));
+                let (status, resp) = match (method.as_str(), delay_of) {
+                    ("GET", _) if path == "/proxies" => ("200 OK", body.clone()),
+                    ("GET", _) if path == "/connections" => {
+                        let snap = if conns.len() > 1 {
+                            conns.pop_front()
+                        } else {
+                            conns.front().cloned()
+                        };
+                        (
+                            "200 OK",
+                            snap.unwrap_or_else(|| "{\"connections\":[]}".into()),
+                        )
+                    }
+                    ("PUT", _) | ("DELETE", _) => ("204 No Content", String::new()),
+                    ("GET", Some(name)) => match delays.get_mut(name).and_then(|q| {
+                        if q.len() > 1 {
+                            q.pop_front().flatten()
+                        } else {
+                            q.front().copied().flatten()
+                        }
+                    }) {
+                        Some(d) => ("200 OK", format!("{{\"delay\":{d}}}")),
+                        None => (
+                            "503 Service Unavailable",
+                            "{\"message\":\"Timeout\"}".to_string(),
+                        ),
+                    },
+                    _ => ("404 Not Found", String::new()),
+                };
+                let msg = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                    resp.len()
+                );
+                let _ = s.write_all(msg.as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        FakeClash {
+            _dir: dir,
+            sock,
+            log,
+        }
+    }
+
+    fn three_node_group(now: &str) -> Value {
+        json!({"proxies": {
+            "G": {"type": "Selector", "now": now, "all": ["N1", "N2", "N3", SMART_HIDE_NODE]},
+            "N1": {"type": "Socks5"}, "N2": {"type": "Socks5"}, "N3": {"type": "Socks5"}
+        }})
+    }
+
+    fn state_with_history() -> GroupState {
+        let mut st = GroupState::default();
+        for n in ["N1", "N2", "N3"] {
+            st.push(n, Some(100));
+        }
+        st
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_backed_off_nodes_but_always_tests_the_anchor() {
+        let fc = fake_clash(
+            three_node_group("N1"),
+            &[("N1", &[Some(100)]), ("N2", &[None]), ("N3", &[Some(300)])],
+        );
+        let mut st = state_with_history();
+        let later = tokio::time::Instant::now() + Duration::from_secs(600);
+        for n in ["N1", "N2"] {
+            st.backoff.insert(
+                n.into(),
+                Backoff {
+                    streak: 5,
+                    until: Some(later),
+                },
+            );
+        }
+        let (stats, fixed) = (
+            SmartStats::default(),
+            crate::smart_fixed::SmartFixed::in_memory(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        let out = run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+            .await
+            .unwrap();
+        let req = fc.requests();
+        assert!(
+            req.contains(&"GET /proxies/N1/delay".to_string()),
+            "anchor must be tested even when backed off: {req:?}"
+        );
+        assert!(
+            !req.contains(&"GET /proxies/N2/delay".to_string()),
+            "backed-off node must be skipped: {req:?}"
+        );
+        assert!(
+            req.contains(&"GET /proxies/N3/delay".to_string()),
+            "{req:?}"
+        );
+        assert!(out.settled, "no switch and the anchor answered");
+        assert!(
+            !st.backoff.contains_key("N1"),
+            "a success clears the anchor's streak"
+        );
+        assert_eq!(st.anchor.as_ref().map(|m| m.name.as_str()), Some("N1"));
+    }
+
+    #[tokio::test]
+    async fn a_switch_makes_the_pass_unsettled_and_moves_the_anchor() {
+        let fc = fake_clash(
+            three_node_group("N1"),
+            &[("N1", &[None]), ("N2", &[Some(400)]), ("N3", &[Some(50)])],
+        );
+        let mut st = state_with_history();
+        let (stats, fixed) = (
+            SmartStats::default(),
+            crate::smart_fixed::SmartFixed::in_memory(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        let out = run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+            .await
+            .unwrap();
+        assert!(!out.settled, "a switch must reset the cadence");
+        assert!(fc.requests().contains(&"PUT /proxies/G".to_string()));
+        assert_eq!(st.anchor.as_ref().map(|m| m.name.as_str()), Some("N3"));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_dead_current_node_fails_over_despite_its_history() {
+        for missed_before in [true, false] {
+
+            let fc = fake_clash(
+                three_node_group("N1"),
+                &[("N1", &[None]), ("N2", &[Some(120)]), ("N3", &[None])],
+            );
+            let mut st = GroupState::default();
+            for _ in 0..7 {
+                st.push("N1", Some(100));
+            }
+            for d in [Some(100), None, None, None] {
+                st.push("N2", d);
+            }
+            for _ in 0..4 {
+                st.push("N3", None);
+            }
+            if missed_before {
+                st.backoff.insert(
+                    "N1".into(),
+                    Backoff {
+                        streak: 1,
+                        until: None,
+                    },
+                );
+            }
+            let (stats, fixed) = (
+                SmartStats::default(),
+                crate::smart_fixed::SmartFixed::in_memory(),
+            );
+            let (_tx, rx) = watch::channel(false);
+            let out = run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+                .await
+                .unwrap();
+            let req = fc.requests();
+            let n1_tests = req.iter().filter(|r| *r == "GET /proxies/N1/delay").count();
+            assert_eq!(
+                n1_tests,
+                if missed_before { 1 } else { 2 },
+                "a first failure is retested once, a repeat failure is not: {req:?}"
+            );
+            assert!(
+                req.contains(&"PUT /proxies/G".to_string()),
+                "missed before={missed_before}"
+            );
+            assert_eq!(st.anchor.as_ref().map(|m| m.name.as_str()), Some("N2"));
+            assert!(!out.settled);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_of_the_current_node_is_ignored() {
+        let fc = fake_clash(
+            three_node_group("N1"),
+            &[
+                ("N1", &[None, Some(100)]),
+                ("N2", &[Some(300)]),
+                ("N3", &[Some(300)]),
+            ],
+        );
+        let mut st = state_with_history();
+        let (stats, fixed) = (
+            SmartStats::default(),
+            crate::smart_fixed::SmartFixed::in_memory(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        let out = run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+            .await
+            .unwrap();
+        assert!(!fc.requests().contains(&"PUT /proxies/G".to_string()));
+        assert!(!st.hist["N1"].has_failures(), "the blip must not be scored");
+        assert!(!st.backoff.contains_key("N1"));
+        assert!(out.settled, "nothing changed in the end");
+    }
+
+    #[tokio::test]
+    async fn a_recovering_faster_node_keeps_the_cadence_fast() {
+        for (n2_delay, want_settled) in [(5, false), (500, true)] {
+            let fc = fake_clash(
+                three_node_group("N1"),
+                &[
+                    ("N1", &[Some(150)]),
+                    ("N2", &[Some(n2_delay)]),
+                    ("N3", &[None]),
+                ],
+            );
+            let mut st = GroupState::default();
+            for _ in 0..7 {
+                st.push("N1", Some(150));
+            }
+            for d in [Some(n2_delay), None, None, Some(n2_delay)] {
+                st.push("N2", d);
+            }
+            let later = tokio::time::Instant::now() + Duration::from_secs(600);
+            st.backoff.insert(
+                "N3".into(),
+                Backoff {
+                    streak: 9,
+                    until: Some(later),
+                },
+            );
+            let (stats, fixed) = (
+                SmartStats::default(),
+                crate::smart_fixed::SmartFixed::in_memory(),
+            );
+            let (_tx, rx) = watch::channel(false);
+            let out = run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+                .await
+                .unwrap();
+            assert!(
+                !fc.requests().contains(&"PUT /proxies/G".to_string()),
+                "N2 is still penalised for its misses"
+            );
+            assert_eq!(out.settled, want_settled, "N2 at {n2_delay}ms");
+        }
+    }
+
+    fn cc(
+        id: &str,
+        chains: &[&str],
+        up: u64,
+        down: u64,
+        typ: &str,
+    ) -> crate::clash_pull::ClashConn {
+        crate::clash_pull::ClashConn {
+            id: id.into(),
+            chains: chains.iter().map(|s| s.to_string()).collect(),
+            upload: up,
+            download: down,
+            inbound_type: typ.into(),
+            ..Default::default()
+        }
+    }
+
+    fn conn_json(id: &str, chains: &[&str], up: u64, down: u64) -> Value {
+        json!({"id": id, "chains": chains, "upload": up, "download": down, "metadata": {"type": "Socks5"}})
+    }
+
+    #[test]
+    fn only_this_groups_idle_or_stuck_connections_on_the_old_node_are_picked() {
+        let before = vec![
+            cc("idle", &["N1", "G"], 10, 20, "Socks5"),
+            cc("moving", &["N1", "G"], 10, 20, "Socks5"),
+            cc("nested", &["N1", "G", "OUTER"], 3, 3, "Socks5"),
+            cc("other-group", &["N1", "H"], 1, 1, "Socks5"),
+            cc("inner", &["N1", "G"], 1, 1, "Inner"),
+            cc("new-node", &["N2", "G"], 1, 1, "Socks5"),
+            cc("gone", &["N1", "G"], 5, 5, "Socks5"),
+        ];
+        let mut after = before.clone();
+        after.retain(|c| c.id != "gone");
+        after
+            .iter_mut()
+            .find(|c| c.id == "moving")
+            .unwrap()
+            .download = 25;
+        after.push(cc("fresh", &["N1", "G"], 0, 0, "Socks5"));
+        let (stalled, moving) = stalled_on("G", "N1", &before, &after);
+        assert_eq!(stalled, vec!["idle".to_string(), "nested".to_string()]);
+        assert_eq!(moving, vec!["moving".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failover_closes_stalled_connections_and_keeps_moving_ones() {
+        let snaps = vec![
+            json!({"connections": [conn_json("A", &["N1", "G"], 100, 100), conn_json("B", &["N1", "G"], 100, 100), conn_json("C", &["N2", "G"], 1, 1)]}),
+            json!({"connections": [conn_json("A", &["N1", "G"], 100, 100), conn_json("B", &["N1", "G"], 100, 500), conn_json("C", &["N2", "G"], 1, 1)]}),
+            json!({"connections": [conn_json("B", &["N1", "G"], 100, 900), conn_json("C", &["N2", "G"], 1, 1)]}),
+        ];
+        let fc = fake_clash_with_conns(
+            three_node_group("N1"),
+            &[("N1", &[None]), ("N2", &[Some(120)]), ("N3", &[None])],
+            snaps,
+        );
+        let mut st = GroupState::default();
+        for _ in 0..7 {
+            st.push("N1", Some(100));
+        }
+        st.backoff.insert(
+            "N1".into(),
+            Backoff {
+                streak: 1,
+                until: None,
+            },
+        );
+        st.push("N2", Some(100));
+        let (stats, fixed) = (
+            SmartStats::default(),
+            crate::smart_fixed::SmartFixed::in_memory(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let req = fc.requests();
+        assert!(req.contains(&"PUT /proxies/G".to_string()), "{req:?}");
+        assert_eq!(
+            req.iter()
+                .filter(|r| r.starts_with("GET /connections"))
+                .count(),
+            3,
+            "first look, then the stall check, then the recheck of the moving one: {req:?}"
+        );
+        assert!(
+            req.contains(&"DELETE /connections/A".to_string()),
+            "{req:?}"
+        );
+        assert!(
+            !req.iter()
+                .any(|r| r == "DELETE /connections/B" || r == "DELETE /connections/C"),
+            "{req:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_switch_leaves_old_connections_alone() {
+        let fc = fake_clash_with_conns(
+            three_node_group("N1"),
+            &[
+                ("N1", &[Some(300)]),
+                ("N2", &[Some(400)]),
+                ("N3", &[Some(50)]),
+            ],
+            vec![json!({"connections": [conn_json("A", &["N1", "G"], 1, 1)]})],
+        );
+        let mut st = state_with_history();
+        let (stats, fixed) = (
+            SmartStats::default(),
+            crate::smart_fixed::SmartFixed::in_memory(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        run_group_pass(&fc.sock, "G", "http://t/", &mut st, &stats, &fixed, &rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let req = fc.requests();
+        assert!(req.contains(&"PUT /proxies/G".to_string()), "{req:?}");
+        assert!(!req.iter().any(|r| r.contains("/connections")), "{req:?}");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_tests_only_the_anchor_and_flags_a_failure() {
+        let group = vec![SmartGroup {
+            name: "G".into(),
+            url: String::new(),
+        }];
+        for (anchor_up, want) in [(true, false), (false, true)] {
+            let n1 = [anchor_up.then_some(90)];
+            let fc = fake_clash(
+                three_node_group("N1"),
+                &[("N1", &n1), ("N2", &[Some(10)]), ("N3", &[Some(10)])],
+            );
+            let states: SharedStates = Arc::new(Mutex::new(HashMap::new()));
+            let mut st = state_with_history();
+            st.anchor = Some(Member {
+                name: "N1".into(),
+                provider: None,
+            });
+            lock_states(&states).insert("G".into(), st);
+            let (stats, fixed) = (
+                SmartStats::default(),
+                crate::smart_fixed::SmartFixed::in_memory(),
+            );
+            let failed =
+                check_anchors(&fc.sock, "http://t/", &group, &states, &stats, &fixed).await;
+            assert_eq!(failed, want, "anchor up={anchor_up}");
+            assert_eq!(fc.requests(), vec!["GET /proxies/N1/delay".to_string()]);
+            let g = lock_states(&states);
+            let st = g.get("G").expect("state must be put back");
+            assert!(
+                !st.hist["N1"].has_failures(),
+                "a failed check is not scored; the full sweep re-measures"
+            );
+            assert_eq!(st.hist["N1"].samples.len(), if anchor_up { 2 } else { 1 });
+        }
     }
 
     #[test]

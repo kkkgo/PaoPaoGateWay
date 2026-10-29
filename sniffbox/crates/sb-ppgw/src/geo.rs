@@ -145,16 +145,17 @@ struct FileOutcome {
 
 async fn update_one(f: &GeoFile, dir: &Path, rv: &Option<String>, sv: String) -> FileOutcome {
 
-    if let Some(rv) = rv {
-        if !sv.is_empty() && sv == *rv {
-            return FileOutcome {
-                name: f.local.into(),
-                status: GeoStatus::UpToDate,
-                display_version: sv,
-                commit_version: None,
-                changed: false,
-            };
-        }
+    if let Some(rv) = rv
+        && !sv.is_empty()
+        && sv == *rv
+    {
+        return FileOutcome {
+            name: f.local.into(),
+            status: GeoStatus::UpToDate,
+            display_version: sv,
+            commit_version: None,
+            changed: false,
+        };
     }
 
     let Some(rh) = remote_sha256(f).await else {

@@ -125,10 +125,10 @@ mod tests {
                 g.map.insert(b, sb);
                 g.order.push_back(b);
 
-                if g.map.len() >= cache.cap {
-                    if let Some(ev) = g.order.pop_front() {
-                        g.map.remove(&ev);
-                    }
+                if g.map.len() >= cache.cap
+                    && let Some(ev) = g.order.pop_front()
+                {
+                    g.map.remove(&ev);
                 }
                 g.map.insert(c, sc);
                 g.order.push_back(c);

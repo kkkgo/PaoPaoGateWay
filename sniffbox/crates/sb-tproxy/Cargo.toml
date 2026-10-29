@@ -4,12 +4,10 @@
 name          = "sb-tproxy"
 version       = { workspace = true }
 edition       = { workspace = true }
-rust-version  = { workspace = true }
 license       = { workspace = true }
 
 [dependencies]
 tokio     = { workspace = true }
-nix       = { workspace = true }
 socket2   = { workspace = true }
 libc      = { workspace = true }
 tracing   = { workspace = true }

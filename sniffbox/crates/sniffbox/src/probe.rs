@@ -57,7 +57,7 @@ impl Permit {
 
     fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_INFLIGHT).then_some(n + 1)
             })
             .ok()
@@ -131,6 +131,43 @@ mod tests {
             "permit drop should return quota"
         );
         assert!(Permit::acquire(&p.inflight).is_some());
+    }
+
+    #[test]
+    fn concurrent_acquire_never_exceeds_cap() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let (counter, peak) = (Arc::clone(&counter), Arc::clone(&peak));
+                std::thread::spawn(move || {
+                    let mut granted = 0usize;
+                    for _ in 0..20_000 {
+                        if let Some(permit) = Permit::acquire(&counter) {
+                            peak.fetch_max(counter.load(Ordering::Acquire), Ordering::AcqRel);
+                            for _ in 0..32 {
+                                std::hint::spin_loop();
+                            }
+                            drop(permit);
+                            granted += 1;
+                        }
+                    }
+                    granted
+                })
+            })
+            .collect();
+        let granted: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert!(granted > 0, "no permit was ever granted");
+        let peak = peak.load(Ordering::Acquire);
+        assert!(
+            peak <= MAX_INFLIGHT,
+            "inflight peaked at {peak} (cap {MAX_INFLIGHT})"
+        );
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "every permit should have been returned"
+        );
     }
 
     #[tokio::test]

@@ -68,7 +68,6 @@ load_ini() {
     if [ -s "$PPGW_ENV.err" ]; then
         while read -r ini_err_line; do ppgwecho "$ini_err_line"; done <"$PPGW_ENV.err"
     fi
-    rm -f "$PPGW_ENV.err"
     if [ "$ini_rc" = "0" ]; then
         mv "$PPGW_ENV.new" "$PPGW_ENV"
     else
@@ -119,14 +118,28 @@ capture_old_box() {
     old_socks5_password=$socks5_password
 }
 
+reload_env() {
+    if [ -f "$PPGW_INI" ] && [ -f "$PPGW_ENV" ]; then
+        . "$PPGW_ENV"
+        apply_defaults
+        return 0
+    fi
+    load_ini
+}
+
 load_baseline() {
     load_ini
+    baseline_ini_rc=$?
     capture_old_all
     if [ -f "$SNIFFBOX_SNAPSHOT" ]; then
         . "$SNIFFBOX_SNAPSHOT" 2>"$PPGWTTY"
         apply_defaults
         capture_old_box
-        load_ini
+        if [ "$baseline_ini_rc" = "0" ]; then
+            reload_env
+        else
+            load_ini
+        fi
     fi
 }
 
@@ -150,44 +163,160 @@ require_ini() {
     return 0
 }
 
+clock_sync() {
+    set -- $(date +"%s %z" 2>/dev/null)
+    case "$1" in '' | *[!0-9]*) clock_epoch="" && return ;; esac
+    case "$2" in [+-][0-9][0-9][0-9][0-9]) ;; *) clock_epoch="" && return ;; esac
+    clock_epoch=$1
+    read -r clock_up _ </proc/uptime
+    clock_up=${clock_up%.*}
+    clock_tzh=${2#?}
+    clock_tzh=${clock_tzh%??}
+    clock_tzm=${2#???}
+    clock_off=$((${clock_tzh#0} * 3600 + ${clock_tzm#0} * 60))
+    case "$2" in -*) clock_off=$((0 - clock_off)) ;; esac
+}
+
+log_ts() {
+    read -r log_up _ </proc/uptime
+    log_up=${log_up%.*}
+    if [ -z "$clock_epoch" ] || [ $((log_up - clock_up)) -ge 60 ]; then
+        clock_sync
+    fi
+    if [ -z "$clock_epoch" ]; then
+        log_hms=$(date +%H%M%S)
+        return
+    fi
+    log_s=$(((clock_epoch + log_up - clock_up + clock_off) % 86400))
+    log_h=$((log_s / 3600))
+    log_m=$((log_s / 60 % 60))
+    log_s=$((log_s % 60))
+    [ "$log_h" -lt 10 ] && log_h=0$log_h
+    [ "$log_m" -lt 10 ] && log_m=0$log_m
+    [ "$log_s" -lt 10 ] && log_s=0$log_s
+    log_hms=$log_h$log_m$log_s
+}
+
 log() {
     log_msg=$1
     log_type=$2
+    log_ts
     if [ "$log_type" = "warn" ]; then
-        ppgwecho "\033[31m[PaoPaoGW $(date +%H%M%S)]\033[0m ""$log_msg"
+        ppgwecho "\033[31m[PaoPaoGW $log_hms]\033[0m ""$log_msg"
         return 0
     fi
     if [ "$log_type" = "succ" ]; then
-        ppgwecho "\033[32m[PaoPaoGW $(date +%H%M%S)]\033[0m ""$log_msg"
+        ppgwecho "\033[32m[PaoPaoGW $log_hms]\033[0m ""$log_msg"
         return 0
     fi
-    ppgwecho "[PaoPaoGW $(date +%H%M%S)] ""$1"
+    ppgwecho "[PaoPaoGW $log_hms] ""$1"
+}
+
+
+read_dns() {
+    dns1=""
+    dns2=""
+    [ -f /etc/resolv.conf ] || return 0
+    while read -r rd_key rd_val _ || [ -n "$rd_key" ]; do
+        [ "$rd_key" = "nameserver" ] || continue
+        case "$rd_val" in '' | *[!0-9.]*) continue ;; esac
+        [ -z "$dns1" ] && dns1=$rd_val
+        dns2=$rd_val
+    done </etc/resolv.conf
+}
+
+read_gw() {
+    gw_first=""
+    eth0gw=""
+    rg_routes=$(ip route show 2>/dev/null)
+    while IFS= read -r rg_line; do
+        case "$rg_line" in "default via "*) ;; *) continue ;; esac
+        rg_ip=${rg_line#default via }
+        rg_ip=${rg_ip%% *}
+        [ -z "$gw_first" ] && gw_first=$rg_ip
+        case "$rg_line" in *eth0*) [ -z "$eth0gw" ] && eth0gw=$rg_ip ;; esac
+    done <<EOF
+$rg_routes
+EOF
+}
+
+read_hour_date() {
+    set -- $(date +"%H %Y-%m-%d")
+    current_hour=$1
+    current_date=$2
+}
+
+
+last_key_line() {
+    kl_line=""
+    [ -f "$1" ] || return 0
+    while IFS= read -r kl_l || [ -n "$kl_l" ]; do
+        case "$kl_l" in "$2"*) ;; *) continue ;; esac
+        if [ "$3" != "prefix" ]; then
+            kl_rest=${kl_l#"$2"}
+            kl_rest=${kl_rest#"${kl_rest%%[! ]*}"}
+            case "$kl_rest" in =*) ;; *) continue ;; esac
+        fi
+        kl_line=$kl_l
+    done <"$1"
+}
+
+kv_is() {
+    case "$1" in "$2=$3"* | "$2=\"$3"* | "$2='$3"*) return 0 ;; esac
+    return 1
+}
+
+is_ppsub_url() {
+    case "$1" in ppsub@*) return 0 ;; esac
+    return 1
 }
 
 net_ready() {
-    while ! ip addr show dev eth0 | grep -q 'inet '; do
+    while :; do
+        nr_addr=$(ip -4 addr show dev eth0 2>/dev/null)
+        case "$nr_addr" in *"inet "*) break ;; esac
         log "Waiting for eth0 to be ready." warn
         sleep 1
     done
-    eth0ip=$(ip -4 addr show dev eth0 scope global | grep inet | grep -Eo "$IPREX4" | head -1)
+    eth0ip=""
+    while IFS= read -r nr_line; do
+        case "$nr_line" in *"inet "*"scope global"*) ;; *) continue ;; esac
+        nr_line=${nr_line#*inet }
+        eth0ip=${nr_line%%/*}
+        break
+    done <<EOF
+$nr_addr
+EOF
     export eth0ip
-    eth0mac=$(ip link show dev eth0 | grep -Eo "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" | head -1)
-    dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
-    dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
+    eth0mac=""
+    [ -r /sys/class/net/eth0/address ] && read -r eth0mac </sys/class/net/eth0/address
+    read_dns
     if [ -z "$dns1" ]; then
         log "Error: eth0 DNS not found." warn
     fi
     if [ "$dns1" != "$dns2" ]; then
-        if echo "$dns2" | grep -qEo "$IPREX4"; then
+        if [ -n "$dns2" ]; then
             eth0dns="$dns1 $dns2"
         fi
     else
         eth0dns="$dns1"
     fi
-    eth0gw=$(ip r | grep eth0 | grep "default via" | grep -Eo "$IPREX4" | head -1)
-    log "eth0 ready: IP:[""$eth0ip""] MAC:[""$eth0mac""]" succ
-    log "            DNS:[""$eth0dns""] GW:[""$eth0gw""]" succ
-    if grep -q eth06 /etc/config/network; then
+    read_gw
+
+
+    read -r nr_up _ </proc/uptime
+    nr_up=${nr_up%.*}
+    if [ "$eth0ip|$eth0mac|$eth0dns|$eth0gw" != "$net_ready_shown" ] || [ -z "$net_ready_at" ] || [ $((nr_up - net_ready_at)) -ge 20 ]; then
+        log "eth0 ready: IP:[""$eth0ip""] MAC:[""$eth0mac""]" succ
+        log "            DNS:[""$eth0dns""] GW:[""$eth0gw""]" succ
+        net_ready_shown="$eth0ip|$eth0mac|$eth0dns|$eth0gw"
+        net_ready_at=$nr_up
+    fi
+    if [ -z "$net_v6" ]; then
+        net_v6=0
+        grep -q eth06 /etc/config/network && net_v6=1
+    fi
+    if [ "$net_v6" = "1" ]; then
         eth0ip6=$(ip -6 addr show dev eth0 scope global | grep inet6 | grep -Eo "$PUBIPREX6" | head -1)
         if [ -n "$eth0ip6" ]; then
             export eth0ip6
@@ -371,7 +500,7 @@ load_clash() {
         new_node=$(ppgw -now_node 2>"$PPGWTTY")
         if [ "$PPGW_FORCE_CLOSEALL" = "1" ]; then
             closeall_flag="yes"
-        elif [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
+        elif [ "$mode" = "suburl" ] && is_ppsub_url "$suburl"; then
             new_ppsub_hash=$(md5sum /etc/config/clash/clash-dashboard/data/ppsub.json 2>/dev/null | cut -d' ' -f1)
             if [ "$old_ppsub_hash" != "$new_ppsub_hash" ]; then
                 closeall_flag="yes"
@@ -473,6 +602,15 @@ gen_hash() {
     fi
 }
 
+gen_hash_into() {
+    if load_ini; then
+        set -- $(md5sum "$PPGW_ENV")
+        hash=$1
+    else
+        hash="INI does not exist"
+    fi
+}
+
 gen_yaml_hash() {
     calcfile=$1
     if [ -f "$calcfile" ]; then
@@ -498,13 +636,16 @@ get_conf() {
     down_type=$2
     submode_flag=""
     if [ -f /tmp/ppgw.ini ]; then
-        submode_flag=$(grep -E "^mode" /tmp/ppgw.ini | tail -1)
+        last_key_line /tmp/ppgw.ini mode prefix
+        submode_flag=$kl_line
     fi
-    if echo "$down_url" | grep -qEo "^ppsub@"; then
-        down_url=$(echo "$down_url" | sed "s/^ppsub@//g")
+    case "$down_url" in
+    ppsub@*)
+        down_url=${down_url#ppsub@}
         down_type=ppsub
-    fi
-    if echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && [ -f /www/ppsub.json ]; then
+        ;;
+    esac
+    if kv_is "$submode_flag" mode suburl && [ -f /www/ppsub.json ]; then
         down_type="ppsub"
     fi
     apply_defaults
@@ -514,9 +655,11 @@ get_conf() {
                 log "Load local ppgw.ini" succ
             else
                 cp /www/ppgw.ini /tmp/ppgw.ini.tmp
-                submode_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^mode[ ]*=" | tail -1)
-                suburl_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^suburl[ ]*=" | tail -1)
-                if (echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && echo "$suburl_flag" | grep -E -q "^suburl=[\"']?ppsub@") || echo "$submode_flag" | grep -E -q "^mode=[\"']?free[\"']?"; then
+                last_key_line /tmp/ppgw.ini.tmp mode
+                submode_flag=$kl_line
+                last_key_line /tmp/ppgw.ini.tmp suburl
+                suburl_flag=$kl_line
+                if { kv_is "$submode_flag" mode suburl && kv_is "$suburl_flag" suburl ppsub@; } || kv_is "$submode_flag" mode free; then
                     grep -v "^fast_node" "/tmp/ppgw.ini.tmp" >"/tmp/ppgw.ini"
                     echo 'fast_node=no' >>"/tmp/ppgw.ini"
                     echo 'fall_direct=no' >>"/tmp/ppgw.ini"
@@ -547,11 +690,11 @@ get_conf() {
         cp /www/ppsub.json "$file_down_tmp"
         log "Load local ppsub.json" succ
     else
-        load_ini
+        reload_env
         echo "127.0.0.1 localhost" >/etc/hosts
-        if echo "$down_url" | grep -qE "^http://paopao\.dns([:/]|$)"; then
-            dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
-            dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
+        case "$down_url" in http://paopao.dns | http://paopao.dns:* | http://paopao.dns/*) down_paopao=1 ;; *) down_paopao=0 ;; esac
+        if [ "$down_paopao" = "1" ]; then
+            read_dns
             genHost_p1=$(ppgw -server "$dns1" -port "53" -rawURL "$down_url" | cut -d" " -f1)
             genHost_p2=$(ppgw -server "$dns2" -port "53" -rawURL "$down_url" | cut -d" " -f1)
             genHost_p3=$(ppgw -server "$dns_ip" -port "$dns_port" -rawURL "$down_url" | cut -d" " -f1)
@@ -570,19 +713,23 @@ get_conf() {
             fi
             echo "$genHost" >>/etc/hosts
         fi
-        if echo "$down_url" | grep https; then
+        case "$down_url" in
+        *https*)
+            echo "$down_url"
             sync_ntp
-        fi
+            clock_sync
+            ;;
+        esac
         ppgw -downURL "$down_url" -output "$file_down_tmp" >"$PPGWTTY" 2>&1
     fi
     echo "127.0.0.1 localhost" >/etc/hosts
     if [ "$down_type" = "ini" ]; then
-        if head -1 "$file_down_tmp" | grep -q "#paopao-gateway"; then
+        gc_first=""
+        [ -f "$file_down_tmp" ] && IFS= read -r gc_first <"$file_down_tmp"
+        case "$gc_first" in *"#paopao-gateway"*) gc_head_ok=1 ;; *) gc_head_ok=0 ;; esac
+        if [ "$gc_head_ok" = "1" ]; then
             checkflag=0
-            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+="[^\"]+$' >"$PPGWTTY" 2>&1; then
-                checkflag=1
-            fi
-            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E '^[_a-zA-Z0-9]+=[^"]+"$' >"$PPGWTTY" 2>&1; then
+            if sed 's/\r/\n/g' "$file_down_tmp" | grep -E -e '^[_a-zA-Z0-9]+="[^\"]+$' -e '^[_a-zA-Z0-9]+=[^"]+"$' >"$PPGWTTY" 2>&1; then
                 checkflag=1
             fi
             if [ "$checkflag" = "1" ]; then
@@ -591,9 +738,11 @@ get_conf() {
             fi
             cp "$file_down_tmp" "$file_down"
             sed 's/\r/\n/g' "$file_down" | grep -E "^[_a-zA-Z0-9]+=" >"/tmp/ppgw.ini.tmp"
-            submode_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^mode[ ]*=" | tail -1)
-            suburl_flag=$(cat "/tmp/ppgw.ini.tmp" | grep -E "^suburl[ ]*=" | tail -1)
-            if (echo "$submode_flag" | grep -E -q "^mode=[\"']?suburl[\"']?" && echo "$suburl_flag" | grep -E -q "^suburl=[\"']?ppsub@") || echo "$submode_flag" | grep -E -q "^mode=[\"']?free[\"']?"; then
+            last_key_line /tmp/ppgw.ini.tmp mode
+            submode_flag=$kl_line
+            last_key_line /tmp/ppgw.ini.tmp suburl
+            suburl_flag=$kl_line
+            if { kv_is "$submode_flag" mode suburl && kv_is "$suburl_flag" suburl ppsub@; } || kv_is "$submode_flag" mode free; then
                 grep -v "^fast_node" "/tmp/ppgw.ini.tmp" >"/tmp/ppgw.ini"
                 echo 'fast_node=no' >>"/tmp/ppgw.ini"
                 echo 'fall_direct=no' >>"/tmp/ppgw.ini"
@@ -661,9 +810,9 @@ get_conf() {
 
 try_conf() {
     net_ready
-    export gw=$(ip route show | grep "default via" | head -1 | grep -Eo "$IPREX4" | head -1)
-    dns1=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | head -1)
-    dns2=$(grep nameserver /etc/resolv.conf | grep -Eo "$IPREX4" | tail -1)
+    # net_ready just read the routes and resolv.conf: gw_first / dns1 / dns2 are current.
+    gw=$gw_first
+    export gw
     conf_port=7889
     conf_name=$1
     down_type=$2
@@ -704,7 +853,8 @@ try_conf() {
         return 0
     fi
 
-    if echo "$conf_name" | grep -qiE "^https?://"; then
+    case "$conf_name" in [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*) conf_is_url=1 ;; *) conf_is_url=0 ;; esac
+    if [ "$conf_is_url" = "1" ]; then
         log "Get ""$conf_name"" from remote URL"
         get_conf "$conf_name" "$down_type"
         return $?
@@ -975,7 +1125,7 @@ while true; do
         sleep 30
         continue
     fi
-    hash=$(gen_hash)
+    gen_hash_into
     log "[OLD PPGW HASH]: ""$last_hash"
     log "[NEW PPGW HASH]: ""$hash"
     if [ "$hash" != "$last_hash" ]; then
@@ -1113,7 +1263,7 @@ while true; do
         load_box
         if pidof clash >/dev/null 2>&1; then
             log "Clash Running OK." succ
-            if [ "$mode" = "suburl" ] && echo "$suburl" | grep -qEo "^ppsub@"; then
+            if [ "$mode" = "suburl" ] && is_ppsub_url "$suburl"; then
                 ppgw -healthcheck "/etc/config/clash/clash-dashboard/data/ppsub.json" >"$PPGWTTY" 2>&1
                 hc_rc=$?
                 if [ "$hc_rc" -eq 0 ]; then
@@ -1150,7 +1300,7 @@ while true; do
             elif [ "$fast_node" = "check" ]; then
                 # ppsub has its own global health check, skip fast_node=check proxy test
                 if [ "$mode" = "suburl" ]; then
-                    if ! echo "$suburl" | grep -qEo "^ppsub@"; then
+                    if ! is_ppsub_url "$suburl"; then
                         do_proxytest=1
                     fi
                 else
@@ -1190,16 +1340,21 @@ while true; do
         sleep_count=$((sleep_count + 1))
     fi
     if [ "$mode" = "suburl" ]; then
-        load_ini
-        current_hour=$(date +%H)
-        current_date=$(date +%Y-%m-%d)
-        if echo "$subcron" | grep -Eqo '^(1[0-9]|2[0-3]|[0-9])$'; then
+        reload_env
+        read_hour_date
+        case "$subcron" in [0-9] | 1[0-9] | 2[0-3]) subcron_ok=1 ;; *) subcron_ok=0 ;; esac
+        if [ "$subcron_ok" = "1" ]; then
             ppgw_subtime=6000
-            if [ "$current_hour" -lt "$subcron" ]; then
-                next_run=$(date +"%Y-%m-%d ${subcron}:XX")
-            else
-                tomorrow=$(date +%Y-%m-%d -d @$(($(date +%s) + 86400)) 2>/dev/null || date -v+1d +%Y-%m-%d 2>/dev/null)
-                next_run="${tomorrow} ${subcron}:XX"
+            ppgw_subtime_for=""
+            if [ "$current_hour" -lt "$subcron" ]; then next_run_key="$current_date|before|$subcron"; else next_run_key="$current_date|after|$subcron"; fi
+            if [ "$next_run_key" != "$next_run_cached" ]; then
+                if [ "$current_hour" -lt "$subcron" ]; then
+                    next_run=$(date +"%Y-%m-%d ${subcron}:XX")
+                else
+                    tomorrow=$(date +%Y-%m-%d -d @$(($(date +%s) + 86400)) 2>/dev/null || date -v+1d +%Y-%m-%d 2>/dev/null)
+                    next_run="${tomorrow} ${subcron}:XX"
+                fi
+                next_run_cached=$next_run_key
             fi
             log "[SUBCRON][NEXT SUB-TIME] ""$next_run""" warn
             if [ "$current_hour" -eq "$subcron" ]; then
@@ -1210,7 +1365,10 @@ while true; do
             fi
         else
             subcron=""
-            ppgw_subtime=$(ppgw -interval "$subtime" -sleeptime 30)
+            if [ -z "$ppgw_subtime" ] || [ "$subtime" != "$ppgw_subtime_for" ]; then
+                ppgw_subtime=$(ppgw -interval "$subtime" -sleeptime 30)
+                ppgw_subtime_for=$subtime
+            fi
             log "[SUBTIME][NEXT SUB-TIME] ""$sleep_count""/""$ppgw_subtime"""
         fi
         if [ "$sleep_count" -ge "$ppgw_subtime" ]; then

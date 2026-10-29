@@ -53,6 +53,8 @@ pub struct InboundCfg {
     pub splice_threshold: u64,
     pub udp: bool,
     pub udp_idle: Duration,
+    pub udp_max_sessions: usize,
+    pub udp_reserved_sessions: usize,
 
     pub udp_workers: usize,
 
@@ -63,6 +65,8 @@ pub struct InboundCfg {
     pub tune_sysctl: bool,
 
     pub tune_nic: bool,
+
+    pub tune_rps: bool,
 }
 impl Default for InboundCfg {
     fn default() -> Self {
@@ -74,11 +78,14 @@ impl Default for InboundCfg {
             splice_threshold: 1024 * 1024,
             udp: true,
             udp_idle: Duration::from_secs(60),
+            udp_max_sessions: crate::udp_budget::default_sessions(),
+            udp_reserved_sessions: crate::udp_budget::DEFAULT_RESERVED,
             udp_workers: default_udp_workers(),
             tcp_workers: default_udp_workers(),
             spoof_cache_cap: 1024,
             tune_sysctl: true,
             tune_nic: true,
+            tune_rps: true,
         }
     }
 }
@@ -665,6 +672,12 @@ fn parse_inbound(sec: Option<&Section>) -> Result<InboundCfg, ConfigErr> {
         let n: usize = parse_num("inbound", "udp_workers", v)?;
         c.udp_workers = n.max(1);
     }
+    if let Some(v) = get(sec, "udp_max_sessions") {
+        c.udp_max_sessions = parse_num::<usize>("inbound", "udp_max_sessions", v)?.max(1);
+    }
+    if let Some(v) = get(sec, "udp_reserved_sessions") {
+        c.udp_reserved_sessions = parse_num::<usize>("inbound", "udp_reserved_sessions", v)?.max(1);
+    }
     if let Some(v) = get(sec, "tcp_workers") {
         let n: usize = parse_num("inbound", "tcp_workers", v)?;
         c.tcp_workers = n.clamp(1, 64);
@@ -678,6 +691,9 @@ fn parse_inbound(sec: Option<&Section>) -> Result<InboundCfg, ConfigErr> {
     }
     if let Some(v) = get(sec, "tune_nic") {
         c.tune_nic = parse_bool("inbound", "tune_nic", v)?;
+    }
+    if let Some(v) = get(sec, "tune_rps") {
+        c.tune_rps = parse_bool("inbound", "tune_rps", v)?;
     }
     Ok(c)
 }
@@ -937,6 +953,25 @@ fn parse_cloudflared(sec: Option<&Section>) -> Result<CloudflaredCfg, ConfigErr>
 mod tests {
     use super::*;
 
+    #[test]
+    fn udp_global_limits_parse_and_reject_malformed_values() {
+        let cfg =
+            Config::from_text("[inbound]\nudp_max_sessions=73\nudp_reserved_sessions=9\n").unwrap();
+        assert_eq!(cfg.inbound.udp_max_sessions, 73);
+        assert_eq!(cfg.inbound.udp_reserved_sessions, 9);
+        assert!(Config::from_text("[inbound]\nudp_max_sessions=-1\n").is_err());
+        assert!(Config::from_text("[inbound]\nudp_reserved_sessions=abc\n").is_err());
+        let zero =
+            Config::from_text("[inbound]\nudp_max_sessions=0\nudp_reserved_sessions=0\n").unwrap();
+        assert_eq!(
+            (
+                zero.inbound.udp_max_sessions,
+                zero.inbound.udp_reserved_sessions
+            ),
+            (1, 1)
+        );
+    }
+
     const MIN_INI: &str = r#"
         [inbound]
         listen = 127.0.0.1:1081
@@ -1016,6 +1051,15 @@ mod tests {
         assert!(cfg.inbound.tune_nic);
         let off = Config::from_ini(parse_ini("[inbound]\ntune_nic = false\n").unwrap()).unwrap();
         assert!(!off.inbound.tune_nic);
+    }
+
+    #[test]
+    fn tune_rps_defaults_true_and_parses() {
+        let cfg = Config::from_ini(parse_ini("").unwrap()).unwrap();
+        assert!(cfg.inbound.tune_rps);
+        let off = Config::from_ini(parse_ini("[inbound]\ntune_rps = false\n").unwrap()).unwrap();
+        assert!(!off.inbound.tune_rps);
+        assert!(off.inbound.tune_nic, "tune_rps must not toggle tune_nic");
     }
 
     #[test]

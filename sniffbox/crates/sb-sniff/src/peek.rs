@@ -89,6 +89,25 @@ impl PeekBuf {
         }
     }
 
+    pub fn from_prefix(data: &[u8]) -> Self {
+        if data.is_empty() {
+            return Self::empty();
+        }
+        Self {
+            buf: BytesMut::from(data),
+            limit: data.len(),
+            pool: None,
+        }
+    }
+
+    pub fn seed(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.buf.extend_from_slice(data);
+        self.limit = self.limit.max(self.buf.len());
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.buf
     }

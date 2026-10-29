@@ -265,7 +265,7 @@ pub fn prefetch_with<F>(
     fetch: F,
 ) -> PrefetchReport
 where
-    F: Fn(&str, &str) -> Result<Vec<u8>, String>,
+    F: Fn(&str, &str) -> Result<Vec<u8>, String> + Sync,
 {
     let mut report = PrefetchReport::default();
     let content = match std::fs::read_to_string(clash_yaml) {
@@ -285,32 +285,64 @@ where
         .collect();
     report.removed = cleanup_dir(dir, &keep);
 
-    let mut backfills: HashMap<String, String> = HashMap::new();
+    let mut paths = HashMap::new();
+    let mut groups: Vec<Vec<&Provider>> = Vec::new();
     for p in &providers {
-        let path = Path::new(&p.path);
-        if is_fresh(path, p.interval) {
-            report.cached += 1;
-            if let Ok(bytes) = std::fs::read(path) {
-                note_format(&mut backfills, p, auto, &bytes);
-            }
-            continue;
-        }
-        let tmp = format!("{}.tmp", p.path);
-        match fetch(&p.url, &tmp) {
-            Ok(bytes) => {
-                note_format(&mut backfills, p, auto, &bytes);
-                if std::fs::rename(&tmp, &p.path).is_ok() {
-                    report.downloaded += 1;
-                } else {
-                    let _ = std::fs::remove_file(&tmp);
-                    report.failed += 1;
-                }
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&tmp);
-                report.failed += 1;
-            }
-        }
+        let index = *paths.entry(&p.path).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[index].push(p);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..PREFETCH_CONCURRENCY.min(groups.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = PrefetchReport::default();
+                    let mut backfills = HashMap::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(group) = groups.get(i) else {
+                            break;
+                        };
+                        for p in group {
+                            let path = Path::new(&p.path);
+                            if is_fresh(path, p.interval) {
+                                local.cached += 1;
+                                if let Ok(bytes) = std::fs::read(path) {
+                                    note_format(&mut backfills, p, auto, &bytes);
+                                }
+                                continue;
+                            }
+                            let tmp = format!("{}.tmp", p.path);
+                            match fetch(&p.url, &tmp) {
+                                Ok(bytes) if std::fs::rename(&tmp, &p.path).is_ok() => {
+                                    note_format(&mut backfills, p, auto, &bytes);
+                                    local.downloaded += 1;
+                                }
+                                _ => {
+                                    let _ = std::fs::remove_file(&tmp);
+                                    local.failed += 1;
+                                }
+                            }
+                        }
+                    }
+                    (local, backfills)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("prefetch worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut backfills = HashMap::new();
+    for (local, formats) in results {
+        report.cached += local.cached;
+        report.downloaded += local.downloaded;
+        report.failed += local.failed;
+        backfills.extend(formats);
     }
 
     if let Some(new_content) = backfill_formats(&content, &backfills)
@@ -320,6 +352,8 @@ where
     }
     report
 }
+
+const PREFETCH_CONCURRENCY: usize = 4;
 
 pub const PREFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -661,6 +695,119 @@ rule-providers:
         assert!(!p.exists(), "failure leaves no half-done artifacts");
         assert!(!dir.join("a.yaml.tmp").exists(), "tmp cleaned");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefetch_runs_four_downloads_concurrently_and_never_more() {
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let config = dir.path().join("clash.yaml");
+        let mut yaml = "rule-providers:\n".to_string();
+        for i in 0..9 {
+            yaml.push_str(&format!(
+                "  p{i}:\n    type: http\n    url: http://rules/{i}\n    path: {}\n",
+                cache.join(format!("{i}.txt")).display()
+            ));
+        }
+        std::fs::write(&config, yaml).unwrap();
+
+        let gate = (Mutex::new(false), Condvar::new());
+        let (entered, entries) = std::sync::mpsc::channel();
+        let (report, first_wave, extra) = std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                prefetch_with(
+                    config.to_str().unwrap(),
+                    cache.to_str().unwrap(),
+                    &HashSet::new(),
+                    |url, tmp| {
+                        entered.send(()).unwrap();
+                        let (lock, cv) = &gate;
+                        let (release, timeout) = cv
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                Duration::from_secs(3),
+                                |open| !*open,
+                            )
+                            .unwrap();
+                        assert!(
+                            !timeout.timed_out(),
+                            "test coordinator must release fetches"
+                        );
+                        drop(release);
+                        let body = if url.ends_with("/8") {
+                            b"partial".as_slice()
+                        } else {
+                            b"DOMAIN,example.com\n"
+                        };
+                        std::fs::write(tmp, body).unwrap();
+                        if url.ends_with("/8") {
+                            Err("injected failure".into())
+                        } else {
+                            Ok(body.to_vec())
+                        }
+                    },
+                )
+            });
+            let mut first_wave = 0;
+            for _ in 0..4 {
+                if entries.recv_timeout(Duration::from_secs(1)).is_err() {
+                    break;
+                }
+                first_wave += 1;
+            }
+            let extra = entries.recv_timeout(Duration::from_millis(50)).is_ok();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            (run.join().unwrap(), first_wave, extra)
+        });
+        assert_eq!(first_wave, 4, "fetches must overlap");
+        assert!(!extra, "at most four fetches may be active");
+        assert_eq!(
+            (report.downloaded, report.failed, report.backfilled),
+            (8, 1, 8)
+        );
+        assert!(!cache.join("8.txt").exists());
+        assert!(!cache.join("8.txt.tmp").exists());
+        let formats = formats_of(&config);
+        for i in 0..8 {
+            assert_eq!(formats[&format!("p{i}")], "text");
+        }
+    }
+
+    #[test]
+    fn prefetch_shared_path_is_downloaded_once_and_backfills_both_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let config = dir.path().join("clash.yaml");
+        let path = cache.join("shared.txt");
+        let mut yaml = "rule-providers:\n".to_string();
+        for name in ["a", "b"] {
+            yaml.push_str(&format!("  {name}:\n    type: http\n    url: http://rules/same\n    path: {}\n    interval: 3600\n", path.display()));
+        }
+        std::fs::write(&config, yaml).unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let report = prefetch_with(
+            config.to_str().unwrap(),
+            cache.to_str().unwrap(),
+            &HashSet::new(),
+            |_, tmp| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let body = b"payload:\n  - example.com\n";
+                std::fs::write(tmp, body).unwrap();
+                Ok(body.to_vec())
+            },
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            (report.downloaded, report.cached, report.backfilled),
+            (1, 1, 2)
+        );
+        assert_eq!(formats_of(&config)["a"], "yaml");
+        assert_eq!(formats_of(&config)["b"], "yaml");
     }
 
     #[test]

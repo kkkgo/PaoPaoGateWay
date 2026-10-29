@@ -140,6 +140,12 @@ impl WebProxies {
                         .collect()
                 })
                 .unwrap_or_default();
+
+        let subs = if crate::runtime::ppsub_active() {
+            sb_ppgw::ppsub::subinfo::load(&sb_ppgw::ppsub::subinfo::file())
+        } else {
+            Vec::new()
+        };
         Some(build_trimmed(
             &px,
             &pv,
@@ -148,6 +154,7 @@ impl WebProxies {
             &smart_urls,
             &|g| self.smart_stats.group_scores(g),
             &self.smart_fixed.all(),
+            &subs,
         ))
     }
 
@@ -323,6 +330,7 @@ pub(crate) fn pct_encode_segment(s: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_trimmed(
     proxies_raw: &RawProxies,
     providers_raw: &RawProviders,
@@ -331,6 +339,7 @@ pub(crate) fn build_trimmed(
     smart_urls: &HashMap<String, String>,
     smart_scores: &dyn Fn(&str) -> Option<Value>,
     smart_fixed: &HashMap<String, String>,
+    subs: &[sb_ppgw::ppsub::subinfo::Entry],
 ) -> String {
     let mut proxies = Map::new();
     for (name, p) in &proxies_raw.proxies {
@@ -400,7 +409,31 @@ pub(crate) fn build_trimmed(
     root.insert("testUrl".into(), Value::String(test_url.to_string()));
     root.insert("proxies".into(), Value::Object(proxies));
     root.insert("providers".into(), Value::Object(providers));
+    if !subs.is_empty() {
+        root.insert("subs".into(), subs_json(subs));
+    }
     Value::Object(root).to_string()
+}
+
+fn subs_json(subs: &[sb_ppgw::ppsub::subinfo::Entry]) -> Value {
+    Value::Array(
+        subs.iter()
+            .map(|e| {
+                let mut m = Map::new();
+                m.insert("name".into(), Value::String(e.name.clone()));
+                if e.at > 0 {
+                    m.insert("at".into(), Value::from(e.at));
+                }
+                if let Some(u) = &e.info {
+                    m.insert("upload".into(), Value::from(u.upload));
+                    m.insert("download".into(), Value::from(u.download));
+                    m.insert("total".into(), Value::from(u.total));
+                    m.insert("expire".into(), Value::from(u.expire));
+                }
+                Value::Object(m)
+            })
+            .collect(),
+    )
 }
 
 fn trim_one(name: &str, p: &RawNode) -> Value {
@@ -650,6 +683,7 @@ mod tests {
             &HashMap::new(),
             &|_| None,
             &HashMap::new(),
+            &[],
         ))
         .unwrap();
         assert_eq!(out["mode"], "Rule");
@@ -707,6 +741,7 @@ mod tests {
             &smart_urls,
             &|g| (g == "Smart").then(|| json!({"N1": {"score": 123, "samples": [100, null]}})),
             &HashMap::new(),
+            &[],
         ))
         .unwrap();
 
@@ -751,6 +786,7 @@ mod tests {
             &smart_urls,
             &|_| None,
             &HashMap::new(),
+            &[],
         ))
         .unwrap();
         assert_eq!(out["proxies"]["Smart"]["testUrl"], "http://fallback/204");
@@ -775,6 +811,7 @@ mod tests {
                 &smart_urls,
                 &|_| None,
                 &fixed,
+                &[],
             ))
             .unwrap()
         };
@@ -809,6 +846,7 @@ mod tests {
             &HashMap::new(),
             &|_| None,
             &HashMap::new(),
+            &[],
         ))
         .unwrap();
         assert_eq!(out["proxies"]["UT"]["fixed"], "N1");
@@ -905,9 +943,53 @@ mod tests {
             &HashMap::new(),
             &|_| None,
             &HashMap::new(),
+            &[],
         ))
         .unwrap();
         assert_eq!(out["proxies"], json!({}));
         assert_eq!(out["providers"], json!({}));
+        assert!(out.get("subs").is_none(), "no PPSub usage -> no subs key");
+    }
+
+    #[test]
+    fn ppsub_usage_is_listed_per_subscription() {
+        use sb_ppgw::ppsub::{UserInfo, subinfo::Entry};
+        let subs = [
+            Entry {
+                name: "A".into(),
+                info: Some(UserInfo {
+                    total: 100,
+                    upload: 1,
+                    download: 2,
+                    expire: 1_700_000_000,
+                }),
+                at: 1_690_000_000,
+            },
+            Entry {
+                name: "A_B".into(),
+                info: None,
+                at: 0,
+            },
+        ];
+        let out: Value = serde_json::from_str(&build_trimmed(
+            &px(json!({"proxies": {"A_n1": {"type": "Shadowsocks"}}})),
+            &RawProviders::default(),
+            "rule",
+            "u",
+            &HashMap::new(),
+            &|_| None,
+            &HashMap::new(),
+            &subs,
+        ))
+        .unwrap();
+        assert_eq!(
+            out["subs"],
+            json!([
+                {"name": "A", "at": 1_690_000_000, "upload": 1, "download": 2,
+                 "total": 100, "expire": 1_700_000_000},
+                {"name": "A_B"}
+            ]),
+            "every sub is named (prefix matching needs them all); numbers only when known"
+        );
     }
 }

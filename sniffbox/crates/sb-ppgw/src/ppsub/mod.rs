@@ -1,11 +1,13 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 mod groups;
+pub(crate) mod hosts;
 pub(crate) mod proxies;
 pub mod retry;
 mod rules;
 pub(crate) mod state;
 pub(crate) mod sub;
+pub mod subinfo;
 
 pub use groups::SMART_HIDE_NODE;
 
@@ -76,7 +78,7 @@ pub const SS_IN_PORT: i64 = 8080;
 
 const SS_CIPHERS: [&str; 2] = ["2022-blake3-aes-128-gcm", "aes-128-gcm"];
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UserInfo {
     pub total: i64,
     pub upload: i64,
@@ -88,6 +90,8 @@ pub struct SubResult {
     pub name: String,
     pub success: bool,
     pub proxies: Vec<Yaml>,
+
+    pub(crate) hosts: hosts::SubHosts,
     pub userinfo: Option<UserInfo>,
 
     pub raw_yaml: String,
@@ -186,6 +190,13 @@ pub fn process_ppsub(
         let dns_servers = proxies::collect_dns_servers(ex_dns);
         proxies::resolve_all(&sub_results, &dns_servers, crate::dnsutil::ipv6_enabled())
     } else {
+        for r in sub_results.iter().filter(|r| !r.hosts.map.is_empty()) {
+            pp_log(&format!(
+                "[{}] hosts: {} node domain(s) mapped by the sub's hosts, unused (dns_burn off)",
+                r.name,
+                r.hosts.map.len()
+            ));
+        }
         proxies::Resolution::default()
     };
 
@@ -194,6 +205,19 @@ pub fn process_ppsub(
     std::fs::write(output_file, buf)
         .map_err(|e| PpsubErr::Write(output_file.to_string(), e.to_string()))?;
     pp_log(&format!("wrote {output_file} ({bytes} bytes)"));
+
+    let at = subinfo::now();
+    let entries: Vec<subinfo::Entry> = sub_results
+        .iter()
+        .map(|r| subinfo::Entry {
+            name: r.name.clone(),
+            info: r.userinfo.clone(),
+            at: if r.success { at } else { 0 },
+        })
+        .collect();
+    if let Err(e) = subinfo::save(&subinfo::file(), &entries) {
+        pp_warn(&format!("cannot write subscription usage file: {e}"));
+    }
 
     save_retry_state(
         config_file,
@@ -353,7 +377,7 @@ fn save_retry_state(
             let empty = std::collections::HashMap::new();
             let got = res.subdns.get(&r.name).unwrap_or(&empty);
             let failed = res.failed.get(&r.name);
-            for d in proxies::sub_domains(r) {
+            for d in proxies::lookup_domains(r) {
                 let ips = got
                     .get(&d)
                     .map(|v| v.iter().map(|ip| ip.to_string()).collect())
@@ -363,7 +387,7 @@ fn save_retry_state(
             }
 
             if dns_burn {
-                for d in proxies::sub_domains(r) {
+                for d in proxies::lookup_domains(r) {
                     st.burn.entry(d.clone()).or_insert_with(|| {
                         res.burn
                             .get(&d)
@@ -480,7 +504,7 @@ fn parse_node_groups(cfg: &serde_json::Value) -> Vec<NodeGroup> {
 
 fn b64_decoded_len(s: &str) -> Option<usize> {
     let b = s.as_bytes();
-    if b.is_empty() || b.len() % 4 != 0 {
+    if b.is_empty() || !b.len().is_multiple_of(4) {
         return None;
     }
     let pad = b.iter().rev().take_while(|&&c| c == b'=').count();
@@ -587,6 +611,7 @@ mod tests {
             name: "S".into(),
             success: true,
             proxies: vec![Yaml::Hash(h)],
+            hosts: hosts::SubHosts::default(),
             userinfo: None,
             raw_yaml: String::new(),
             error: String::new(),

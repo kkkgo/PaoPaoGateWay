@@ -334,6 +334,7 @@ mod tests {
             name: name.to_string(),
             success,
             proxies: Vec::new(),
+            hosts: Default::default(),
             userinfo: None,
             raw_yaml: String::new(),
             error: String::new(),

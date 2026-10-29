@@ -38,12 +38,22 @@ fn build(p: &PpgwIni) -> Config {
         splice_threshold: p.num("splice_threshold").unwrap_or(1024 * 1024),
         udp: p.bool("udp_enable").unwrap_or(false),
         udp_idle: Duration::from_secs(60),
+        udp_max_sessions: p
+            .num("udp_max_sessions")
+            .unwrap_or(crate::udp_budget::default_sessions())
+            .max(1),
+        udp_reserved_sessions: p
+            .num("udp_reserved_sessions")
+            .unwrap_or(crate::udp_budget::DEFAULT_RESERVED)
+            .max(1),
         udp_workers: workers,
         tcp_workers: workers,
         spoof_cache_cap: auto_spoof_cache_cap(),
         tune_sysctl: true,
 
         tune_nic: p.bool("tune_nic").unwrap_or(true),
+
+        tune_rps: p.bool("tune_rps").unwrap_or(true),
     };
 
     let socks5 = SocksCfg {
@@ -375,6 +385,35 @@ mod tests {
 
         let stale = build(&ppgw("cf_protocol=\"auto\"\ncf_quality_interval=\"5\"\n"));
         assert_eq!(stale.cloudflared.protocol, CfProtocol::Auto);
+    }
+
+    #[test]
+    fn udp_global_limits_map_from_ppgw_and_require_restart() {
+        let cfg = build(&ppgw("udp_max_sessions=73\nudp_reserved_sessions=9\n"));
+        assert_eq!(cfg.inbound.udp_max_sessions, 73);
+        assert_eq!(cfg.inbound.udp_reserved_sessions, 9);
+        let zero = build(&ppgw("udp_max_sessions=0\nudp_reserved_sessions=0\n"));
+        assert_eq!(
+            (
+                zero.inbound.udp_max_sessions,
+                zero.inbound.udp_reserved_sessions
+            ),
+            (1, 1)
+        );
+        let fallback = build(&ppgw("udp_max_sessions=oops\nudp_reserved_sessions=-1\n"));
+        assert_eq!(
+            fallback.inbound.udp_max_sessions,
+            crate::udp_budget::default_sessions()
+        );
+        assert_eq!(
+            fallback.inbound.udp_reserved_sessions,
+            crate::udp_budget::DEFAULT_RESERVED
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let shared = crate::runtime::SharedState::new(&cfg);
+        shared.reload(&zero);
+        assert_eq!(shared.udp_budget.sessions.limits(), [73, 9]);
     }
 
     #[test]

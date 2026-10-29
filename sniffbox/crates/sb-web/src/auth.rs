@@ -48,10 +48,11 @@ mod tests {
     #[test]
     fn secret_matches_known_vector() {
 
-        let s = derive_secret("clashpass");
-        assert_eq!(s.len(), 64);
-        assert_eq!(s, derive_secret("clashpass"));
-        assert_ne!(s, derive_secret("other"));
+        assert_eq!(
+            derive_secret("clashpass"),
+            "4704d652efa136a59abde25b2c67164a881a1f5687fc735336efca50f7cc7c28"
+        );
+        assert_ne!(derive_secret("clashpass"), derive_secret("other"));
     }
 
     #[test]

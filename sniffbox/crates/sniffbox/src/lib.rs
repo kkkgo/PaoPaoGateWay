@@ -12,6 +12,7 @@ pub mod dns_server;
 pub mod domain_rules;
 pub mod engine;
 pub mod geo_cron;
+pub mod http_forward;
 pub mod inbound_proxy;
 pub mod ip_rules;
 pub mod logging;
@@ -27,8 +28,10 @@ pub mod resolver;
 pub mod runtime;
 pub mod smart_fixed;
 pub mod smart_speed;
+pub mod steering;
 pub mod sysinfo;
 pub mod tasks;
+mod udp_budget;
 pub mod udp_engine;
 pub mod web_geo;
 pub mod web_proxies;
@@ -143,6 +146,9 @@ pub fn cli_main() -> ExitCode {
     }
     if cfg.inbound.tune_nic {
         nic::tune_link_modes();
+    }
+    if cfg.inbound.tune_rps {
+        steering::spawn_tune();
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -425,12 +431,11 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
     let tcp_workers = cfg.inbound.tcp_workers.max(1);
     spawn_tcp_listeners(listen_addr, tcp_workers, &shared, &shutdown_rx, true, false)?;
 
-    if let Some(listen6) = cfg.inbound.listen6 {
-        if let Err(e) =
+    if let Some(listen6) = cfg.inbound.listen6
+        && let Err(e) =
             spawn_tcp_listeners(listen6, tcp_workers, &shared, &shutdown_rx, false, false)
-        {
-            tracing::warn!(%listen6, ?e, "bind_tproxy_tcp (IPv6) failed; continuing IPv4-only");
-        }
+    {
+        tracing::warn!(%listen6, ?e, "bind_tproxy_tcp (IPv6) failed; continuing IPv4-only");
     }
 
     if let Some(cf_addr) = cfg.cloudflared.tproxy {
@@ -491,9 +496,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
     let smart_stats = Arc::new(smart_speed::SmartStats::default());
 
     let smart_fixed = smart_fixed::SmartFixed::load(smart_fixed::state_path());
-    if nodes_enabled {
-        start_stats_pipeline(&shared, shutdown_rx.clone());
-    }
+    start_housekeeping(&shared, shutdown_rx.clone());
 
     if cfg.outbound.mode.via_clash() {
         clash_pull::spawn(
@@ -683,6 +686,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
                 listen_port: cfg.inbound_proxy.listen_port,
                 udp: cfg.inbound_proxy.udp,
                 udp_idle: cfg.inbound.udp_idle,
+                handshake_timeout: inbound_proxy::DEFAULT_HANDSHAKE_TIMEOUT,
             },
             shutdown_rx.clone(),
         );
@@ -748,6 +752,9 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
 
     let _ = tokio::task::spawn_blocking(move || cf_sup.kill()).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let _ =
+        tokio::task::spawn_blocking(|| logging::flush(std::time::Duration::from_millis(300))).await;
     Ok(())
 }
 
@@ -829,10 +836,10 @@ async fn accept_loop(
     }
 }
 
-fn start_stats_pipeline(shared: &Arc<SharedState>, shutdown_rx: watch::Receiver<bool>) {
+fn start_housekeeping(shared: &Arc<SharedState>, shutdown_rx: watch::Receiver<bool>) {
     let shared_c = Arc::clone(shared);
     tokio::spawn(async move {
-        tasks::run_flush_loop(shared_c, shutdown_rx).await;
+        tasks::run_housekeeping(shared_c, shutdown_rx).await;
     });
 }
 

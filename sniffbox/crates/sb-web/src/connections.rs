@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 
 pub trait ConnectionsSource: Send + Sync {
 
-    fn connections_json(&self) -> String;
+    fn connections_json(&self) -> Arc<String>;
 
     fn close_all(&self) {}
 

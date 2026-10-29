@@ -56,14 +56,14 @@ impl ClashSupervisor {
     pub fn restart(&self) -> io::Result<()> {
         let mut guard = self.pid.lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(pid) = (*guard).or_else(find_clash_pid) {
-            if proc_is_clash(pid) {
+        if let Some(pid) = (*guard).or_else(find_clash_pid)
+            && proc_is_clash(pid)
+        {
 
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-                wait_gone(pid, Duration::from_secs(5));
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
             }
+            wait_gone(pid, Duration::from_secs(5));
         }
         *guard = None;
 
@@ -89,10 +89,10 @@ impl sb_web::ClashControl for ClashSupervisor {
     fn ensure_up(&self) -> io::Result<bool> {
         let mut guard = self.pid.lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(pid) = *guard {
-            if proc_is_clash(pid) {
-                return Ok(false);
-            }
+        if let Some(pid) = *guard
+            && proc_is_clash(pid)
+        {
+            return Ok(false);
         }
 
         if let Some(pid) = find_clash_pid() {

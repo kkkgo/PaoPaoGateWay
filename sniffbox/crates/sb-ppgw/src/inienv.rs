@@ -21,6 +21,8 @@ pub const KEYS: &[Key] = &[
     k("openport", "no"),
     k("openport_auth", ""),
     k("udp_enable", "no"),
+    k("udp_max_sessions", ""),
+    k("udp_reserved_sessions", "32"),
     k("admin_cidr", ""),
     k("proxy_cidr", ""),
     k("socks5_ip", ""),
@@ -51,6 +53,7 @@ pub const KEYS: &[Key] = &[
     k("box", ""),
     k("splice_threshold", ""),
     k("tune_nic", ""),
+    k("tune_rps", ""),
     k("traffic_window_min", ""),
 ];
 

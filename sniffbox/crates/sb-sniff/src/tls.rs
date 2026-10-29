@@ -1,6 +1,7 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 use crate::error::ParseErr;
+use std::borrow::Cow;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TlsClientHello<'a> {
@@ -10,6 +11,61 @@ pub struct TlsClientHello<'a> {
     pub alpns: Vec<&'a [u8]>,
 
     pub ech_outer: bool,
+}
+
+const MAX_HANDSHAKE: usize = 64 * 1024;
+
+fn record_at(buf: &[u8], off: usize) -> Result<(&[u8], usize), ParseErr> {
+    let hdr = buf.get(off..off + 5).ok_or(ParseErr::Short {
+        need: off + 5,
+        have: buf.len(),
+    })?;
+    if hdr[0] != 0x16 {
+        return Err(ParseErr::NotHandshake);
+    }
+    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+    let end = off + 5 + len;
+    let body = buf.get(off + 5..end).ok_or(ParseErr::Short {
+        need: end,
+        have: buf.len(),
+    })?;
+    Ok((body, end))
+}
+
+pub fn collect_handshake(buf: &[u8]) -> Result<Cow<'_, [u8]>, ParseErr> {
+    let (first, mut next) = record_at(buf, 0)?;
+    if first.len() >= 4 {
+        let need = 4 + u24_at(first);
+        if need > MAX_HANDSHAKE {
+            return Err(ParseErr::Malformed("tls handshake too large"));
+        }
+        if first.len() >= need {
+            return Ok(Cow::Borrowed(&first[..need]));
+        }
+    }
+    let mut out = first.to_vec();
+    loop {
+        if out.len() >= 4 {
+            let need = 4 + u24_at(&out);
+            if need > MAX_HANDSHAKE {
+                return Err(ParseErr::Malformed("tls handshake too large"));
+            }
+            if out.len() >= need {
+                out.truncate(need);
+                return Ok(Cow::Owned(out));
+            }
+        }
+        let (body, n) = record_at(buf, next)?;
+        next = n;
+        if out.len() + body.len() > MAX_HANDSHAKE {
+            return Err(ParseErr::Malformed("tls handshake too large"));
+        }
+        out.extend_from_slice(body);
+    }
+}
+
+fn u24_at(buf: &[u8]) -> usize {
+    ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize
 }
 
 pub fn parse_client_hello(buf: &[u8]) -> Result<TlsClientHello<'_>, ParseErr> {
@@ -22,8 +78,11 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsClientHello<'_>, ParseErr> {
     let _rec_ver = r.u16()?;
     let rec_len = r.u16()? as usize;
     let rec = r.slice(rec_len)?;
+    parse_handshake(rec)
+}
 
-    let mut rr = Reader::new(rec);
+pub fn parse_handshake(hs: &[u8]) -> Result<TlsClientHello<'_>, ParseErr> {
+    let mut rr = Reader::new(hs);
 
     let ht = rr.u8()?;
     if ht != 0x01 {
@@ -252,6 +311,68 @@ mod tests {
         let ch = ch_example_com();
         let h = parse_client_hello(&ch).expect("parse ok");
         assert!(!h.ech_outer);
+    }
+
+    fn split_into_records(single: &[u8], cut: usize) -> Vec<u8> {
+        let hs = &single[5..];
+        assert!(cut < hs.len(), "cut must split the handshake");
+        let mut out = Vec::new();
+        for part in [&hs[..cut], &hs[cut..]] {
+            out.extend_from_slice(&[0x16, 0x03, 0x01]);
+            out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    #[test]
+    fn single_record_handshake_is_borrowed() {
+        let ch = ch_example_com();
+        let hs = collect_handshake(&ch).expect("collect ok");
+        assert!(
+            matches!(hs, Cow::Borrowed(_)),
+            "single record must not copy"
+        );
+        assert_eq!(parse_handshake(&hs).unwrap().sni, Some("example.com"));
+    }
+
+    #[test]
+    fn client_hello_split_across_records_is_reassembled() {
+        let single = ch_example_com();
+        let hs_len = single.len() - 5;
+
+        for cut in [1, 2, 3, 4, hs_len / 2, hs_len - 1] {
+            let frag = split_into_records(&single, cut);
+            let hs = collect_handshake(&frag)
+                .unwrap_or_else(|e| panic!("cut={cut} collect failed: {e:?}"));
+            assert!(matches!(hs, Cow::Owned(_)), "cut={cut} must reassemble");
+            let h =
+                parse_handshake(&hs).unwrap_or_else(|e| panic!("cut={cut} parse failed: {e:?}"));
+            assert_eq!(h.sni, Some("example.com"), "cut={cut}");
+            assert_eq!(h.alpns.len(), 2, "cut={cut}");
+        }
+    }
+
+    #[test]
+    fn incomplete_second_record_asks_for_more() {
+        let single = ch_example_com();
+        let frag = split_into_records(&single, 40);
+        for cut in [46, 50, frag.len() - 1] {
+            assert!(
+                matches!(collect_handshake(&frag[..cut]), Err(ParseErr::Short { .. })),
+                "truncated at {cut} must be Short"
+            );
+        }
+    }
+
+    #[test]
+    fn absurd_handshake_length_is_rejected() {
+
+        let buf = [0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0xff, 0xff, 0xff];
+        assert_eq!(
+            collect_handshake(&buf),
+            Err(ParseErr::Malformed("tls handshake too large"))
+        );
     }
 
     fn ch_with_ext(sni: &str, extra_ext: &[u8]) -> Vec<u8> {

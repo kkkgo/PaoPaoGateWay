@@ -12,6 +12,8 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+const CLIENT_KEEPALIVE: (i32, i32, i32) = (300, 30, 4);
+
 pub struct Established {
 
     pub dest: SocketAddr,
@@ -21,6 +23,10 @@ pub struct Established {
     pub domain: Option<String>,
 
     pub prelude: Vec<u8>,
+
+    pub peeked: Vec<u8>,
+
+    pub http_forward: Option<crate::http_forward::Request>,
 
     pub sniff: bool,
 
@@ -43,6 +49,8 @@ pub async fn handle_conn(
         inbound: InboundKind::TProxy,
         domain: None,
         prelude: Vec::new(),
+        peeked: Vec::new(),
+        http_forward: None,
         sniff: true,
         group: None,
     };
@@ -61,6 +69,8 @@ pub async fn handle_cf_conn(
         inbound: InboundKind::Cloudflared,
         domain: None,
         prelude: Vec::new(),
+        peeked: Vec::new(),
+        http_forward: None,
         sniff: false,
         group: Some(crate::cf_ctl::CF_LABEL),
     };
@@ -77,7 +87,8 @@ pub async fn serve_established(
 
     let _ = client.set_nodelay(true);
 
-    sb_tproxy::tcp::set_tcp_keepalive(&client, 30, 10, 4);
+    let (idle, intvl, cnt) = CLIENT_KEEPALIVE;
+    sb_tproxy::tcp::set_tcp_keepalive(&client, idle, intvl, cnt);
 
     let port_skip = is_server_first_port(dest.port());
 
@@ -91,21 +102,30 @@ pub async fn serve_established(
         || shared.sniff_neg.is_hit(dest.ip(), dest.port())
     {
         (
-            sb_sniff::Sniffed {
-                proto: SniffedProto::Unknown,
-                domain: None,
-                ech_outer: false,
-            },
+            sb_sniff::Sniffed::UNKNOWN,
 
-            PeekBuf::empty(),
+            PeekBuf::from_prefix(&est.peeked),
         )
     } else {
-        let r = peek_and_sniff(&mut client, &shared.peek_pool, shared.sniff_timeout()).await?;
+        let out = peek_and_sniff(
+            &mut client,
+            &shared.peek_pool,
+            shared.sniff_timeout(),
+            &est.peeked,
+        )
+        .await?;
 
-        if matches!(r.0.proto, SniffedProto::Unknown) {
-            shared.sniff_neg.mark(dest.ip(), dest.port());
+        if out.eof_without_data {
+            tracing::debug!(%peer, %dest, "client closed before sending anything; no upstream dial");
+            return Ok(());
         }
-        r
+
+        if matches!(out.sniffed.proto, SniffedProto::Unknown) {
+            shared.sniff_neg.note_failure(dest.ip(), dest.port());
+        } else {
+            shared.sniff_neg.note_success(dest.ip(), dest.port());
+        }
+        (out.sniffed, out.buf)
     };
     let route = shared.route.load();
 
@@ -207,8 +227,20 @@ pub async fn serve_established(
 
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     shared.close_registry.insert(conn_id, cancel_tx);
+
+    let dest_routable = !in_fakeip && !dest.ip().is_unspecified();
     let result = tokio::select! {
-        r = run_proxy(&shared, &rec, client, peek, est.prelude, dest, domain.as_deref()) => r,
+        r = run_proxy(
+            &shared,
+            &rec,
+            client,
+            peek,
+            est.prelude,
+            est.http_forward,
+            dest,
+            domain.as_deref(),
+            dest_routable,
+        ) => r,
 
         _ = cancel_rx => Ok(()),
     };
@@ -240,11 +272,17 @@ async fn run_proxy(
     mut client: TcpStream,
     peek: PeekBuf,
     prelude: Vec<u8>,
+    http_forward: Option<crate::http_forward::Request>,
     orig: SocketAddr,
     domain: Option<&str>,
+    dest_routable: bool,
 ) -> std::io::Result<()> {
 
-    let mut upstream = match shared.outbound.connect_tcp(orig, domain).await {
+    let mut upstream = match shared
+        .outbound
+        .connect_tcp(orig, domain, dest_routable)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%orig, ?e, "outbound connect failed");
@@ -276,6 +314,19 @@ async fn run_proxy(
             return Ok(());
         }
         rec.add_up(prelude.len() as u64);
+    }
+    if let Some(request) = http_forward {
+        let prefix = peek.bytes().to_vec();
+        drop(peek);
+        return crate::http_forward::relay(
+            client,
+            upstream,
+            prefix,
+            request,
+            &rec.upload,
+            &rec.download,
+        )
+        .await;
     }
     if shared.splice_copy() {
 
@@ -420,14 +471,40 @@ fn could_start_known_proto(b: u8) -> bool {
     matches!(b, 0x16 | 0x13 | b'G' | b'P' | b'H' | b'D' | b'O')
 }
 
+pub struct PeekOutcome {
+    pub sniffed: sb_sniff::Sniffed,
+
+    pub buf: PeekBuf,
+
+    pub eof_without_data: bool,
+}
+
 pub async fn peek_and_sniff(
     client: &mut TcpStream,
     pool: &Arc<PeekBufPool>,
     timeout: Duration,
-) -> std::io::Result<(sb_sniff::Sniffed, PeekBuf)> {
+    prefix: &[u8],
+) -> std::io::Result<PeekOutcome> {
     let mut peek = pool.take();
+    peek.seed(prefix);
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut sniffed = sb_sniff::Sniffed::UNKNOWN;
+    let mut fresh = !peek.is_empty();
+    let mut eof_without_data = false;
     loop {
+        if fresh {
+            sniffed = sniff_all(peek.bytes());
+
+            if !matches!(sniffed.proto, SniffedProto::Unknown) && !sniffed.need_more {
+                break;
+            }
+
+            if let Some(&b0) = peek.bytes().first()
+                && !could_start_known_proto(b0)
+            {
+                break;
+            }
+        }
         if peek.is_full() {
             break;
         }
@@ -436,25 +513,20 @@ pub async fn peek_and_sniff(
             break;
         }
         match tokio::time::timeout(remaining, peek.read_some(client)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(_)) => {
-                let s = sniff_all(peek.bytes());
-                if !matches!(s.proto, SniffedProto::Unknown) {
-                    break;
-                }
-
-                if let Some(&b0) = peek.bytes().first()
-                    && !could_start_known_proto(b0)
-                {
-                    break;
-                }
+            Ok(Ok(0)) => {
+                eof_without_data = peek.is_empty();
+                break;
             }
+            Ok(Ok(_)) => fresh = true,
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => break,
         }
     }
-    let s = sniff_all(peek.bytes());
-    Ok((s, peek))
+    Ok(PeekOutcome {
+        sniffed,
+        buf: peek,
+        eof_without_data,
+    })
 }
 
 #[cfg(test)]
@@ -472,11 +544,15 @@ mod tests {
         let _client = TS::connect(addr).await.unwrap();
         let mut server = acc.await.unwrap();
         let pool = Arc::new(PeekBufPool::with_defaults());
-        let (s, peek) = peek_and_sniff(&mut server, &pool, Duration::from_millis(50))
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_millis(50), b"")
             .await
             .unwrap();
-        assert_eq!(s.proto, SniffedProto::Unknown);
-        assert_eq!(peek.len(), 0);
+        assert_eq!(out.sniffed.proto, SniffedProto::Unknown);
+        assert_eq!(out.buf.len(), 0);
+        assert!(
+            !out.eof_without_data,
+            "client is idle, not gone: must not be taken for a zero-byte close"
+        );
     }
 
     #[test]
@@ -513,16 +589,90 @@ mod tests {
         let pool = Arc::new(PeekBufPool::with_defaults());
         let start = std::time::Instant::now();
 
-        let (s, _peek) = peek_and_sniff(&mut server, &pool, Duration::from_secs(5))
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_secs(5), b"")
             .await
             .unwrap();
         let elapsed = start.elapsed();
-        assert_eq!(s.proto, SniffedProto::Unknown);
+        assert_eq!(out.sniffed.proto, SniffedProto::Unknown);
         assert!(
             elapsed < Duration::from_secs(1),
             "prefix gate should bail early, took {elapsed:?}"
         );
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn peek_prefix_is_sniffed_and_kept() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acc = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let _client = TS::connect(addr).await.unwrap();
+        let mut server = acc.await.unwrap();
+        let pool = Arc::new(PeekBufPool::with_defaults());
+        let prefix = b"GET / HTTP/1.1\r\nHost: prefix.example\r\n\r\n";
+
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_millis(50), prefix)
+            .await
+            .unwrap();
+        assert_eq!(out.sniffed.proto, SniffedProto::Http);
+        assert_eq!(out.sniffed.domain.as_deref(), Some("prefix.example"));
+        assert_eq!(out.buf.bytes(), prefix, "prefix must stay forwardable");
+        assert!(!out.eof_without_data);
+    }
+
+    #[tokio::test]
+    async fn peek_waits_for_a_late_host_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acc = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = TS::connect(addr).await.unwrap();
+        let mut server = acc.await.unwrap();
+        tokio::spawn(async move {
+            client.write_all(b"GET /x HTTP/1.1\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client
+                .write_all(b"Host: late.example\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let pool = Arc::new(PeekBufPool::with_defaults());
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_millis(500), b"")
+            .await
+            .unwrap();
+        assert_eq!(out.sniffed.proto, SniffedProto::Http);
+        assert_eq!(
+            out.sniffed.domain.as_deref(),
+            Some("late.example"),
+            "must keep reading until the Host header lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_byte_close_is_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acc = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TS::connect(addr).await.unwrap();
+        let mut server = acc.await.unwrap();
+        drop(client);
+        let pool = Arc::new(PeekBufPool::with_defaults());
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_secs(5), b"")
+            .await
+            .unwrap();
+        assert!(out.eof_without_data, "client sent nothing and closed");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acc = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = TS::connect(addr).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        drop(client);
+        let mut server = acc.await.unwrap();
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_secs(5), b"")
+            .await
+            .unwrap();
+        assert!(!out.eof_without_data, "a byte did arrive");
     }
 
     #[tokio::test]
@@ -537,11 +687,11 @@ mod tests {
             .await
             .unwrap();
         let pool = Arc::new(PeekBufPool::with_defaults());
-        let (s, _peek) = peek_and_sniff(&mut server, &pool, Duration::from_millis(200))
+        let out = peek_and_sniff(&mut server, &pool, Duration::from_millis(200), b"")
             .await
             .unwrap();
-        assert_eq!(s.proto, SniffedProto::Http);
-        assert_eq!(s.domain.as_deref(), Some("example.com"));
+        assert_eq!(out.sniffed.proto, SniffedProto::Http);
+        assert_eq!(out.sniffed.domain.as_deref(), Some("example.com"));
     }
 
     fn tls_sniff(domain: Option<&str>, ech_outer: bool) -> sb_sniff::Sniffed {
@@ -549,6 +699,7 @@ mod tests {
             proto: SniffedProto::Tls,
             domain: domain.map(str::to_string),
             ech_outer,
+            need_more: false,
         }
     }
 
@@ -685,5 +836,78 @@ mod tests {
 
         assert_eq!(unknown_label(InboundKind::Socks5, true, 80), S::Socks5);
         assert_eq!(unknown_label(InboundKind::Http, true, 443), S::HttpProxy);
+    }
+
+    fn sockopt(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> i32 {
+        let mut v: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                &mut v as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt failed: {}",
+            std::io::Error::last_os_error()
+        );
+        v
+    }
+
+    #[tokio::test]
+    async fn client_keepalive_spares_sleeping_phones_but_still_reclaims() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acc = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let _client = TS::connect(addr).await.unwrap();
+        let (server, peer) = acc.await.unwrap();
+
+        let probe = unsafe { OwnedFd::from_raw_fd(libc::dup(server.as_raw_fd())) };
+        let fd = probe.as_raw_fd();
+        let shared = Arc::new(SharedState::new(&crate::config::Config::default()));
+        let est = Established {
+            dest: "192.0.2.1:443".parse().unwrap(),
+            inbound: InboundKind::TProxy,
+            domain: None,
+            prelude: Vec::new(),
+            peeked: Vec::new(),
+            http_forward: None,
+            sniff: false,
+            group: None,
+        };
+        let task = tokio::spawn(serve_established(shared, server, peer, est));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "serve_established never enabled SO_KEEPALIVE on the client socket"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let idle = sockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE);
+        let intvl = sockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL);
+        let cnt = sockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT);
+        task.abort();
+        assert_eq!((idle, intvl, cnt), CLIENT_KEEPALIVE);
+        assert!(
+            idle >= 300,
+            "idle client probed every {idle}s: each probe wakes a sleeping phone's radio and CPU"
+        );
+        assert!(
+            intvl * cnt >= 120,
+            "grace after the first probe is {}s: phones in power save were seen answering ~31s late",
+            intvl * cnt
+        );
+        assert!(
+            idle + intvl * cnt <= 900,
+            "a client that really left is only reclaimed after {}s",
+            idle + intvl * cnt
+        );
     }
 }

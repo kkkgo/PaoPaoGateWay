@@ -1,7 +1,8 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
+use super::hosts::Mapping;
 use super::state::LEGACY_MARK;
-use super::{LOG, SubResult, UserInfo, pp_log, pp_step, pp_warn, ystr};
+use super::{LOG, SubResult, pp_log, pp_step, pp_warn, ystr};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use yaml_rust2::Yaml;
@@ -16,6 +17,8 @@ pub(crate) struct Resolution {
     pub subdns: HashMap<String, Resolved>,
 
     pub failed: HashMap<String, HashMap<String, Vec<String>>>,
+
+    pub hosts: HashMap<String, Resolved>,
 }
 
 struct SubdnsJob {
@@ -31,64 +34,48 @@ pub(crate) fn build_proxies(
 ) -> Vec<Yaml> {
     let mut all: Vec<Yaml> = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
-    let mut userinfo: Option<(UserInfo, String)> = None;
-    let resolved = &res.burn;
+    let subs: Vec<&SubResult> = sub_results.iter().filter(|r| r.success).collect();
 
-    let subdns: HashMap<String, Resolved> = res
-        .subdns
+    let empty = Resolved::new();
+    let views: Vec<(Resolved, Resolved)> = subs
         .iter()
-        .map(|(name, got)| {
-            let uniq = subtract_known(got.clone(), resolved, &format!("[{name}] subdns"));
-            (name.clone(), uniq)
+        .map(|r| {
+            if !dns_burn {
+                return (Resolved::new(), Resolved::new());
+            }
+            let burn = fold_alias(r, &res.burn, "dns_burn");
+            let own = res.subdns.get(&r.name).unwrap_or(&empty);
+            let got = fold_alias(r, own, "sub's own DNS");
+            let uniq = subtract_known(got, &burn, &format!("[{}] subdns", r.name));
+            (burn, uniq)
         })
         .collect();
 
-    for r in sub_results {
-        if !r.success {
-            continue;
-        }
-        if userinfo.is_none() {
-            if let Some(ui) = &r.userinfo {
-                userinfo = Some((ui.clone(), r.name.clone()));
-            }
-        }
+    for (r, (burn, _)) in subs.iter().zip(&views) {
         for p in &r.proxies {
             if let Some(name) = p["name"].as_str() {
                 used.insert(name.to_string());
             }
             all.push(p.clone());
             if dns_burn {
-                burn_proxy(p, resolved, &mut used, &mut all);
+                burn_proxy(p, burn, &mut used, &mut all);
             }
         }
     }
 
     if dns_burn {
-        for r in sub_results.iter().filter(|r| r.success) {
-            if let Some(got) = subdns.get(&r.name) {
-                emit_subdns_nodes(r, got, &mut used, &mut all);
-            }
+        for (r, (_, uniq)) in subs.iter().zip(&views) {
+            emit_subdns_nodes(r, uniq, &mut used, &mut all);
         }
     }
 
-    if let Some((ui, sub_name)) = &userinfo {
-        if let Some(template) = all.last().and_then(|y| y.as_hash()).cloned() {
-            let gb = 1_073_741_824f64;
-            let remaining = (ui.total - ui.upload - ui.download) as f64 / gb;
-            let total = ui.total as f64 / gb;
-            let expire_date = format_expire(ui.expire);
-
-            let mut info_node = template;
-            info_node.insert(
-                ystr("name"),
-                ystr(&format!(
-                    "{sub_name}_{sub_name}: {remaining:.2}G/{total:.2}G@@{expire_date}"
-                )),
-            );
-
-            let mut prefixed = vec![Yaml::Hash(info_node)];
-            prefixed.append(&mut all);
-            all = prefixed;
+    let mut fixed: Vec<Yaml> = Vec::new();
+    if dns_burn {
+        for (r, (burn, uniq)) in subs.iter().zip(&views) {
+            if let Some(ips) = res.hosts.get(&r.name) {
+                let left = static_unique(&r.name, ips, burn, uniq);
+                emit_hosts_nodes(r, &left, &mut used, &mut fixed);
+            }
         }
     }
 
@@ -99,8 +86,120 @@ pub(crate) fn build_proxies(
             .unwrap_or(false)
     });
     let mut result = subdns;
+    result.extend(fixed);
     result.extend(others);
     result
+}
+
+fn fold_alias(r: &SubResult, map: &Resolved, source: &str) -> Resolved {
+    let mut out = Resolved::new();
+    for d in sub_domains(r) {
+        let mut ips = map.get(&d).cloned().unwrap_or_default();
+        if let Some(t) = r.hosts.alias_of(&d) {
+            let own = ips.len();
+            for ip in map.get(t).into_iter().flatten() {
+                if !ips.contains(ip) {
+                    ips.push(*ip);
+                }
+            }
+            if ips.len() > own {
+                pp_log(&format!(
+                    "[{}] hosts: {d} -> alias {t} adds {} IP ({source})",
+                    r.name,
+                    ips.len() - own
+                ));
+            }
+        }
+        if !ips.is_empty() {
+            out.insert(d, ips);
+        }
+    }
+    out
+}
+
+fn static_unique(sub: &str, fixed: &Resolved, burn: &Resolved, subdns: &Resolved) -> Resolved {
+    let mut out = Resolved::new();
+    for (d, ips) in fixed {
+        let known = |ip: &IpAddr| {
+            burn.get(d).is_some_and(|v| v.contains(ip))
+                || subdns.get(d).is_some_and(|v| v.contains(ip))
+        };
+        let left: Vec<IpAddr> = ips.iter().filter(|ip| !known(ip)).copied().collect();
+        if left.is_empty() {
+            pp_log(&format!(
+                "[{sub}] hosts: {d} -> all {} static IP already resolved by DNS, no @hosts node",
+                ips.len()
+            ));
+            continue;
+        }
+        out.insert(d.clone(), left);
+    }
+    out
+}
+
+pub(crate) fn static_hosts(sub_results: &[SubResult], ipv6: bool) -> HashMap<String, Resolved> {
+    let mut out = HashMap::new();
+    for r in sub_results.iter().filter(|r| r.success) {
+        let mut m = Resolved::new();
+        for (d, mapping) in &r.hosts.map {
+            if let Mapping::Ips(list) = mapping {
+                let ips = usable_static(list, ipv6);
+                if !ips.is_empty() {
+                    m.insert(d.clone(), ips);
+                }
+            }
+        }
+        if !m.is_empty() {
+            out.insert(r.name.clone(), m);
+        }
+    }
+    out
+}
+
+fn usable_static(list: &[IpAddr], ipv6: bool) -> Vec<IpAddr> {
+    list.iter()
+        .copied()
+        .filter(|ip| (ipv6 || ip.is_ipv4()) && crate::fallback::is_usable_node_ip(*ip))
+        .collect()
+}
+
+fn log_hosts(r: &SubResult, ipv6: bool) {
+    let tag = format!("[{}] hosts", r.name);
+    for (d, m) in &r.hosts.map {
+        match m {
+            Mapping::Alias(t) => {
+                pp_log(&format!(
+                    "{tag}: {d} -> alias {t} (resolved like a node domain)"
+                ));
+            }
+            Mapping::Ips(list) => {
+                let shown: Vec<String> = list.iter().map(IpAddr::to_string).collect();
+                let dropped = list.len() - usable_static(list, ipv6).len();
+                if dropped == list.len() {
+                    pp_warn(&format!(
+                        "{tag}: {d} -> static {} unusable (fakeip/reserved/IPv6 off), ignored",
+                        shown.join(", ")
+                    ));
+                } else if dropped > 0 {
+                    pp_log(&format!(
+                        "{tag}: {d} -> static {} ({dropped} unusable dropped)",
+                        shown.join(", ")
+                    ));
+                } else {
+                    pp_log(&format!("{tag}: {d} -> static {}", shown.join(", ")));
+                }
+            }
+        }
+    }
+    for (d, why) in &r.hosts.ignored {
+        pp_warn(&format!("{tag}: {d} ignored ({why})"));
+    }
+    if r.hosts.skipped > 0 {
+        pp_warn(&format!(
+            "{tag}: {} entr(ies) with an invalid key skipped",
+            r.hosts.skipped
+        ));
+    }
 }
 
 pub(crate) fn resolve_all(
@@ -108,6 +207,9 @@ pub(crate) fn resolve_all(
     dns_servers: &[String],
     ipv6: bool,
 ) -> Resolution {
+    for r in sub_results.iter().filter(|r| r.success) {
+        log_hosts(r, ipv6);
+    }
 
     let mut domains: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -118,14 +220,27 @@ pub(crate) fn resolve_all(
             }
         }
     }
+    let servers = domains.len();
+    for r in sub_results.iter().filter(|r| r.success) {
+        for t in r.hosts.alias_targets() {
+            if seen.insert(t.clone()) {
+                domains.push(t);
+            }
+        }
+    }
+    let aliases = domains.len() - servers;
     if dns_servers.is_empty() {
         pp_warn(
             "dns_burn: no DNS server configured (dns_ip/ex_dns empty), skipping domain resolution",
         );
     } else {
         pp_step(&format!(
-            "dns_burn: resolving {} unique domain server(s) via [{}]",
-            domains.len(),
+            "dns_burn: resolving {servers} unique domain server(s){} via [{}]",
+            if aliases > 0 {
+                format!(" + {aliases} hosts alias target(s)")
+            } else {
+                String::new()
+            },
             dns_servers.join(", ")
         ));
     }
@@ -135,7 +250,7 @@ pub(crate) fn resolve_all(
         .filter(|r| r.success)
         .filter_map(|r| {
             let specs = sub_dns_servers(&r.raw_yaml);
-            let domains = sub_domains(r);
+            let domains = lookup_domains(r);
             (!specs.is_empty() && !domains.is_empty()).then(|| SubdnsJob {
                 name: r.name.clone(),
                 specs,
@@ -216,17 +331,33 @@ pub(crate) fn resolve_all(
         burn: resolved,
         subdns: subdns.into_inner().unwrap(),
         failed: failed.into_inner().unwrap(),
+        hosts: static_hosts(sub_results, ipv6),
     }
 }
 
 pub(crate) fn sub_domains(r: &SubResult) -> Vec<String> {
+    server_domains(&r.proxies)
+}
+
+pub(crate) fn lookup_domains(r: &SubResult) -> Vec<String> {
+    let mut out = sub_domains(r);
+    for t in r.hosts.alias_targets() {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+pub(crate) fn server_domains(proxies: &[Yaml]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for p in &r.proxies {
-        if let Some(server) = p["server"].as_str() {
-            if server.parse::<IpAddr>().is_err() && seen.insert(server.to_string()) {
-                out.push(server.to_string());
-            }
+    for p in proxies {
+        if let Some(server) = p["server"].as_str()
+            && server.parse::<IpAddr>().is_err()
+            && seen.insert(server.to_string())
+        {
+            out.push(server.to_string());
         }
     }
     out
@@ -266,12 +397,33 @@ pub(crate) fn emit_subdns_nodes(
     used: &mut HashSet<String>,
     all: &mut Vec<Yaml>,
 ) {
+    emit_copies(r, unique, used, all, generate_subdns_node_name);
+}
+
+fn emit_hosts_nodes(
+    r: &SubResult,
+    fixed: &HashMap<String, Vec<IpAddr>>,
+    used: &mut HashSet<String>,
+    all: &mut Vec<Yaml>,
+) {
+    emit_copies(r, fixed, used, all, |base, ip, used| {
+        crate::yamltx::generate_node_name_with_prefix(base, ip, used, "hosts")
+    });
+}
+
+fn emit_copies(
+    r: &SubResult,
+    by_server: &HashMap<String, Vec<IpAddr>>,
+    used: &mut HashSet<String>,
+    all: &mut Vec<Yaml>,
+    name_of: impl Fn(&str, &str, &HashSet<String>) -> String,
+) {
 
     for p in &r.proxies {
         let Some(server) = p["server"].as_str() else {
             continue;
         };
-        let Some(ips) = unique.get(server) else {
+        let Some(ips) = by_server.get(server) else {
             continue;
         };
         let Some(ph) = p.as_hash() else {
@@ -280,7 +432,7 @@ pub(crate) fn emit_subdns_nodes(
         let base = p["name"].as_str().unwrap_or("").to_string();
         for ip in ips {
             let ipstr = ip.to_string();
-            let uniq = generate_subdns_node_name(&base, &ipstr, used);
+            let uniq = name_of(&base, &ipstr, used);
             used.insert(uniq.clone());
             let mut np = ph.clone();
             np.insert(ystr("name"), ystr(&uniq));
@@ -375,13 +527,6 @@ pub(crate) fn collect_dns_servers(ex_dns: &str) -> Vec<String> {
     servers
 }
 
-fn format_expire(expire: i64) -> String {
-    match time::OffsetDateTime::from_unix_timestamp(expire) {
-        Ok(dt) => format!("{:04}-{:02}-{:02}", dt.year(), dt.month() as u8, dt.day()),
-        Err(_) => "unknown".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,18 +565,13 @@ mod tests {
     }
 
     #[test]
-    fn expire_date_format() {
-
-        assert_eq!(format_expire(1_700_000_000), "2023-11-14");
-    }
-
-    #[test]
-    fn merge_without_dnsburn_and_virtual_nodes() {
+    fn userinfo_never_becomes_a_node() {
         let r = SubResult {
             name: "S".to_string(),
             success: true,
             proxies: vec![node("S_A", "1.2.3.4"), node("S_B", "5.6.7.8")],
-            userinfo: Some(UserInfo {
+            hosts: Default::default(),
+            userinfo: Some(super::super::UserInfo {
                 total: 2 * 1_073_741_824,
                 upload: 0,
                 download: 1_073_741_824,
@@ -441,22 +581,12 @@ mod tests {
             error: String::new(),
         };
         let out = process_proxies(&[r], false, "");
-
-        assert_eq!(out.len(), 3);
-        let info = out[0]["name"].as_str().unwrap();
-        assert!(
-            info.starts_with("S_S: "),
-            "merged node has <sub>_<sub> prefix: {info}"
+        let names: Vec<&str> = out.iter().filter_map(|p| p["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["S_A", "S_B"],
+            "usage goes to the subinfo file, not into the node list"
         );
-        assert!(
-            info.contains("1.00G/2.00G"),
-            "remaining/total traffic: {info}"
-        );
-        assert!(
-            info.ends_with("@@2023-11-14"),
-            "@@ separates expiry date: {info}"
-        );
-        assert_eq!(out[1]["name"].as_str(), Some("S_A"));
     }
 
     fn node(name: &str, server: &str) -> Yaml {
@@ -540,10 +670,10 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while !stop2.load(Ordering::Relaxed) {
-                if let Ok((n, peer)) = sock.recv_from(&mut buf) {
-                    if let Ok(q) = sb_dns::message::parse_query(&buf[..n]) {
-                        let _ = sock.send_to(&q.answer_a(Ipv4Addr::new(11, 1, 2, 3), 60), peer);
-                    }
+                if let Ok((n, peer)) = sock.recv_from(&mut buf)
+                    && let Ok(q) = sb_dns::message::parse_query(&buf[..n])
+                {
+                    let _ = sock.send_to(&q.answer_a(Ipv4Addr::new(11, 1, 2, 3), 60), peer);
                 }
             }
         });
@@ -555,6 +685,7 @@ mod tests {
             name: "S".to_string(),
             success: true,
             proxies: vec![node("S_HK", "hk.example.com")],
+            hosts: Default::default(),
             userinfo: None,
             raw_yaml: raw,
             error: String::new(),
@@ -599,10 +730,10 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while !stop2.load(Ordering::Relaxed) {
-                if let Ok((n, peer)) = sock.recv_from(&mut buf) {
-                    if let Ok(q) = sb_dns::message::parse_query(&buf[..n]) {
-                        let _ = sock.send_to(&q.answer_a(Ipv4Addr::new(11, 1, 2, 3), 60), peer);
-                    }
+                if let Ok((n, peer)) = sock.recv_from(&mut buf)
+                    && let Ok(q) = sb_dns::message::parse_query(&buf[..n])
+                {
+                    let _ = sock.send_to(&q.answer_a(Ipv4Addr::new(11, 1, 2, 3), 60), peer);
                 }
             }
         });
@@ -617,6 +748,7 @@ mod tests {
                 node("HK01", "hk.example.com"),
                 node("HK02", "hk.example.com"),
             ],
+            hosts: Default::default(),
             userinfo: None,
             raw_yaml: raw,
             error: String::new(),
@@ -667,11 +799,11 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             while !stop2.load(Ordering::Relaxed) {
-                if let Ok((n, peer)) = sock.recv_from(&mut buf) {
-                    if let Ok(q) = sb_dns::message::parse_query(&buf[..n]) {
-                        query_count2.fetch_add(1, Ordering::Relaxed);
-                        let _ = sock.send_to(&q.answer_a(Ipv4Addr::new(11, 1, 2, 3), 60), peer);
-                    }
+                if let Ok((n, peer)) = sock.recv_from(&mut buf)
+                    && let Ok(q) = sb_dns::message::parse_query(&buf[..n])
+                {
+                    query_count2.fetch_add(1, Ordering::Relaxed);
+                    let _ = sock.send_to(&q.answer_a(Ipv4Addr::new(11, 1, 2, 3), 60), peer);
                 }
             }
         });
@@ -683,6 +815,7 @@ mod tests {
                 node("HK01", "hk.example.com"),
                 node("HK02", "hk.example.com"),
             ],
+            hosts: Default::default(),
             userinfo: None,
             raw_yaml: String::new(),
             error: String::new(),
@@ -706,6 +839,329 @@ mod tests {
             query_count.load(Ordering::Relaxed),
             1,
             "same domain should be queried only once"
+        );
+    }
+
+    fn sub_from(name: &str, yaml: &str) -> SubResult {
+        let (proxies, hosts) = super::super::sub::parse_payload(yaml, name);
+        SubResult {
+            name: name.to_string(),
+            success: true,
+            proxies,
+            hosts,
+            userinfo: None,
+            raw_yaml: yaml.to_string(),
+            error: String::new(),
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn table(entries: &[(&str, &[&str])]) -> Resolved {
+        entries
+            .iter()
+            .map(|(d, ips)| (d.to_string(), ips.iter().map(|s| ip(s)).collect()))
+            .collect()
+    }
+
+    fn name_server(out: &[Yaml]) -> Vec<(String, String)> {
+        out.iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap_or("").to_string(),
+                    p["server"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn alias_rides_dns_nodes_and_only_static_becomes_hosts() {
+        let a = sub_from(
+            "A",
+            "hosts:\n  hk.example.com: entry.example.net\n  jp.example.com: [12.0.0.7, 11.0.0.2, 127.0.0.1]\nproxies:\n  - {name: HK, server: hk.example.com, type: ss}\n  - {name: JP, server: jp.example.com, type: ss}\n",
+        );
+        let res = Resolution {
+            burn: table(&[
+                ("hk.example.com", &["11.0.0.1"]),
+                ("entry.example.net", &["11.0.0.1", "11.0.0.3"]),
+                ("jp.example.com", &["11.0.0.2"]),
+            ]),
+            subdns: [(
+                "A".to_string(),
+                table(&[("entry.example.net", &["11.0.1.3"])]),
+            )]
+            .into_iter()
+            .collect(),
+            hosts: static_hosts(std::slice::from_ref(&a), false),
+            ..Default::default()
+        };
+        let out = build_proxies(&[a], &res, true);
+        assert_eq!(
+            name_server(&out),
+            pairs(&[
+                ("A_HK@subdns3", "11.0.1.3"),
+                ("A_JP@hosts7", "12.0.0.7"),
+                ("A_HK", "hk.example.com"),
+                ("A_HK@1", "11.0.0.1"),
+                ("A_HK@3", "11.0.0.3"),
+                ("A_JP", "jp.example.com"),
+                ("A_JP@2", "11.0.0.2"),
+            ])
+        );
+    }
+
+    #[test]
+    fn existing_node_names_keep_their_addresses() {
+        let plain = sub_from(
+            "A",
+            "proxies:\n  - {name: HK, server: hk.example.com, type: ss}\n",
+        );
+        let aliased = sub_from(
+            "A",
+            "hosts:\n  hk.example.com: entry.example.net\nproxies:\n  - {name: HK, server: hk.example.com, type: ss}\n",
+        );
+        let res = Resolution {
+            burn: table(&[
+                ("hk.example.com", &["11.0.0.4"]),
+                ("entry.example.net", &["11.0.9.4"]),
+            ]),
+            ..Default::default()
+        };
+        let before = name_server(&build_proxies(&[plain], &res, true));
+        let after = name_server(&build_proxies(&[aliased], &res, true));
+        assert_eq!(
+            before,
+            pairs(&[("A_HK", "hk.example.com"), ("A_HK@4", "11.0.0.4")])
+        );
+        assert_eq!(
+            after,
+            pairs(&[
+                ("A_HK", "hk.example.com"),
+                ("A_HK@4", "11.0.0.4"),
+                ("A_HK@4A", "11.0.9.4"),
+            ]),
+            "the alias only appends"
+        );
+    }
+
+    #[test]
+    fn hosts_apply_only_to_their_own_subscription() {
+        let a = sub_from(
+            "A",
+            "hosts:\n  shared.example.com: 12.0.0.1\n  x.example.com: ta.example.net\nproxies:\n  - {name: S, server: shared.example.com, type: ss}\n  - {name: X, server: x.example.com, type: ss}\n",
+        );
+        let b = sub_from(
+            "B",
+            "hosts:\n  shared.example.com: 12.0.0.2\nproxies:\n  - {name: S, server: shared.example.com, type: ss}\n  - {name: X, server: x.example.com, type: ss}\n",
+        );
+        let subs = [a, b];
+        let res = Resolution {
+            burn: table(&[("ta.example.net", &["11.0.0.5"])]),
+            hosts: static_hosts(&subs, false),
+            ..Default::default()
+        };
+        let got = name_server(&build_proxies(&subs, &res, true));
+        assert_eq!(
+            got,
+            pairs(&[
+                ("A_S@hosts1", "12.0.0.1"),
+                ("B_S@hosts2", "12.0.0.2"),
+                ("A_S", "shared.example.com"),
+                ("A_X", "x.example.com"),
+                ("A_X@5", "11.0.0.5"),
+                ("B_S", "shared.example.com"),
+                ("B_X", "x.example.com"),
+            ]),
+            "B never sees A's alias nor A's static address"
+        );
+    }
+
+    #[test]
+    fn dns_burn_off_ignores_hosts() {
+        let a = sub_from(
+            "A",
+            "hosts:\n  hk.example.com: 12.0.0.1\nproxies:\n  - {name: HK, server: hk.example.com, type: ss}\n",
+        );
+        let res = Resolution {
+            hosts: static_hosts(std::slice::from_ref(&a), false),
+            ..Default::default()
+        };
+        assert_eq!(
+            name_server(&build_proxies(&[a], &res, false)),
+            pairs(&[("A_HK", "hk.example.com")])
+        );
+    }
+
+    #[test]
+    fn static_hosts_keep_only_usable_addresses() {
+        let a = sub_from(
+            "A",
+            "hosts:\n  hk.example.com: ['127.0.0.1', '2606:4700::1111', 7.1.2.3, 12.0.0.1]\n  jp.example.com: 0.0.0.0\n  us.example.com: entry.example.net\nproxies:\n  - {name: HK, server: hk.example.com}\n  - {name: JP, server: jp.example.com}\n  - {name: US, server: us.example.com}\n",
+        );
+        let subs = std::slice::from_ref(&a);
+        let v4 = static_hosts(subs, false);
+        assert_eq!(
+            v4["A"],
+            table(&[("hk.example.com", &["12.0.0.1"])]),
+            "loopback/fakeip dropped, v6 dropped while IPv6 is off, aliases are not static"
+        );
+        let v6 = static_hosts(subs, true);
+        assert_eq!(
+            v6["A"],
+            table(&[("hk.example.com", &["2606:4700::1111", "12.0.0.1"])])
+        );
+        assert!(static_hosts(&[sub_from("B", "proxies: []")], true).is_empty());
+    }
+
+    #[test]
+    fn lookup_domains_appends_alias_targets_once() {
+        let a = sub_from(
+            "A",
+            "hosts:\n  a.example.com: t.example.net\n  b.example.com: t.example.net\n  c.example.com: a.example.com\nproxies:\n  - {name: A, server: a.example.com}\n  - {name: B, server: b.example.com}\n  - {name: C, server: c.example.com}\n  - {name: T, server: t.example.net}\n",
+        );
+        assert_eq!(
+            lookup_domains(&a),
+            vec![
+                "a.example.com",
+                "b.example.com",
+                "c.example.com",
+                "t.example.net",
+            ],
+            "a target that is itself a node domain is not repeated"
+        );
+        let b = sub_from(
+            "B",
+            "hosts:\n  a.example.com: t.example.net\n  b.example.com: t.example.net\nproxies:\n  - {name: A, server: a.example.com}\n  - {name: B, server: b.example.com}\n  - {name: I, server: 1.2.3.4}\n",
+        );
+        assert_eq!(
+            lookup_domains(&b),
+            vec!["a.example.com", "b.example.com", "t.example.net"],
+            "alias targets follow the node domains, once each"
+        );
+    }
+
+    struct MockDns {
+        port: u16,
+        hits: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockDns {
+        fn start(answers: &[(&str, &str)], fallback_ip: &str) -> Self {
+            use std::net::{Ipv4Addr, UdpSocket};
+            use std::sync::atomic::Ordering;
+            let answers: HashMap<String, Ipv4Addr> = answers
+                .iter()
+                .map(|(d, i)| (d.to_string(), i.parse().unwrap()))
+                .collect();
+            let fallback_ip: Ipv4Addr = fallback_ip.parse().unwrap();
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .unwrap();
+            let port = sock.local_addr().unwrap().port();
+            let hits = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (hits2, stop2) = (hits.clone(), stop.clone());
+            let handle = std::thread::spawn(move || {
+                let mut buf = [0u8; 512];
+                while !stop2.load(Ordering::Relaxed) {
+                    let Ok((n, peer)) = sock.recv_from(&mut buf) else {
+                        continue;
+                    };
+                    let Ok(q) = sb_dns::message::parse_query(&buf[..n]) else {
+                        continue;
+                    };
+                    let name = q.name.trim_end_matches('.').to_lowercase();
+                    *hits2.lock().unwrap().entry(name.clone()).or_insert(0) += 1;
+                    let ip = answers.get(&name).copied().unwrap_or(fallback_ip);
+                    let _ = sock.send_to(&q.answer_a(ip, 60), peer);
+                }
+            });
+            Self {
+                port,
+                hits,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn hits(&self, name: &str) -> usize {
+            self.hits.lock().unwrap().get(name).copied().unwrap_or(0)
+        }
+    }
+
+    impl Drop for MockDns {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn alias_targets_go_through_dns_burn_and_the_subs_own_dns() {
+        let burn = MockDns::start(
+            &[
+                ("hk.example.com", "11.0.0.1"),
+                ("entry.example.net", "11.0.0.3"),
+            ],
+            "11.0.0.9",
+        );
+        let own = MockDns::start(
+            &[
+                ("hk.example.com", "11.0.0.1"),
+                ("entry.example.net", "11.0.1.3"),
+            ],
+            "11.0.0.9",
+        );
+        let a = sub_from(
+            "A",
+            &format!(
+                "dns:\n  nameserver:\n    - 127.0.0.1:{}\nhosts:\n  hk.example.com: entry.example.net\nproxies:\n  - {{name: HK, server: hk.example.com, type: ss}}\n",
+                own.port
+            ),
+        );
+        let res = resolve_all(
+            std::slice::from_ref(&a),
+            &[format!("127.0.0.1:{}", burn.port)],
+            false,
+        );
+        assert_eq!(
+            res.burn.get("entry.example.net"),
+            Some(&vec![ip("11.0.0.3")])
+        );
+        assert_eq!(
+            res.subdns["A"].get("entry.example.net"),
+            Some(&vec![ip("11.0.1.3")])
+        );
+        assert_eq!(burn.hits("entry.example.net"), 1, "dns_burn asked once");
+        assert_eq!(own.hits("entry.example.net"), 1, "sub's own DNS asked once");
+        assert_eq!(
+            burn.hits("hk.example.com"),
+            1,
+            "the node domain is still resolved"
+        );
+
+        let out = name_server(&build_proxies(&[a], &res, true));
+        assert_eq!(
+            out,
+            pairs(&[
+                ("A_HK@subdns3", "11.0.1.3"),
+                ("A_HK", "hk.example.com"),
+                ("A_HK@1", "11.0.0.1"),
+                ("A_HK@3", "11.0.0.3"),
+            ])
         );
     }
 }

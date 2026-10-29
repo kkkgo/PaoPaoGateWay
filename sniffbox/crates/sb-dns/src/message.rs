@@ -81,7 +81,7 @@ pub fn parse_query(buf: &[u8]) -> Result<Query<'_>, DnsError> {
 }
 
 fn parse_name(buf: &[u8], mut pos: usize) -> Result<(String, usize), DnsError> {
-    let mut name = String::new();
+    let mut name = String::with_capacity(64);
     loop {
         let len = *buf.get(pos).ok_or(DnsError::Truncated)?;
         if len == 0 {
@@ -116,12 +116,14 @@ impl Query<'_> {
         self.qclass == CLASS_IN && self.qtype == TYPE_A
     }
 
-    fn echo_prefix(&self) -> Vec<u8> {
-        self.raw[..self.question_end].to_vec()
+    fn echo_prefix(&self, extra: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.question_end + extra);
+        out.extend_from_slice(&self.raw[..self.question_end]);
+        out
     }
 
     pub fn answer_a(&self, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
-        let mut out = self.echo_prefix();
+        let mut out = self.echo_prefix(16);
         write_response_header(&mut out, self.rd, RCODE_NOERROR, 1);
         out.extend_from_slice(&[0xC0, 0x0C]);
         out.extend_from_slice(&TYPE_A.to_be_bytes());
@@ -133,13 +135,13 @@ impl Query<'_> {
     }
 
     pub fn nodata(&self) -> Vec<u8> {
-        let mut out = self.echo_prefix();
+        let mut out = self.echo_prefix(0);
         write_response_header(&mut out, self.rd, RCODE_NOERROR, 0);
         out
     }
 
     pub fn error(&self, rcode: u8) -> Vec<u8> {
-        let mut out = self.echo_prefix();
+        let mut out = self.echo_prefix(0);
         write_response_header(&mut out, self.rd, rcode, 0);
         out
     }

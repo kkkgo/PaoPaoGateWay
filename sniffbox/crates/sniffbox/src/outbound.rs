@@ -152,7 +152,13 @@ impl Outbound {
         &self,
         dest: SocketAddr,
         domain: Option<&str>,
+        dest_routable: bool,
     ) -> io::Result<TcpStream> {
+        let domain = match self {
+
+            Outbound::Direct(_) if dest_routable => None,
+            _ => domain,
+        };
         let first = self.connect_once(dest, domain).await;
         if first.is_ok() {
             OUTBOUND_WARMED.store(true, Ordering::Relaxed);
@@ -194,24 +200,50 @@ impl Outbound {
                         "ovpn tunnel (tun114) not ready",
                     ));
                 }
-                let addr = match domain {
-                    Some(host) => {
-                        let ip = d.resolver.resolve_v4(host).await?;
-                        SocketAddr::new(std::net::IpAddr::V4(ip), dest.port())
-                    }
-                    None => dest,
+                let addresses = match domain {
+                    Some(host) => d
+                        .resolver
+                        .resolve_all_v4(host)
+                        .await?
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(std::net::IpAddr::V4(ip), dest.port()))
+                        .collect(),
+                    None => vec![dest],
                 };
-                connect_tcp_direct(
-                    addr,
-                    d.bind_device.as_deref(),
-                    d.so_mark,
-                    DIRECT_CONNECT_TIMEOUT,
-                )
+                connect_addresses(&addresses, DIRECT_CONNECT_TIMEOUT, |addr, timeout| {
+                    connect_tcp_direct(addr, d.bind_device.as_deref(), d.so_mark, timeout)
+                })
                 .await
-                .map_err(io::Error::other)
             }
         }
     }
+}
+
+async fn connect_addresses<T, E, F, Fut>(
+    addresses: &[SocketAddr],
+    budget: Duration,
+    mut connect: F,
+) -> io::Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+    F: FnMut(SocketAddr, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut error = io::Error::new(io::ErrorKind::NotFound, "no addresses to connect");
+    for (i, addr) in addresses.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let slice = remaining / (addresses.len() - i) as u32;
+        match tokio::time::timeout(slice, connect(*addr, slice)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => error = io::Error::other(e),
+            Err(_) => error = io::ErrorKind::TimedOut.into(),
+        }
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -331,11 +363,83 @@ mod tests {
         assert!(ob.is_direct() && ob.socks5_pool().is_none());
 
         let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), echo.port());
-        let mut s = ob.connect_tcp(dest, Some("echo.test")).await.unwrap();
+        let mut s = ob
+            .connect_tcp(dest, Some("echo.test"), false)
+            .await
+            .unwrap();
         s.write_all(b"hi-direct").await.unwrap();
         let mut back = [0u8; 9];
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"hi-direct");
+    }
+
+    #[tokio::test]
+    async fn direct_connect_tries_second_dns_address_and_cache_preserves_it() {
+        let echo = echo_server().await;
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cfg = cfg_with_outbound(
+            OutboundCfg {
+                mode: OutboundMode::Free,
+                resolver: DnsResolverCfg {
+                    server: Some(dns.local_addr().unwrap()),
+                },
+                ..Default::default()
+            },
+            "127.0.0.1:1".parse().unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            let mut buf = [0; 1500];
+            let (n, peer) = dns.recv_from(&mut buf).await.unwrap();
+            let q = parse_query(&buf[..n]).unwrap();
+            let mut response = q.answer_a(Ipv4Addr::new(127, 0, 0, 2), 60);
+            let second = q.answer_a(Ipv4Addr::LOCALHOST, 60);
+            response[7] = 2;
+            response.extend_from_slice(&second[second.len() - 16..]);
+            dns.send_to(&response, peer).await.unwrap();
+
+        });
+        let ob = Outbound::build(&cfg);
+        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), echo.port());
+        for _ in 0..2 {
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(2),
+                ob.connect_once(dest, Some("multi.example")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            stream.write_all(b"hi").await.unwrap();
+            let mut reply = [0; 2];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"hi");
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blackholed_address_leaves_time_for_the_next_one() {
+        let addresses = [
+            "192.0.2.1:80".parse().unwrap(),
+            "192.0.2.2:80".parse().unwrap(),
+        ];
+        let start = tokio::time::Instant::now();
+        let result = connect_addresses(&addresses, Duration::from_secs(10), |addr, _| async move {
+            if addr == addresses[0] {
+                std::future::pending::<()>().await;
+            }
+            Ok::<_, io::Error>(addr)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, addresses[1]);
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        let start = tokio::time::Instant::now();
+        let result = connect_addresses(&addresses, Duration::from_secs(10), |_, _| {
+            std::future::pending::<io::Result<()>>()
+        })
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
     }
 
     #[tokio::test]
@@ -363,7 +467,7 @@ mod tests {
         OUTBOUND_WARMED.store(true, Ordering::Relaxed);
         let start = std::time::Instant::now();
         let err = ob
-            .connect_tcp(dest, Some("example.com"))
+            .connect_tcp(dest, Some("example.com"), false)
             .await
             .expect_err("tun down → reject");
         OUTBOUND_WARMED.store(saved, Ordering::Relaxed);
@@ -387,10 +491,41 @@ mod tests {
 
         let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), echo.port());
         let err = ob
-            .connect_tcp(dest, Some("echo.test"))
+            .connect_tcp(dest, Some("echo.test"), false)
             .await
             .expect_err("SO_BINDTODEVICE to missing iface still fails");
         assert_ne!(err.kind(), io::ErrorKind::NetworkUnreachable);
+    }
+
+    #[tokio::test]
+    async fn direct_keeps_a_routable_dest_ip_instead_of_re_resolving() {
+        let echo = echo_server().await;
+        let blackhole: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let cfg = cfg_with_outbound(
+            OutboundCfg {
+                mode: OutboundMode::Free,
+                resolver: DnsResolverCfg {
+                    server: Some(blackhole),
+                },
+                ..Default::default()
+            },
+            "127.0.0.1:1".parse().unwrap(),
+        );
+        let ob = Outbound::build(&cfg);
+        let start = std::time::Instant::now();
+        let mut s = ob
+            .connect_tcp(echo, Some("sniffed-but-unresolvable.example"), true)
+            .await
+            .expect("a reachable real dest must be dialed as-is");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "no DNS round trip should have happened, took {:?}",
+            start.elapsed()
+        );
+        s.write_all(b"real-ip").await.unwrap();
+        let mut back = [0u8; 7];
+        s.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"real-ip");
     }
 
     #[tokio::test]
@@ -405,7 +540,7 @@ mod tests {
         );
         let ob = Outbound::build(&cfg);
 
-        let mut s = ob.connect_tcp(echo, None).await.unwrap();
+        let mut s = ob.connect_tcp(echo, None, true).await.unwrap();
         s.write_all(b"raw!").await.unwrap();
         let mut back = [0u8; 4];
         s.read_exact(&mut back).await.unwrap();

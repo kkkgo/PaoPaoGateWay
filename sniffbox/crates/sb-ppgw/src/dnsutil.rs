@@ -24,10 +24,10 @@ pub fn url_hostname(raw: &str) -> String {
         None => s,
     };
 
-    if let Some(rest) = s.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            return rest[..end].to_string();
-        }
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_string();
     }
 
     match s.rsplit_once(':') {
@@ -56,12 +56,11 @@ pub fn nslookup(host: &str, server: &str, port: i64, ipv6_enabled: bool) -> Opti
         return Some(ip);
     }
 
-    if !server.is_empty() {
-        if let Some(addr) = server_addr(server, port) {
-            if let Some(ip) = query_one(host, addr, ipv6_enabled) {
-                return Some(ip);
-            }
-        }
+    if !server.is_empty()
+        && let Some(addr) = server_addr(server, port)
+        && let Some(ip) = query_one(host, addr, ipv6_enabled)
+    {
+        return Some(ip);
     }
 
     for addr in ex_dns_env_servers() {
@@ -87,17 +86,16 @@ pub fn nslookup(host: &str, server: &str, port: i64, ipv6_enabled: bool) -> Opti
 }
 
 fn query_one(host: &str, addr: SocketAddr, ipv6_enabled: bool) -> Option<IpAddr> {
-    if let Some(resp) = query(host, addr, TYPE_A) {
-        if let Some(ip) = resp.v4.first() {
-            return Some(IpAddr::V4(*ip));
-        }
+    if let Some(resp) = query(host, addr, TYPE_A)
+        && let Some(ip) = resp.v4.first()
+    {
+        return Some(IpAddr::V4(*ip));
     }
-    if ipv6_enabled {
-        if let Some(resp) = query(host, addr, TYPE_AAAA) {
-            if let Some(ip) = resp.v6.first() {
-                return Some(IpAddr::V6(*ip));
-            }
-        }
+    if ipv6_enabled
+        && let Some(resp) = query(host, addr, TYPE_AAAA)
+        && let Some(ip) = resp.v6.first()
+    {
+        return Some(IpAddr::V6(*ip));
     }
     None
 }
@@ -111,10 +109,8 @@ fn system_resolve(host: &str, ipv6_enabled: bool) -> Option<IpAddr> {
     if let Some(ip) = addrs.iter().find(|a| a.is_ipv4()) {
         return Some(*ip);
     }
-    if ipv6_enabled {
-        if let Some(ip) = addrs.iter().find(|a| a.is_ipv6()) {
-            return Some(*ip);
-        }
+    if ipv6_enabled && let Some(ip) = addrs.iter().find(|a| a.is_ipv6()) {
+        return Some(*ip);
     }
     None
 }
@@ -303,10 +299,8 @@ pub fn resolve_host_via(host: &str, server: SocketAddr, ipv6_enabled: bool) -> V
     if let Some(resp) = query(host, server, TYPE_A) {
         out.extend(resp.v4.into_iter().map(IpAddr::V4));
     }
-    if ipv6_enabled {
-        if let Some(resp) = query(host, server, TYPE_AAAA) {
-            out.extend(resp.v6.into_iter().map(IpAddr::V6));
-        }
+    if ipv6_enabled && let Some(resp) = query(host, server, TYPE_AAAA) {
+        out.extend(resp.v6.into_iter().map(IpAddr::V6));
     }
     out
 }

@@ -9,7 +9,7 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 pub const MMSG_VLEN: usize = 16;
-pub const MMSG_SLOT_CAP: usize = 2048;
+pub const MMSG_SLOT_CAP: usize = 65536;
 
 const UDP_RCVBUF_BYTES: libc::c_int = 1024 * 1024;
 
@@ -108,6 +108,13 @@ pub fn bind_udp_reuseaddr(addr: SocketAddr) -> io::Result<UdpSocket> {
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
+    set_sockbuf_forced(
+        sock.as_raw_fd(),
+        libc::SO_RCVBUF,
+        libc::SO_RCVBUFFORCE,
+        UDP_RCVBUF_BYTES,
+        "SO_RCVBUF",
+    );
     sock.bind(&addr.into())?;
     UdpSocket::from_std(sock.into())
 }
@@ -177,6 +184,7 @@ pub struct MmsgBuf {
     mmsghdrs: Vec<libc::mmsghdr>,
 
     filled: usize,
+    truncated_drops: u64,
 }
 
 unsafe impl Send for MmsgBuf {}
@@ -206,6 +214,7 @@ impl MmsgBuf {
             iovecs,
             mmsghdrs,
             filled: 0,
+            truncated_drops: 0,
         }
     }
 
@@ -213,8 +222,15 @@ impl MmsgBuf {
         self.mmsghdrs.len()
     }
 
+    pub fn truncated_drops(&self) -> u64 {
+        self.truncated_drops
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], SocketAddr, SocketAddr)> + '_ {
         (0..self.filled).filter_map(move |i| {
+            if self.mmsghdrs[i].msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+                return None;
+            }
             let n = self.mmsghdrs[i].msg_len as usize;
             let payload = &self.bufs[i][..n.min(self.bufs[i].len())];
             let peer = unsafe {
@@ -265,19 +281,18 @@ pub fn recv_mmsg_with_origdst_nonblocking(fd: RawFd, buf: &mut MmsgBuf) -> io::R
     }
     buf.filled = rc as usize;
 
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let truncated = buf.mmsghdrs[..buf.filled]
-            .iter()
-            .filter(|h| h.msg_hdr.msg_flags & libc::MSG_TRUNC != 0)
-            .count();
-        if truncated > 0 {
-            tracing::debug!(
-                truncated,
-                batch = buf.filled,
-                slot_cap = buf.bufs.first().map_or(0, |b| b.len()),
-                "recvmmsg datagram(s) truncated; raise MMSG_SLOT_CAP if frequent (jumbo/GSO)"
-            );
-        }
+    let truncated = buf.mmsghdrs[..buf.filled]
+        .iter()
+        .filter(|h| h.msg_hdr.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0)
+        .count();
+    buf.truncated_drops = buf.truncated_drops.saturating_add(truncated as u64);
+    if truncated > 0 {
+        tracing::debug!(
+            truncated,
+            batch = buf.filled,
+            slot_cap = buf.bufs.first().map_or(0, |b| b.len()),
+            "recvmmsg truncated datagram(s) dropped"
+        );
     }
     Ok(buf.filled)
 }
@@ -287,6 +302,7 @@ pub struct MmsgRxBuf {
     iovecs: Vec<libc::iovec>,
     mmsghdrs: Vec<libc::mmsghdr>,
     filled: usize,
+    truncated_drops: u64,
 }
 
 unsafe impl Send for MmsgRxBuf {}
@@ -310,6 +326,7 @@ impl MmsgRxBuf {
             iovecs,
             mmsghdrs,
             filled: 0,
+            truncated_drops: 0,
         }
     }
 
@@ -317,10 +334,17 @@ impl MmsgRxBuf {
         self.mmsghdrs.len()
     }
 
+    pub fn truncated_drops(&self) -> u64 {
+        self.truncated_drops
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        (0..self.filled).map(move |i| {
+        (0..self.filled).filter_map(move |i| {
+            if self.mmsghdrs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                return None;
+            }
             let n = self.mmsghdrs[i].msg_len as usize;
-            &self.bufs[i][..n.min(self.bufs[i].len())]
+            Some(&self.bufs[i][..n.min(self.bufs[i].len())])
         })
     }
 }
@@ -357,6 +381,14 @@ pub fn recv_mmsg_payloads_nonblocking(fd: RawFd, buf: &mut MmsgRxBuf) -> io::Res
         return Err(io::Error::last_os_error());
     }
     buf.filled = rc as usize;
+    let truncated = buf.mmsghdrs[..buf.filled]
+        .iter()
+        .filter(|h| h.msg_hdr.msg_flags & libc::MSG_TRUNC != 0)
+        .count();
+    buf.truncated_drops = buf.truncated_drops.saturating_add(truncated as u64);
+    if truncated > 0 {
+        tracing::debug!(truncated, "recvmmsg truncated reply datagram(s) dropped");
+    }
     Ok(buf.filled)
 }
 
@@ -587,6 +619,29 @@ fn set_sockbuf_forced(
 mod tests {
     use super::*;
 
+    #[test]
+    fn recv_buffer_falls_back_when_force_is_unavailable() {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let control = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        control
+            .set_recv_buffer_size(UDP_RCVBUF_BYTES as usize)
+            .unwrap();
+
+        set_sockbuf_forced(
+            sock.as_raw_fd(),
+            libc::SO_RCVBUF,
+            -1,
+            UDP_RCVBUF_BYTES,
+            "SO_RCVBUF",
+        );
+        assert_eq!(
+            sock.recv_buffer_size().unwrap(),
+            control.recv_buffer_size().unwrap(),
+            "fallback must apply the requested buffer, subject to this kernel's cap"
+        );
+    }
+
     fn bind_specific_reuseaddr(addr: SocketAddr) -> io::Result<Socket> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
@@ -695,6 +750,96 @@ mod tests {
         assert_eq!(got[1], b"world!!");
         assert_eq!(got[2], b"");
         assert_eq!(got[3], big);
+    }
+
+    #[test]
+    fn production_ingress_preserves_large_mixed_datagrams() {
+        use std::net::UdpSocket as StdUdp;
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let rx = StdUdp::bind(addr).unwrap();
+            rx.set_nonblocking(true).unwrap();
+            let v6 = rx.local_addr().unwrap().is_ipv6();
+            set_int_opt(
+                rx.as_raw_fd(),
+                if v6 {
+                    libc::IPPROTO_IPV6
+                } else {
+                    libc::IPPROTO_IP
+                },
+                if v6 {
+                    libc::IPV6_RECVORIGDSTADDR
+                } else {
+                    libc::IP_RECVORIGDSTADDR
+                },
+                1,
+                "ORIGDST",
+            )
+            .unwrap();
+            let tx = StdUdp::bind(addr).unwrap();
+            let mut buf = MmsgBuf::new(MMSG_VLEN, MMSG_SLOT_CAP);
+            for sizes in [[0, 1200, 2049], [4097, 16384, 64], [65507, 1, 2048]] {
+                let packets: Vec<Vec<u8>> = sizes
+                    .into_iter()
+                    .map(|n| (0..n).map(|i| (i % 251) as u8).collect())
+                    .collect();
+                for p in &packets {
+                    tx.send_to(p, rx.local_addr().unwrap()).unwrap();
+                }
+                assert_eq!(
+                    recv_mmsg_with_origdst_nonblocking(rx.as_raw_fd(), &mut buf).unwrap(),
+                    packets.len()
+                );
+                let got: Vec<_> = buf
+                    .iter()
+                    .map(|(p, peer, orig)| {
+                        assert_eq!(peer, tx.local_addr().unwrap());
+                        assert_eq!(orig, rx.local_addr().unwrap());
+                        p.to_vec()
+                    })
+                    .collect();
+                assert_eq!(
+                    got, packets,
+                    "whole datagrams, including lengths above the link MTU"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_datagrams_are_never_yielded_as_valid_prefixes() {
+        use std::net::UdpSocket as StdUdp;
+        let rx = StdUdp::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        set_int_opt(
+            rx.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_RECVORIGDSTADDR,
+            1,
+            "ORIGDST",
+        )
+        .unwrap();
+        let tx = StdUdp::bind("127.0.0.1:0").unwrap();
+        let mut ingress = MmsgBuf::new(2, 4);
+        tx.send_to(b"too large", rx.local_addr().unwrap()).unwrap();
+        tx.send_to(b"ok", rx.local_addr().unwrap()).unwrap();
+        assert_eq!(
+            recv_mmsg_with_origdst_nonblocking(rx.as_raw_fd(), &mut ingress).unwrap(),
+            2
+        );
+        assert_eq!(
+            ingress.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
+            vec![b"ok".as_slice()]
+        );
+        assert_eq!(ingress.truncated_drops(), 1);
+        let mut reply = MmsgRxBuf::new(2, 4);
+        tx.send_to(b"too large", rx.local_addr().unwrap()).unwrap();
+        tx.send_to(b"ok", rx.local_addr().unwrap()).unwrap();
+        assert_eq!(
+            recv_mmsg_payloads_nonblocking(rx.as_raw_fd(), &mut reply).unwrap(),
+            2
+        );
+        assert_eq!(reply.iter().collect::<Vec<_>>(), vec![b"ok".as_slice()]);
+        assert_eq!(reply.truncated_drops(), 1);
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 use crate::error::ParseErr;
 use crate::tls;
-use aes::Aes128;
-use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-use aes_gcm::{Aes128Gcm, Nonce, aead::Aead};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
+use aes::{Aes128, Block};
+use aes_gcm::{Aes128Gcm, aead::Aead};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::collections::BTreeMap;
@@ -357,8 +357,8 @@ fn decrypt_initial(
     }
     let sample = &pkt[pn_off + 4..pn_off + 20];
 
-    let aes = Aes128::new(GenericArray::from_slice(hp));
-    let mut block = *GenericArray::from_slice(sample);
+    let aes = Aes128::new(hp.try_into().expect("hp key is 16 bytes"));
+    let mut block: Block = sample.try_into().expect("sample is 16 bytes");
     aes.encrypt_block(&mut block);
     let mask = block;
 
@@ -397,12 +397,9 @@ fn decrypt_initial(
     let aad = &hdr_and_pn[..aad_end];
     let ct = &hdr_and_pn[aad_end..ct_end];
 
-    let cipher = Aes128Gcm::new(GenericArray::from_slice(key));
+    let cipher = Aes128Gcm::new(key.try_into().expect("quic key is 16 bytes"));
     let pt = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            aes_gcm::aead::Payload { msg: ct, aad },
-        )
+        .decrypt(&nonce.into(), aes_gcm::aead::Payload { msg: ct, aad })
         .map_err(|_| ParseErr::Malformed("quic parse"))?;
     Ok(pt)
 }
@@ -476,6 +473,15 @@ mod tests {
         assert_eq!(hex::encode(&key), "1f369613dd76d5467730efcbe3b1a22d");
         assert_eq!(hex::encode(&iv), "fa044b2f42a3fd3b46fb255c");
         assert_eq!(hex::encode(&hp), "9f50449e04a0e810283a1e9933adedd2");
+    }
+
+    #[test]
+    fn rfc9001_appendix_a2_initial_yields_sni() {
+        let pkt = hex::decode(include_str!("testdata/rfc9001_a2_initial.hex").trim()).unwrap();
+        assert_eq!(extract_sni(&pkt), Ok(Some("example.com".to_string())));
+        let mut s = IncrementalSniffer::new();
+        assert_eq!(s.feed(&pkt), Ok(()));
+        assert_eq!(s.try_take_sni().as_deref(), Some("example.com"));
     }
 
     #[test]

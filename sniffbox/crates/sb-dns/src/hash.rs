@@ -24,12 +24,11 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 pub fn fxhash(bytes: &[u8]) -> u64 {
     const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
     let mut h = 0u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for c in chunks {
+        let w = u64::from_le_bytes(*c);
         h = (h.rotate_left(5) ^ w).wrapping_mul(K);
     }
-    let rem = chunks.remainder();
     if !rem.is_empty() {
         let mut buf = [0u8; 8];
         buf[..rem.len()].copy_from_slice(rem);
@@ -53,12 +52,11 @@ pub fn wyhash_lite(bytes: &[u8]) -> u64 {
     const S0: u64 = 0xa0761d6478bd642f;
     const S1: u64 = 0xe7037ed1a0b428db;
     let mut seed = S0 ^ mum(S0, S1);
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for c in chunks {
+        let w = u64::from_le_bytes(*c);
         seed = mum(seed ^ S1, w ^ S0);
     }
-    let rem = chunks.remainder();
     let mut buf = [0u8; 8];
     buf[..rem.len()].copy_from_slice(rem);
     let w = u64::from_le_bytes(buf);
