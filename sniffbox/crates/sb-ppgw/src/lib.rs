@@ -704,8 +704,16 @@ fn cmd_ppsub(f: &PpgwFlags, io: &mut Io) -> i32 {
                 rep.removed,
                 rep.backfilled,
             );
+            if !rep.undetected.is_empty() {
+                let _ = writeln!(
+                    io.out,
+                    "{}rule-set format still guessed, re-check once clash is up: {}",
+                    term::green("[PaoPaoGW RuleSet]"),
+                    rep.undetected.join(", "),
+                );
+            }
 
-            ppsub::state::refresh_output_hash(&f.output);
+            ppsub::state::record_prefetch(&f.output, &rep.undetected);
             spawn_gap_fill(io);
             0
         }

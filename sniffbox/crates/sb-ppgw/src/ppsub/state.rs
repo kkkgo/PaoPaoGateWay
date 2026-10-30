@@ -76,6 +76,8 @@ pub struct RetryState {
 
     pub burn: BTreeMap<String, Vec<String>>,
     pub subs: Vec<SubState>,
+
+    pub formats: Vec<String>,
 }
 
 impl RetryState {
@@ -87,6 +89,7 @@ impl RetryState {
                 .iter()
                 .any(|s| s.domains.values().any(|d| !d.failed_specs.is_empty()))
             || self.burn.values().any(|ips| ips.is_empty())
+            || !self.formats.is_empty()
     }
 
     pub fn gaps(&self) -> (usize, usize, usize) {
@@ -113,9 +116,20 @@ impl RetryState {
 }
 
 pub fn refresh_output_hash(output: &str) {
+    update(|st| st.output_hash = file_hash(output));
+}
+
+pub fn record_prefetch(output: &str, undetected: &[String]) {
+    update(|st| {
+        st.output_hash = file_hash(output);
+        st.formats = undetected.to_vec();
+    });
+}
+
+fn update(f: impl FnOnce(&mut RetryState)) {
     let path = state_file();
     if let Some(mut st) = RetryState::load(&path) {
-        st.output_hash = file_hash(output);
+        f(&mut st);
         let _ = st.save(&path);
     }
 }
@@ -183,6 +197,7 @@ fn to_json(s: &RetryState) -> String {
         "clash_socks5": s.clash_socks5,
         "burn": serde_json::Value::Object(burn),
         "subs": subs,
+        "formats": s.formats,
     })
     .to_string()
 }
@@ -210,6 +225,7 @@ fn from_json(text: &str) -> Option<RetryState> {
             .map(|o| o.iter().map(|(k, v)| (k.clone(), jstrvec(v))).collect())
             .unwrap_or_default(),
         subs,
+        formats: v.get("formats").map(jstrvec).unwrap_or_default(),
     })
 }
 
@@ -305,6 +321,7 @@ mod tests {
                 specs: vec!["https://doh.example/dns-query".into()],
                 domains,
             }],
+            formats: vec![],
         }
     }
 
@@ -351,6 +368,20 @@ mod tests {
         let mut c = s.clone();
         c.burn.insert("c.com".to_string(), vec![]);
         assert!(c.pending(), "empty dns_burn result is a gap");
+
+        let mut d = s.clone();
+        d.formats = vec!["reject".into()];
+        assert!(d.pending(), "unidentified rule-set format is a gap");
+    }
+
+    #[test]
+    fn formats_round_trip_and_old_state_without_it_still_loads() {
+        let mut s = sample();
+        s.formats = vec!["reject".into(), "ads".into()];
+        let back = from_json(&to_json(&s)).expect("parse back");
+        assert_eq!(back.formats, ["reject", "ads"]);
+        let old = r#"{"version":1,"config":"c","output":"o","subs":[]}"#;
+        assert!(from_json(old).expect("old state").formats.is_empty());
     }
 
     #[test]

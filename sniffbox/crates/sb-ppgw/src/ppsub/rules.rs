@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(fmt(&rs("http://x/a.yaml", "")).as_deref(), Some("yaml"));
         assert_eq!(fmt(&rs("http://x/a.mrs?v=1", "")).as_deref(), Some("mrs"));
         assert_eq!(fmt(&rs("http://x/a.list", "")).as_deref(), Some("text"));
-        assert_eq!(fmt(&rs("http://x/raw", "")).as_deref(), Some("text"));
+        assert_eq!(fmt(&rs("http://x/raw", "")).as_deref(), Some("yaml"));
         assert_eq!(
             fmt(&rs("http://x/a.yaml", "text")).as_deref(),
             Some("text"),

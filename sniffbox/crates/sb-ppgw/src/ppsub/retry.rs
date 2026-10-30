@@ -76,7 +76,8 @@ pub fn run(io: &mut crate::Io) -> i32 {
 
     let (bad_subs, bad_specs, bad_burn) = st.gaps();
     note_step(&format!(
-        "retry: {bad_subs} subscription(s) + {bad_specs} (domain, DNS) pair(s) + {bad_burn} dns_burn domain(s) to fill once clash is up"
+        "retry: {bad_subs} subscription(s) + {bad_specs} (domain, DNS) pair(s) + {bad_burn} dns_burn domain(s) + {} rule-set format(s) to fill once clash is up",
+        st.formats.len()
     ));
 
     let cfg: serde_json::Value = match std::fs::read_to_string(&st.config)
@@ -115,6 +116,10 @@ fn fill_gaps(
     io: &mut crate::Io,
 ) -> Result<bool, String> {
     let ipv6 = crate::dnsutil::ipv6_enabled();
+
+    let formats_fixed = fill_formats(&mut st, |out, names| {
+        crate::ruleset::predetect(out, names).backfilled
+    });
 
     let mut fresh_subs: Vec<String> = Vec::new();
     let mut sub_results: Vec<SubResult> = Vec::new();
@@ -159,35 +164,60 @@ fn fill_gaps(
         ));
     }
 
-    let changed = !fresh_subs.is_empty() || new_ips > 0;
-    if !changed {
+    let rebuild = !fresh_subs.is_empty() || new_ips > 0;
+    if !rebuild && formats_fixed == 0 {
         note("retry: nothing new resolved, config left untouched");
         let _ = st.save(&state::state_file());
         return Ok(false);
     }
-    note_step(&format!(
-        "retry: {} new subscription(s) + {new_ips} new IP(s) → rebuilding config",
-        fresh_subs.len()
-    ));
 
-    let prev_text =
-        std::fs::read_to_string(&st.output).map_err(|e| format!("read {}: {e}", st.output))?;
-    let prev = yaml_rust2::YamlLoader::load_from_str(&prev_text)
-        .ok()
-        .and_then(|d| d.into_iter().next());
-    let resolution = to_resolution(&st, &sub_results, ipv6);
-    let yaml = super::emit_config(cfg, &sub_results, &resolution, st.dns_burn, prev.as_ref())
-        .map_err(|e| e.to_string())?;
-    write_atomic(&st.output, &yaml).map_err(|e| format!("write {}: {e}", st.output))?;
-    st.output_hash = state::file_hash(&st.output);
-    if !fresh_subs.is_empty() {
-        refresh_subinfo(&super::subinfo::file(), &st, &fresh_subs);
+    if rebuild {
+        note_step(&format!(
+            "retry: {} new subscription(s) + {new_ips} new IP(s) → rebuilding config",
+            fresh_subs.len()
+        ));
+
+        let prev_text =
+            std::fs::read_to_string(&st.output).map_err(|e| format!("read {}: {e}", st.output))?;
+        let prev = yaml_rust2::YamlLoader::load_from_str(&prev_text)
+            .ok()
+            .and_then(|d| d.into_iter().next());
+        let resolution = to_resolution(&st, &sub_results, ipv6);
+        let yaml = super::emit_config(cfg, &sub_results, &resolution, st.dns_burn, prev.as_ref())
+            .map_err(|e| e.to_string())?;
+        write_atomic(&st.output, &yaml).map_err(|e| format!("write {}: {e}", st.output))?;
+        st.output_hash = state::file_hash(&st.output);
+        if !fresh_subs.is_empty() {
+            refresh_subinfo(&super::subinfo::file(), &st, &fresh_subs);
+        }
     }
 
     combine_and_reload(&st.output, io)?;
     note("retry: gap-fill applied, clash reloaded");
     let _ = st.save(&state::state_file());
     Ok(true)
+}
+
+fn fill_formats<F>(st: &mut RetryState, detect: F) -> usize
+where
+    F: FnOnce(&str, &std::collections::HashSet<String>) -> usize,
+{
+    if st.formats.is_empty() {
+        return 0;
+    }
+    let names: std::collections::HashSet<String> =
+        std::mem::take(&mut st.formats).into_iter().collect();
+    let fixed = detect(&st.output, &names);
+    if fixed > 0 {
+        st.output_hash = state::file_hash(&st.output);
+        note(&format!("retry: {fixed} rule-set format(s) corrected"));
+    } else {
+        note(&format!(
+            "retry: {} rule-set format(s) not corrected, keeping the guess",
+            names.len()
+        ));
+    }
+    fixed
 }
 
 fn fill_subdns(
@@ -588,6 +618,40 @@ impl Drop for Lock {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn format_gap_is_checked_once_and_rehashes_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.yaml");
+        std::fs::write(&out, "rule-providers: {}\n").unwrap();
+        let mut st = RetryState {
+            output: out.to_str().unwrap().to_string(),
+            output_hash: state::file_hash(out.to_str().unwrap()),
+            formats: vec!["reject".into()],
+            ..Default::default()
+        };
+        let fixed = fill_formats(&mut st, |path, names| {
+            assert!(names.contains("reject"));
+            std::fs::write(path, "rule-providers: {reject: {format: yaml}}\n").unwrap();
+            1
+        });
+        assert_eq!(fixed, 1);
+        assert!(st.formats.is_empty(), "a format gap is retried only once");
+        assert!(
+            !taken_over(&st),
+            "our own backfill must not look like a takeover"
+        );
+
+        let mut called = false;
+        assert_eq!(
+            fill_formats(&mut st, |_, _| {
+                called = true;
+                0
+            }),
+            0
+        );
+        assert!(!called, "nothing to detect when no format gap is left");
+    }
 
     #[test]
     fn merge_ips_dedups_and_counts() {

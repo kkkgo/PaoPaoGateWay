@@ -63,7 +63,7 @@ fn ext_for(format: &str, url: &str) -> &'static str {
 }
 
 pub fn guess_format(url: &str) -> &'static str {
-    url_ext(url).unwrap_or("text")
+    url_ext(url).unwrap_or("yaml")
 }
 
 fn url_ext(url: &str) -> Option<&'static str> {
@@ -73,6 +73,8 @@ fn url_ext(url: &str) -> Option<&'static str> {
         Some("yaml")
     } else if last.ends_with(".mrs") {
         Some("mrs")
+    } else if last.ends_with(".list") || last.ends_with(".conf") {
+        Some("text")
     } else {
         None
     }
@@ -141,6 +143,8 @@ pub struct PrefetchReport {
     pub failed: usize,
     pub removed: usize,
     pub backfilled: usize,
+
+    pub undetected: Vec<String>,
 }
 
 pub fn parse_providers(content: &str) -> Vec<Provider> {
@@ -246,15 +250,20 @@ fn note_format(
     backfills: &mut HashMap<String, String>,
     p: &Provider,
     auto: &HashSet<String>,
-    bytes: &[u8],
-) {
-    if !p.format.is_empty() && !auto.contains(&p.name) {
-        return;
+    bytes: Option<&[u8]>,
+) -> bool {
+    let is_auto = auto.contains(&p.name);
+    if !p.format.is_empty() && !is_auto {
+        return false;
     }
-    if let Some(fmt) = detect_format(&p.url, bytes)
-        && fmt != p.format
-    {
-        backfills.insert(p.name.clone(), fmt.to_string());
+    match bytes.and_then(|b| detect_format(&p.url, b)) {
+        Some(fmt) => {
+            if fmt != p.format {
+                backfills.insert(p.name.clone(), fmt.to_string());
+            }
+            false
+        }
+        None => is_auto,
     }
 }
 
@@ -301,6 +310,7 @@ where
                 scope.spawn(|| {
                     let mut local = PrefetchReport::default();
                     let mut backfills = HashMap::new();
+                    let mut undetected = Vec::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(group) = groups.get(i) else {
@@ -308,27 +318,29 @@ where
                         };
                         for p in group {
                             let path = Path::new(&p.path);
-                            if is_fresh(path, p.interval) {
+                            let bytes = if is_fresh(path, p.interval) {
                                 local.cached += 1;
-                                if let Ok(bytes) = std::fs::read(path) {
-                                    note_format(&mut backfills, p, auto, &bytes);
+                                std::fs::read(path).ok()
+                            } else {
+                                let tmp = format!("{}.tmp", p.path);
+                                match fetch(&p.url, &tmp) {
+                                    Ok(bytes) if std::fs::rename(&tmp, &p.path).is_ok() => {
+                                        local.downloaded += 1;
+                                        Some(bytes)
+                                    }
+                                    _ => {
+                                        let _ = std::fs::remove_file(&tmp);
+                                        local.failed += 1;
+                                        None
+                                    }
                                 }
-                                continue;
-                            }
-                            let tmp = format!("{}.tmp", p.path);
-                            match fetch(&p.url, &tmp) {
-                                Ok(bytes) if std::fs::rename(&tmp, &p.path).is_ok() => {
-                                    note_format(&mut backfills, p, auto, &bytes);
-                                    local.downloaded += 1;
-                                }
-                                _ => {
-                                    let _ = std::fs::remove_file(&tmp);
-                                    local.failed += 1;
-                                }
+                            };
+                            if note_format(&mut backfills, p, auto, bytes.as_deref()) {
+                                undetected.push(p.name.clone());
                             }
                         }
                     }
-                    (local, backfills)
+                    (local, backfills, undetected)
                 })
             })
             .collect();
@@ -338,12 +350,14 @@ where
             .collect::<Vec<_>>()
     });
     let mut backfills = HashMap::new();
-    for (local, formats) in results {
+    for (local, formats, undetected) in results {
         report.cached += local.cached;
         report.downloaded += local.downloaded;
         report.failed += local.failed;
         backfills.extend(formats);
+        report.undetected.extend(undetected);
     }
+    report.undetected.sort();
 
     if let Some(new_content) = backfill_formats(&content, &backfills)
         && std::fs::write(clash_yaml, new_content).is_ok()
@@ -811,12 +825,52 @@ rule-providers:
     }
 
     #[test]
-    fn guess_format_uses_suffix_then_text() {
+    fn guess_format_uses_suffix_then_yaml() {
         assert_eq!(guess_format("http://x/a.yaml"), "yaml");
         assert_eq!(guess_format("http://x/a.YML?v=2"), "yaml");
         assert_eq!(guess_format("http://x/a.mrs#f"), "mrs");
         assert_eq!(guess_format("http://x/a.list"), "text");
-        assert_eq!(guess_format("http://x/raw"), "text");
+        assert_eq!(guess_format("http://x/a.conf?x=1"), "text");
+        assert_eq!(guess_format("http://x/raw"), "yaml");
+
+        assert_eq!(guess_format("http://x/release/reject.txt"), "yaml");
+    }
+
+    #[test]
+    fn prefetch_reports_auto_providers_it_could_not_identify() {
+        let dir = scratch("pf_undetected");
+        let clash = dir.with_extension("yaml");
+        std::fs::write(
+            &clash,
+            provider_yaml(&[
+                ("dead", "http://u/dead.txt", &dir.join("d.txt"), "yaml"),
+                ("junk", "http://u/junk", &dir.join("j.txt"), "yaml"),
+                ("ok", "http://u/ok", &dir.join("o.txt"), "yaml"),
+                ("suffix", "http://u/s.list", &dir.join("s.txt"), "text"),
+                ("explicit", "http://u/e", &dir.join("e.txt"), "yaml"),
+            ]),
+        )
+        .unwrap();
+        let rep = prefetch_with(
+            clash.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            &names(&["dead", "junk", "ok", "suffix"]),
+            |url, tmp| {
+                let body: &[u8] = match url {
+                    "http://u/dead.txt" | "http://u/e" => return Err("net down".into()),
+                    "http://u/junk" => b"+.a.com\n",
+                    _ => b"DOMAIN-SUFFIX,a.com\n",
+                };
+                std::fs::write(tmp, body).unwrap();
+                Ok(body.to_vec())
+            },
+        );
+        assert_eq!(rep.undetected, ["dead", "junk"]);
+        let f = formats_of(&clash);
+        assert_eq!(f["ok"], "text");
+        assert_eq!(f["dead"], "yaml", "unknown keeps the guess");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&clash);
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
