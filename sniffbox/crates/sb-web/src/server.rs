@@ -5,8 +5,8 @@ use crate::events::LogTx;
 use crate::screen::ScreenHistory;
 use crate::traffic::TrafficSource;
 use crate::{
-    auth, clash_logs, connections, gate, http, native, proxy_unix, respond, router, screen_poll,
-    static_files,
+    auth, authlimit, clash_logs, connections, gate, http, native, proxy_unix, respond, router,
+    screen_poll, static_files,
 };
 use arc_swap::ArcSwap;
 use std::io;
@@ -51,6 +51,8 @@ pub struct ServerConfig {
     pub reload_inflight: Arc<AtomicBool>,
 
     pub group_delay_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+
+    pub auth_limit: crate::authlimit::AuthLimiter,
 
     pub probe: Option<Arc<dyn crate::probe::ProbeSource>>,
 
@@ -182,16 +184,43 @@ async fn handle_conn(
             continue;
         }
 
-        if route.needs_auth()
-            && !local_ctl
-            && !auth::check_bearer(req.header("authorization"), cfg.token.load().as_str())
-        {
-            respond::unauthorized(&mut stream, ka).await?;
-            carry = consume_body(&mut stream, req.framing()?, body_prefix).await?;
-            if !ka {
+        if route.needs_auth() && !local_ctl {
+
+            if let Some(wait) = cfg.auth_limit.blocked(peer.ip()) {
+                let secs = authlimit::retry_after_secs(wait).to_string();
+                let body = format!(
+                    r#"{{"message":"too many failed logins, retry in {secs}s","retryAfter":{secs}}}"#
+                );
+                respond::send(
+                    &mut stream,
+                    429,
+                    "Too Many Requests",
+                    &[("Content-Type", "application/json"), ("Retry-After", &secs)],
+                    body.as_bytes(),
+                    false,
+                )
+                .await?;
                 return Ok(());
             }
-            continue;
+            let header = req.header("authorization");
+            if !auth::check_bearer(header, cfg.token.load().as_str()) {
+                if authlimit::bearer_presented(header)
+                    && cfg.auth_limit.fail(peer.ip()) == authlimit::Charge::JustBlocked
+                {
+                    tracing::warn!(
+                        %peer,
+                        burst = authlimit::BURST,
+                        "web login throttled: too many wrong tokens from this address"
+                    );
+                }
+                respond::unauthorized(&mut stream, ka).await?;
+                carry = consume_body(&mut stream, req.framing()?, body_prefix).await?;
+                if !ka {
+                    return Ok(());
+                }
+                continue;
+            }
+            cfg.auth_limit.success(peer.ip());
         }
 
         match route {
@@ -263,12 +292,12 @@ async fn handle_conn(
             }
             router::Route::Static => {
                 let ui_root = cfg.webroot.join("ui");
-                serve_static(&mut stream, &ui_root, req.path_only(), "/ui", ka).await?;
+                serve_static(&mut stream, &req, &ui_root, "/ui", ka).await?;
             }
             router::Route::DataFiles => {
 
                 let root = cfg.webroot.join("data");
-                serve_static(&mut stream, &root, req.path_only(), "/data", ka).await?;
+                serve_static(&mut stream, &req, &root, "/data", ka).await?;
             }
             router::Route::Blocked => {
                 tracing::info!(%peer, method = %req.method, path = %req.path_only(), "blocked dangerous clash API");
@@ -418,22 +447,72 @@ async fn geo_update(stream: &mut TcpStream, cfg: &ServerConfig, ka: bool) -> io:
     .await
 }
 
+static GZIP_CACHE: std::sync::LazyLock<static_files::GzipCache> =
+    std::sync::LazyLock::new(static_files::GzipCache::default);
+
 async fn serve_static(
     stream: &mut TcpStream,
+    req: &http::ReqHead,
     webroot: &Path,
-    path: &str,
     prefix: &str,
     ka: bool,
 ) -> io::Result<()> {
-    let Some(file_path) = static_files::resolve_prefixed(webroot, path, prefix) else {
+    let Some(file_path) = static_files::resolve_prefixed(webroot, req.path_only(), prefix) else {
         return respond::forbidden(stream, "bad path\n", ka).await;
     };
-    match tokio::fs::read(&file_path).await {
-        Ok(bytes) => {
-            let ct = static_files::content_type(&file_path);
-            let cc = static_files::cache_control(&file_path);
-            respond::file(stream, ct, cc, &bytes, ka).await
+    let meta = match tokio::fs::metadata(&file_path).await {
+        Ok(m) if m.is_file() => m,
+        _ => return respond::not_found(stream, ka).await,
+    };
+    let etag = static_files::etag(&meta);
+    let ct = static_files::content_type(&file_path);
+    let cc = static_files::cache_control(&file_path);
+    let gzippable = static_files::compressible(&file_path)
+        && (static_files::GZIP_MIN..=static_files::GZIP_MAX_FILE).contains(&meta.len());
+
+    let mut headers: Vec<(&str, &str)> = vec![("Cache-Control", cc), ("ETag", &etag)];
+    if gzippable {
+        headers.push(("Vary", "Accept-Encoding"));
+    }
+    headers.extend_from_slice(&static_files::SECURITY_HEADERS);
+
+    if static_files::etag_matches(req.header("if-none-match"), &etag) {
+        return respond::not_modified_with(stream, &headers, ka).await;
+    }
+    headers.push(("Content-Type", ct));
+
+    if gzippable && static_files::accepts_gzip(req.header("accept-encoding")) {
+        let gz = match GZIP_CACHE.get(&file_path, &etag) {
+            Some(gz) => Some(gz),
+            None => {
+                let Ok(raw) = tokio::fs::read(&file_path).await else {
+                    return respond::not_found(stream, ka).await;
+                };
+                let compressed = tokio::task::spawn_blocking(move || {
+                    let gz = static_files::gzip(&raw);
+                    (gz.len() < raw.len()).then_some(gz).ok_or(raw)
+                })
+                .await
+                .map_err(io::Error::other)?;
+                match compressed {
+                    Ok(gz) => {
+                        let gz: std::sync::Arc<[u8]> = gz.into();
+                        GZIP_CACHE.put(file_path.clone(), etag.clone(), std::sync::Arc::clone(&gz));
+                        Some(gz)
+                    }
+                    Err(raw) => {
+                        return respond::send(stream, 200, "OK", &headers, &raw, ka).await;
+                    }
+                }
+            }
+        };
+        if let Some(gz) = gz {
+            headers.push(("Content-Encoding", "gzip"));
+            return respond::send(stream, 200, "OK", &headers, &gz, ka).await;
         }
+    }
+    match tokio::fs::read(&file_path).await {
+        Ok(bytes) => respond::send(stream, 200, "OK", &headers, &bytes, ka).await,
         Err(_) => respond::not_found(stream, ka).await,
     }
 }

@@ -210,6 +210,17 @@ impl SharedState {
         }
     }
 
+    pub fn clear_traffic_stats(&self) {
+        for rec in self.conn_table.snapshot() {
+            if rec.closed_ms.load(Ordering::Relaxed) == 0 {
+                rec.rebase_cursors();
+            }
+        }
+        self.conn_table.remove_closed();
+        self.traffic.clear();
+        self.agg.clear();
+    }
+
     pub fn splice_copy(&self) -> bool {
         self.splice_copy.load(Ordering::Relaxed)
     }
@@ -357,9 +368,7 @@ impl sb_web::TrafficSource for WebTraffic {
         self.shared.traffic.totals()
     }
     fn clear(&self) {
-        self.shared.conn_table.clear();
-        self.shared.traffic.clear();
-        self.shared.agg.clear();
+        self.shared.clear_traffic_stats();
     }
 }
 
@@ -1056,17 +1065,104 @@ fn live_totals(shared: &SharedState, all: &[Arc<ConnRecord>]) -> (u64, u64) {
 fn connections_snapshot(shared: &SharedState) -> String {
     let all = shared.conn_table.snapshot();
     let (down, up) = live_totals(shared, &all);
-    let conns: Vec<serde_json::Value> = all
+    let conns: Vec<ConnOut<'_>> = all
         .iter()
         .filter(|r| r.closed_ms.load(Ordering::Relaxed) == 0)
-        .map(|r| conn_json(r))
+        .map(|r| ConnOut::of(r))
         .collect();
-    serde_json::json!({
-        "downloadTotal": down,
-        "uploadTotal": up,
-        "connections": conns,
+    serde_json::to_string(&SnapshotOut {
+        download_total: down,
+        upload_total: up,
+        connections: conns,
     })
-    .to_string()
+    .unwrap_or_else(|_| r#"{"downloadTotal":0,"uploadTotal":0,"connections":[]}"#.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotOut<'a> {
+    download_total: u64,
+    upload_total: u64,
+    connections: Vec<ConnOut<'a>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnOut<'a> {
+    #[serde(serialize_with = "ser_display")]
+    id: u64,
+    metadata: MetaOut<'a>,
+    upload: u64,
+    download: u64,
+    start: String,
+    chains: [&'static str; 0],
+    rule: &'static str,
+    rule_payload: &'static str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaOut<'a> {
+    network: &'static str,
+    #[serde(rename = "type")]
+    conn_type: &'static str,
+    #[serde(rename = "sourceIP", serialize_with = "ser_display")]
+    source_ip: IpAddr,
+    #[serde(serialize_with = "ser_display")]
+    source_port: u16,
+    #[serde(rename = "destinationIP", serialize_with = "ser_display")]
+    destination_ip: IpAddr,
+    #[serde(serialize_with = "ser_display")]
+    destination_port: u16,
+    #[serde(serialize_with = "ser_host")]
+    host: (&'a Option<String>, IpAddr),
+    dns_mode: &'static str,
+    process_path: &'static str,
+    special_proxy: &'static str,
+    sniff_host: &'a str,
+}
+
+impl<'a> ConnOut<'a> {
+    fn of(r: &'a ConnRecord) -> Self {
+        let conn_type = if r.kind == RecordKind::Internal {
+            "Inner"
+        } else {
+            inbound_type_str(r.inbound)
+        };
+        Self {
+            id: r.id.0,
+            metadata: MetaOut {
+                network: r.transport.as_str(),
+                conn_type,
+                source_ip: r.src.0,
+                source_port: r.src.1,
+                destination_ip: r.dst.0,
+                destination_port: r.dst.1,
+                host: (&r.domain, r.dst.0),
+                dns_mode: "normal",
+                process_path: "",
+                special_proxy: "",
+                sniff_host: r.domain.as_deref().unwrap_or_default(),
+            },
+            upload: r.upload.load(Ordering::Relaxed),
+            download: r.download.load(Ordering::Relaxed),
+            start: rfc3339_ms(r.created_epoch_ms),
+            chains: [],
+            rule: "",
+            rule_payload: "",
+        }
+    }
+}
+
+fn ser_display<T: std::fmt::Display, S: serde::Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(v)
+}
+
+fn ser_host<S: serde::Serializer>(v: &(&Option<String>, IpAddr), s: S) -> Result<S::Ok, S::Error> {
+    match v.0 {
+        Some(d) => s.serialize_str(d),
+        None => s.collect_str(&v.1),
+    }
 }
 
 pub fn inbound_type_str(inbound: InboundKind) -> &'static str {
@@ -1079,37 +1175,6 @@ pub fn inbound_type_str(inbound: InboundKind) -> &'static str {
 
         InboundKind::Clash(label) => label,
     }
-}
-
-fn conn_json(r: &ConnRecord) -> serde_json::Value {
-
-    let conn_type = if r.kind == RecordKind::Internal {
-        "Inner"
-    } else {
-        inbound_type_str(r.inbound)
-    };
-    serde_json::json!({
-        "id": r.id.0.to_string(),
-        "metadata": {
-            "network": r.transport.as_str(),
-            "type": conn_type,
-            "sourceIP": r.src.0.to_string(),
-            "sourcePort": r.src.1.to_string(),
-            "destinationIP": r.dst.0.to_string(),
-            "destinationPort": r.dst.1.to_string(),
-            "host": r.display_domain(),
-            "dnsMode": "normal",
-            "processPath": "",
-            "specialProxy": "",
-            "sniffHost": r.domain.clone().unwrap_or_default(),
-        },
-        "upload": r.upload.load(Ordering::Relaxed),
-        "download": r.download.load(Ordering::Relaxed),
-        "start": rfc3339_ms(r.created_epoch_ms),
-        "chains": [],
-        "rule": "",
-        "rulePayload": "",
-    })
 }
 
 fn rfc3339_ms(epoch_ms: u64) -> String {
@@ -1628,6 +1693,84 @@ mod tests {
         assert_eq!(conns[0]["chains"].as_array().unwrap().len(), 0);
         assert_eq!(conns[0]["metadata"]["type"], "TProxy");
         assert_eq!(conns[0]["upload"], 100);
+    }
+
+    fn conn_json_reference(r: &ConnRecord) -> serde_json::Value {
+
+        let conn_type = if r.kind == RecordKind::Internal {
+            "Inner"
+        } else {
+            inbound_type_str(r.inbound)
+        };
+        serde_json::json!({
+            "id": r.id.0.to_string(),
+            "metadata": {
+                "network": r.transport.as_str(),
+                "type": conn_type,
+                "sourceIP": r.src.0.to_string(),
+                "sourcePort": r.src.1.to_string(),
+                "destinationIP": r.dst.0.to_string(),
+                "destinationPort": r.dst.1.to_string(),
+                "host": r.display_domain(),
+                "dnsMode": "normal",
+                "processPath": "",
+                "specialProxy": "",
+                "sniffHost": r.domain.clone().unwrap_or_default(),
+            },
+            "upload": r.upload.load(Ordering::Relaxed),
+            "download": r.download.load(Ordering::Relaxed),
+            "start": rfc3339_ms(r.created_epoch_ms),
+            "chains": [],
+            "rule": "",
+            "rulePayload": "",
+        })
+    }
+
+    #[test]
+    fn connections_snapshot_matches_the_value_builder() {
+        use std::net::IpAddr;
+        let shared = SharedState::new(&cfg(false));
+        let mk = |src: &str, dst: &str, domain: Option<&str>| {
+            ConnRecord::new(
+                shared.id_gen.next_id(),
+                (src.parse::<IpAddr>().unwrap(), 40001),
+                (dst.parse::<IpAddr>().unwrap(), 8443),
+                sb_stats::SniffedProto::Tls,
+                domain.map(str::to_string),
+            )
+        };
+        let recs = [
+            Arc::new(mk("192.0.2.7", "198.51.100.9", Some("a.example.com"))),
+            Arc::new(
+                mk("2001:db8::7", "2001:db8::99", None)
+                    .with_inbound(InboundKind::Socks5, sb_stats::Transport::Udp),
+            ),
+            Arc::new(ConnRecord::internal(
+                shared.id_gen.next_id(),
+                ("203.0.113.5".parse().unwrap(), 53),
+                Some("q\"uote\\back.example".into()),
+            )),
+        ];
+        for (i, r) in recs.iter().enumerate() {
+            r.add_up(10 + i as u64);
+            r.add_down(1 << 40);
+            shared.conn_table.insert(Arc::clone(r));
+        }
+        let closed = Arc::new(mk("192.0.2.8", "198.51.100.10", Some("gone.example")));
+        shared.conn_table.insert(Arc::clone(&closed));
+        shared.conn_table.close(closed.id);
+
+        let v: serde_json::Value = serde_json::from_str(&connections_snapshot(&shared)).unwrap();
+        let mut got = v["connections"].as_array().unwrap().clone();
+        got.sort_by_key(|c| c["id"].as_str().unwrap().parse::<u64>().unwrap());
+        let want: Vec<serde_json::Value> = recs.iter().map(|r| conn_json_reference(r)).collect();
+        assert_eq!(
+            got, want,
+            "direct serialization must match the old builder field for field"
+        );
+        let (d, u) = live_totals(&shared, &shared.conn_table.snapshot());
+        assert_eq!(v["downloadTotal"], d);
+        assert_eq!(v["uploadTotal"], u);
     }
 
     #[test]

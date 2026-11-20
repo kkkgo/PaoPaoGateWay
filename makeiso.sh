@@ -58,7 +58,8 @@ sed "s/rootsha/$rootsha/g" "$builddir"/Dockerfile >"$builddir"/iso/Dockerfile
 cp "$builddir"/remakeiso.sh "$builddir"/iso/
 sed -i "s/PPGW_version/$ppgwver/g" "$builddir"/iso/remakeiso.sh
 cd "$builddir"/iso || exit
-docker build -t ppgwiso .
+# downloader stage fetches mihomo/geodata; bypass its cache so builds stay current.
+docker build --no-cache-filter downloader -t ppgwiso .
 
 echo "generate final iso via docker..."
 docker run --rm --name ppgwiso_final \

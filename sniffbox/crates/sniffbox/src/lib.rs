@@ -655,6 +655,7 @@ async fn run(cfg: Config, source: ConfigSource) -> std::io::Result<()> {
             reload_cmd: (!cfg.web.reload_cmd.is_empty()).then(|| cfg.web.reload_cmd.clone()),
             reload_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             group_delay_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            auth_limit: Default::default(),
 
             probe: Some(Arc::new(probe::WebProbe::new(cfg.inbound_proxy.udp))
                 as Arc<dyn sb_web::ProbeSource>),

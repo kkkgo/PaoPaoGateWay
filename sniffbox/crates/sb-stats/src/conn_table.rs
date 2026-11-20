@@ -60,6 +60,8 @@ pub struct ConnTable {
     started: Instant,
 
     started_epoch_ms: u64,
+    #[cfg(test)]
+    skew_ms: AtomicU64,
 }
 
 impl ConnTable {
@@ -68,11 +70,16 @@ impl ConnTable {
             inner: DashMap::new(),
             started: Instant::now(),
             started_epoch_ms: now_epoch_ms(),
+            #[cfg(test)]
+            skew_ms: AtomicU64::new(0),
         }
     }
 
     pub fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+        let ms = self.started.elapsed().as_millis() as u64;
+        #[cfg(test)]
+        let ms = ms + self.skew_ms.load(Ordering::Relaxed);
+        ms
     }
 
     pub fn started_epoch_ms(&self) -> u64 {
@@ -127,35 +134,45 @@ impl ConnTable {
         self.sweep_with_close_grace(stale_after, Duration::from_secs(5))
     }
 
-    pub fn sweep_recency(&self, max_closed: usize, active_stale_after: Duration) -> usize {
-        let now = self.now_ms();
-        let stale_h = active_stale_after.as_millis() as u64;
+    pub fn sweep_recency(&self, max_closed: usize) -> usize {
         let mut closed: Vec<(ConnId, u64)> = Vec::new();
-        let mut stale_active: Vec<ConnId> = Vec::new();
+        let mut orphans: Vec<ConnId> = Vec::new();
         for e in self.inner.iter() {
             let r = e.value();
-            let last_seen = r.last_seen_ms.load(Ordering::Relaxed);
-            let closed_ms = r.closed_ms.load(Ordering::Relaxed);
-            if closed_ms != 0 {
-                closed.push((*e.key(), last_seen));
-            } else if now.saturating_sub(last_seen) > stale_h {
-                stale_active.push(*e.key());
+            if r.closed_ms.load(Ordering::Relaxed) != 0 {
+                closed.push((*e.key(), r.last_seen_ms.load(Ordering::Relaxed)));
+            } else if Arc::strong_count(r) == 1 {
+                orphans.push(*e.key());
             }
         }
-
-        closed.sort_unstable_by_key(|c| std::cmp::Reverse(c.1));
         let mut removed = 0;
         if closed.len() > max_closed {
+
+            if max_closed > 0 {
+                closed.select_nth_unstable_by_key(max_closed, |c| std::cmp::Reverse(c.1));
+            }
             for (id, _) in &closed[max_closed..] {
                 self.inner.remove(id);
                 removed += 1;
             }
         }
-        for id in &stale_active {
-            self.inner.remove(id);
-            removed += 1;
+        for id in &orphans {
+            if self
+                .inner
+                .remove_if(id, |_, r| Arc::strong_count(r) == 1)
+                .is_some()
+            {
+                removed += 1;
+            }
         }
         removed
+    }
+
+    pub fn remove_closed(&self) -> usize {
+        let before = self.inner.len();
+        self.inner
+            .retain(|_, r| r.closed_ms.load(Ordering::Relaxed) == 0);
+        before.saturating_sub(self.inner.len())
     }
 
     pub fn sweep_with_close_grace(&self, stale_after: Duration, closed_grace: Duration) -> usize {
@@ -265,15 +282,77 @@ mod tests {
     async fn sweep_recency_drops_closed_keeps_active() {
         let t = ConnTable::new();
         t.insert(rec(1));
-        t.insert(rec(2));
+        let live = rec(2);
+        t.insert(Arc::clone(&live));
         t.close(ConnId(1));
-        let removed = t.sweep_recency(0, Duration::from_secs(86_400));
+        let removed = t.sweep_recency(0);
         assert_eq!(removed, 1);
         assert!(
             t.get(ConnId(1)).is_none(),
             "closed record dropped (max_closed=0)"
         );
         assert!(t.get(ConnId(2)).is_some(), "active record kept");
+    }
+
+    #[test]
+    fn sweep_recency_keeps_owned_idle_records_and_reaps_orphans() {
+        let t = ConnTable::new();
+        let owned = rec(1);
+        t.insert(Arc::clone(&owned));
+        t.insert(rec(2));
+        t.skew_ms.store(48 * 3_600_000, Ordering::Relaxed);
+        assert!(t.now_ms() - owned.last_seen_ms.load(Ordering::Relaxed) > 86_400_000);
+
+        assert_eq!(t.sweep_recency(0), 1);
+        assert!(
+            t.get(ConnId(1)).is_some(),
+            "an idle record whose owner is alive must not be evicted"
+        );
+        assert!(t.get(ConnId(2)).is_none(), "orphan must be reaped");
+
+        drop(owned);
+        assert_eq!(t.sweep_recency(0), 1, "owner gone without close -> reaped");
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn orphan_held_by_a_snapshot_is_reaped_next_round() {
+        let t = ConnTable::new();
+        t.insert(rec(1));
+        let snap = t.snapshot();
+        assert_eq!(t.sweep_recency(0), 0);
+        drop(snap);
+        assert_eq!(t.sweep_recency(0), 1);
+    }
+
+    #[test]
+    fn sweep_recency_keeps_the_most_recent_closed() {
+        let t = ConnTable::new();
+        let mut owners = Vec::new();
+        for id in [4u64, 9, 1, 7, 10, 2, 8, 3, 6, 5] {
+            let r = rec(id);
+            t.insert(Arc::clone(&r));
+            t.close(ConnId(id));
+            r.last_seen_ms.store(id * 1000, Ordering::Relaxed);
+            owners.push(r);
+        }
+        assert_eq!(t.sweep_recency(3), 7);
+        let mut left: Vec<u64> = t.snapshot().iter().map(|r| r.id.0).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![8, 9, 10]);
+    }
+
+    #[test]
+    fn remove_closed_keeps_active() {
+        let t = ConnTable::new();
+        let a = rec(1);
+        let b = rec(2);
+        t.insert(Arc::clone(&a));
+        t.insert(Arc::clone(&b));
+        t.close(ConnId(2));
+        assert_eq!(t.remove_closed(), 1);
+        assert!(t.get(ConnId(1)).is_some());
+        assert!(t.get(ConnId(2)).is_none());
     }
 
     #[tokio::test]

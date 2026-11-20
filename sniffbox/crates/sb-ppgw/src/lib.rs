@@ -22,6 +22,7 @@ pub mod rt;
 pub mod ruleset;
 pub mod subtime;
 pub mod term;
+pub mod tls;
 pub mod udp_probe;
 pub mod yamltx;
 

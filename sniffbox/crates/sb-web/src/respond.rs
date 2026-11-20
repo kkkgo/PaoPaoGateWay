@@ -47,6 +47,28 @@ pub async fn not_modified<W: AsyncWrite + Unpin>(
     w.flush().await
 }
 
+pub async fn not_modified_with<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    extra: &[(&str, &str)],
+    keep_alive: bool,
+) -> io::Result<()> {
+    let mut head = String::from("HTTP/1.1 304 Not Modified\r\n");
+    head.push_str(if keep_alive {
+        "Connection: keep-alive\r\n"
+    } else {
+        "Connection: close\r\n"
+    });
+    for (k, v) in extra {
+        head.push_str(k);
+        head.push_str(": ");
+        head.push_str(v);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    w.write_all(head.as_bytes()).await?;
+    w.flush().await
+}
+
 pub async fn redirect<W: AsyncWrite + Unpin>(
     w: &mut W,
     location: &str,
@@ -90,27 +112,6 @@ pub async fn not_found<W: AsyncWrite + Unpin>(w: &mut W, keep_alive: bool) -> io
         "Not Found",
         &[("Content-Type", "text/plain")],
         b"not found\n",
-        keep_alive,
-    )
-    .await
-}
-
-pub async fn file<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    content_type: &str,
-    cache_control: &str,
-    body: &[u8],
-    keep_alive: bool,
-) -> io::Result<()> {
-    send(
-        w,
-        200,
-        "OK",
-        &[
-            ("Content-Type", content_type),
-            ("Cache-Control", cache_control),
-        ],
-        body,
         keep_alive,
     )
     .await

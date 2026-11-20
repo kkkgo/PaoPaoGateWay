@@ -552,16 +552,6 @@ async fn doh_query(
     Some(parsed)
 }
 
-fn dot_connector() -> &'static btls::ssl::SslConnector {
-    static CFG: OnceLock<btls::ssl::SslConnector> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let mut b = btls::ssl::SslConnector::builder(btls::ssl::SslMethod::tls())
-            .expect("btls connector builder");
-        b.set_verify(btls::ssl::SslVerifyMode::NONE);
-        b.build()
-    })
-}
-
 fn resolve_dot(
     domain: &str,
     host: &str,
@@ -654,18 +644,7 @@ async fn dot_exchange<S>(domain: &str, host: &str, stream: S, ipv6: bool) -> Opt
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut cfg = dot_connector().configure().ok()?;
-
-    cfg.set_verify_hostname(false);
-    if host.parse::<IpAddr>().is_ok() {
-        cfg.set_use_server_name_indication(false);
-    }
-    let ssl = cfg.into_ssl(host).ok()?;
-    let mut tls = tokio_btls::SslStream::new(ssl, stream).ok()?;
-    tokio::time::timeout(TIMEOUT, std::pin::Pin::new(&mut tls).connect())
-        .await
-        .ok()?
-        .ok()?;
+    let mut tls = crate::tls::connect(stream, host, TIMEOUT).await?;
 
     let mut out = Vec::new();
     if let Some(resp) = dot_one(&mut tls, domain, TYPE_A).await {
@@ -678,7 +657,7 @@ where
 }
 
 async fn dot_one<S>(
-    tls: &mut tokio_btls::SslStream<S>,
+    tls: &mut crate::tls::TlsStream<S>,
     domain: &str,
     qtype: u16,
 ) -> Option<message::DnsResponse>
@@ -757,7 +736,7 @@ mod tests {
     #[test]
     fn dot_connector_builds_and_failed_handshake_returns_none() {
         use std::net::TcpListener;
-        let _ = dot_connector();
+        let _ = crate::tls::insecure_connector();
 
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();

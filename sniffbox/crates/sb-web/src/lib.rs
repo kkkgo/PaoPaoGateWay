@@ -2,6 +2,7 @@
 
 pub mod acl;
 pub mod auth;
+pub mod authlimit;
 pub mod clash_ctl;
 pub mod clash_logs;
 pub mod cloudflared;
@@ -33,7 +34,7 @@ pub use auth::{TokenHandle, check_bearer, derive_secret, token_handle};
 pub use clash_ctl::ClashControl;
 pub use cloudflared::CloudflaredSource;
 pub use connections::ConnectionsSource;
-pub use events::{LogEvent, LogSource, LogTx};
+pub use events::{LogEvent, LogHub, LogSource, LogTx};
 pub use geo::{GeoControl, GeoFut};
 pub use info::{InfoScope, InfoSource};
 pub use nodes::NodesSource;

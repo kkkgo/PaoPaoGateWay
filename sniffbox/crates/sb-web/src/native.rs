@@ -30,7 +30,7 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/logs/sse" => {
-            logs_sse(stream, cfg, shutdown).await?;
+            logs_sse(stream, req, cfg, shutdown).await?;
             Ok(false)
         }
         "/sniffbox/screen" => {
@@ -46,7 +46,9 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/traffic/clear" => {
-            traffic_clear(stream, cfg, ka).await?;
+            if post_only(stream, req, ka).await? {
+                traffic_clear(stream, cfg, ka).await?;
+            }
             Ok(ka)
         }
         "/sniffbox/traffic/sse" => {
@@ -70,7 +72,9 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/nodes/clear" => {
-            nodes_clear(stream, cfg, ka).await?;
+            if post_only(stream, req, ka).await? {
+                nodes_clear(stream, cfg, ka).await?;
+            }
             Ok(ka)
         }
         "/sniffbox/info" => {
@@ -90,11 +94,15 @@ pub async fn handle(
             Ok(ka)
         }
         "/sniffbox/reload" => {
-            reload(stream, cfg, ka).await?;
+            if post_only(stream, req, ka).await? {
+                reload(stream, cfg, ka).await?;
+            }
             Ok(ka)
         }
         "/sniffbox/clash/up" => {
-            clash_up(stream, cfg, ka).await?;
+            if post_only(stream, req, ka).await? {
+                clash_up(stream, cfg, ka).await?;
+            }
             Ok(ka)
         }
         "/sniffbox/cloudflared" => {
@@ -118,6 +126,22 @@ pub async fn handle(
             Ok(ka)
         }
     }
+}
+
+async fn post_only(stream: &mut TcpStream, req: &ReqHead, ka: bool) -> io::Result<bool> {
+    if req.method.eq_ignore_ascii_case("POST") {
+        return Ok(true);
+    }
+    respond::send(
+        stream,
+        405,
+        "Method Not Allowed",
+        &[JSON, ("Allow", "POST")],
+        br#"{"message":"use POST"}"#,
+        ka,
+    )
+    .await?;
+    Ok(false)
 }
 
 async fn probe(
@@ -737,14 +761,27 @@ async fn traffic_sse(
 
 async fn logs_sse(
     stream: &mut TcpStream,
+    req: &ReqHead,
     cfg: &ServerConfig,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let Some(tx) = cfg.log_tx.as_ref() else {
+    let Some(hub) = cfg.log_tx.as_ref() else {
         return respond::not_found(stream, false).await;
     };
-    let mut rx = tx.subscribe();
+    let mut rx = hub.subscribe();
     sse::write_headers(stream).await?;
+    let mut last_sent = 0u64;
+    if let Some(from) = replay_from(&req.path, hub.epoch()) {
+        sse::event(
+            stream,
+            &format!(r#"{{"hello":true,"epoch":{}}}"#, hub.epoch()),
+        )
+        .await?;
+        for ev in hub.since(from) {
+            sse::event(stream, &ev.to_json()).await?;
+            last_sent = ev.seq;
+        }
+    }
     let mut hb = tokio::time::interval(Duration::from_secs(15));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -753,12 +790,21 @@ async fn logs_sse(
         tokio::select! {
             _ = sd.changed() => { if *sd.borrow() { return Ok(()); } }
             r = rx.recv() => match r {
+                Ok(ev) if ev.seq <= last_sent => {}
                 Ok(ev) => sse::event(stream, &ev.to_json()).await?,
                 Err(RecvError::Lagged(n)) => sse::comment(stream, &format!("lagged {n}")).await?,
                 Err(RecvError::Closed) => return Ok(()),
             },
             _ = hb.tick() => sse::comment(stream, "ping").await?,
         }
+    }
+}
+
+fn replay_from(path: &str, epoch: u64) -> Option<u64> {
+    let since = query_param(path, "since")?.parse::<u64>().unwrap_or(0);
+    match query_param(path, "epoch").and_then(|e| e.parse::<u64>().ok()) {
+        Some(e) if e != epoch => Some(0),
+        _ => Some(since),
     }
 }
 
@@ -822,7 +868,29 @@ async fn read_screen_async(dev: PathBuf) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{etag_of, if_none_match_hits, pct_decode, query_param};
+    use super::{etag_of, if_none_match_hits, pct_decode, query_param, replay_from};
+
+    #[test]
+    fn log_replay_start() {
+        let e = 1_700_000_000_000u64;
+        assert_eq!(
+            replay_from("/sniffbox/logs/sse", e),
+            None,
+            "no since = live only (old clients)"
+        );
+        assert_eq!(replay_from("/sniffbox/logs/sse?since=0", e), Some(0));
+        assert_eq!(replay_from("/sniffbox/logs/sse?since=42", e), Some(42));
+        assert_eq!(
+            replay_from(&format!("/sniffbox/logs/sse?since=42&epoch={e}"), e),
+            Some(42)
+        );
+        assert_eq!(
+            replay_from("/sniffbox/logs/sse?since=42&epoch=1", e),
+            Some(0),
+            "gateway restarted: seq numbering restarted too, replay everything"
+        );
+        assert_eq!(replay_from("/sniffbox/logs/sse?since=junk", e), Some(0));
+    }
 
     #[test]
     fn if_none_match_follows_rfc_weak_comparison() {

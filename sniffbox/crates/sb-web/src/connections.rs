@@ -54,7 +54,10 @@ pub async fn handle(
     }
 
     let ka = ka && !req.is_upgrade();
-    let body = src.connections_json();
+    let src = Arc::clone(src);
+    let body = tokio::task::spawn_blocking(move || src.connections_json())
+        .await
+        .map_err(io::Error::other)?;
     respond::send(
         stream,
         200,

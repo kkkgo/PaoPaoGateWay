@@ -516,6 +516,7 @@ impl CloudflaredSupervisor {
 
             let mut g = self.global.lock().unwrap_or_else(|e| e.into_inner());
             g.last_download = None;
+            g.last_update = None;
         }
 
         for egress in Egress::ALL {
@@ -808,7 +809,9 @@ impl CloudflaredSupervisor {
             return;
         }
 
-        let changed = if self.proxy_chores_possible() {
+        let changed = if !self.update_due() {
+            false
+        } else if self.proxy_chores_possible() {
             self.run_update()
         } else {
 
@@ -1183,18 +1186,18 @@ impl CloudflaredSupervisor {
 
         let before = file_fingerprint(&staged);
         match run_as_cf(&staged, &["update"], egress, UPDATE_TIMEOUT, &self.logs) {
-            Ok(true) => {
+            Ok(st) if update_finished(st.code()) => {
                 let after = file_fingerprint(&staged);
                 if after != before && after.is_some() {
-                    match std::fs::copy(&staged, CF_BIN).and_then(|_| set_mode(CF_BIN, 0o755)) {
-                        Ok(()) => tracing::info!(version = %cf_version(), "cloudflared updated"),
+                    match install_binary(&staged, CF_BIN, verify_runs) {
+                        Ok(version) => tracing::info!(%version, "cloudflared updated"),
                         Err(e) => tracing::warn!(?e, "cloudflared: install of update failed"),
                     }
                 } else {
                     tracing::info!("cloudflared already up to date");
                 }
             }
-            Ok(false) => tracing::info!("cloudflared update reported no change / failed; continue"),
+            Ok(st) => tracing::info!(code = ?st.code(), "cloudflared update failed; continue"),
             Err(e) => tracing::warn!(?e, "cloudflared update could not run; continue"),
         }
         Ok(())
@@ -1413,13 +1416,35 @@ fn cf_version() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+fn update_finished(code: Option<i32>) -> bool {
+    matches!(code, Some(0) | Some(11))
+}
+
+fn install_binary(
+    src: &str,
+    dst: &str,
+    verify: impl Fn(&str) -> io::Result<String>,
+) -> io::Result<String> {
+    let tmp = format!("{dst}.update");
+    let _ = std::fs::remove_file(&tmp);
+    let staged = std::fs::copy(src, &tmp)
+        .and_then(|_| set_mode(&tmp, 0o755))
+        .and_then(|()| verify_elf(&tmp))
+        .and_then(|()| verify(&tmp))
+        .and_then(|version| std::fs::rename(&tmp, dst).map(|()| version));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
+}
+
 fn run_as_cf(
     bin: &str,
     args: &[&str],
     egress: Egress,
     timeout: Duration,
     logs: &Arc<sb_web::LineHistory>,
-) -> io::Result<bool> {
+) -> io::Result<std::process::ExitStatus> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .env("HOME", egress.home())
@@ -1438,7 +1463,7 @@ fn run_as_cf(
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait()? {
-            Some(st) => return Ok(st.success()),
+            Some(st) => return Ok(st),
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -2424,7 +2449,8 @@ mod tests {
         let tick = method_body(src, "fn tick_locked(&self)");
 
         assert!(
-            tick.contains("let changed = if self.proxy_chores_possible() {")
+            tick.contains("let changed = if !self.update_due() {")
+                && tick.contains("} else if self.proxy_chores_possible() {")
                 && tick.contains("self.run_update()"),
             "run_update() must stay behind a proxy_chores_possible() gate"
         );
@@ -2825,5 +2851,88 @@ mod tests {
         buf[18..20].copy_from_slice(&cf_elf_machine().to_le_bytes());
         std::fs::write(&p, buf).unwrap();
         verify_elf(p.to_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn update_exit_11_means_a_new_binary_is_in_place() {
+        assert!(update_finished(Some(0)));
+        assert!(update_finished(Some(11)));
+        assert!(!update_finished(Some(10)));
+        assert!(!update_finished(Some(1)));
+        assert!(!update_finished(None), "killed by a signal");
+    }
+
+    fn spawn_retrying(path: &std::path::Path) -> std::process::Child {
+        for _ in 0..50 {
+            match Command::new(path).arg("30").spawn() {
+                Ok(c) => return c,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("spawn {path:?}: {e}"),
+            }
+        }
+        panic!("{path:?} stayed busy");
+    }
+
+    #[test]
+    fn install_replaces_a_binary_that_is_running() {
+        let (Some(sleep), Some(bash)) = (
+            ["/usr/bin/sleep", "/bin/sleep"]
+                .into_iter()
+                .find(|p| Path::new(p).is_file()),
+            ["/usr/bin/bash", "/bin/bash"]
+                .into_iter()
+                .find(|p| Path::new(p).is_file() && verify_elf(p).is_ok()),
+        ) else {
+            eprintln!("skipped: needs coreutils sleep and a >1 MB native bash");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("cloudflared");
+        std::fs::copy(sleep, &dst).unwrap();
+        set_mode(dst.to_str().unwrap(), 0o755).unwrap();
+        let mut running = spawn_retrying(&dst);
+
+        let blocked = std::fs::copy(bash, &dst);
+        assert_eq!(
+            blocked.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ETXTBSY),
+            "precondition: writing over a running executable must fail"
+        );
+
+        let version =
+            install_binary(bash, dst.to_str().unwrap(), |p| run_version(p, None)).unwrap();
+        assert!(!version.is_empty());
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            std::fs::read(bash).unwrap(),
+            "the new binary is in place"
+        );
+        assert!(
+            !dir.path().join("cloudflared.update").exists(),
+            "no temp file left behind"
+        );
+        assert!(
+            running.try_wait().unwrap().is_none(),
+            "the running process keeps its old inode"
+        );
+        let _ = running.kill();
+        let _ = running.wait();
+    }
+
+    #[test]
+    fn install_leaves_the_old_binary_when_the_new_one_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("cloudflared");
+        let bad = dir.path().join("bad");
+        std::fs::write(&dst, b"old").unwrap();
+        std::fs::write(&bad, vec![b'<'; 2_000_000]).unwrap();
+        let r = install_binary(bad.to_str().unwrap(), dst.to_str().unwrap(), |_| {
+            panic!("must not run a binary that failed the ELF check")
+        });
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
+        assert!(!dir.path().join("cloudflared.update").exists());
     }
 }

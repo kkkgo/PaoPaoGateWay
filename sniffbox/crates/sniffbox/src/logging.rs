@@ -1,6 +1,6 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use sb_web::{LogEvent, LogSource, LogTx};
+use sb_web::{LogEvent, LogHub, LogSource, LogTx};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -16,6 +16,9 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 static ANSI: AtomicBool = AtomicBool::new(false);
 
 static LOG_TX: OnceLock<LogTx> = OnceLock::new();
+
+const LOG_HISTORY_EVENTS: usize = 2000;
+const LOG_HISTORY_BYTES: usize = 512 * 1024;
 
 static LOG_SINK: OnceLock<LogSink> = OnceLock::new();
 
@@ -333,16 +336,18 @@ struct BroadcastLayer {
 
 impl<S: Subscriber> Layer<S> for BroadcastLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if self.tx.receiver_count() == 0 {
+        let level = event.metadata().level();
+        if *level > Level::INFO && self.tx.receiver_count() == 0 {
             return;
         }
         let mut msg = String::new();
         let mut v = MsgVisitor { out: &mut msg };
         event.record(&mut v);
-        let level = event.metadata().level().as_str().to_ascii_lowercase();
-        let _ = self
-            .tx
-            .send(Arc::new(LogEvent::new(LogSource::Sniffbox, level, msg)));
+        self.tx.publish(LogEvent::new(
+            LogSource::Sniffbox,
+            level.as_str().to_ascii_lowercase(),
+            msg,
+        ));
     }
 }
 
@@ -389,7 +394,7 @@ pub fn init(level: &str, timestamp: bool) {
             !(meta.target().starts_with("sniffbox::smart_speed") && *meta.level() == Level::DEBUG)
         }));
 
-    let (tx, _rx0) = tokio::sync::broadcast::channel::<Arc<LogEvent>>(1024);
+    let tx = LogHub::new(1024, LOG_HISTORY_EVENTS, LOG_HISTORY_BYTES);
     let _ = LOG_TX.set(tx.clone());
     let bcast_layer = BroadcastLayer { tx };
 
@@ -553,10 +558,8 @@ mod tests {
 
     #[test]
     fn broadcast_preserves_message_ansi_color_codes() {
-        use std::sync::Arc;
-        use tokio::sync::broadcast;
-
-        let (tx, mut rx) = broadcast::channel::<Arc<sb_web::LogEvent>>(8);
+        let tx = LogHub::new(8, 16, 1 << 16);
+        let mut rx = tx.subscribe();
         let bcast_layer = BroadcastLayer { tx };
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(bcast_layer));
@@ -565,5 +568,37 @@ mod tests {
 
         let ev = rx.try_recv().expect("event should be broadcast");
         assert_eq!(ev.msg, "\x1b[32ma.com\x1b[0m");
+    }
+
+    #[test]
+    fn info_is_kept_without_subscribers_debug_is_not() {
+        let hub = LogHub::new(8, 16, 1 << 16);
+        let layer = BroadcastLayer { tx: hub.clone() };
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(EnvFilter::new("trace"))
+                .with(layer),
+        );
+        assert_eq!(hub.receiver_count(), 0);
+        tracing::info!("clash started");
+        tracing::debug!("smart probe noise");
+        tracing::warn!(peer = "10.0.0.9\x07", "reload failed");
+        let kept: Vec<_> = hub
+            .since(0)
+            .iter()
+            .map(|e| (e.level.clone(), e.msg.clone()))
+            .collect();
+        assert_eq!(kept.len(), 2, "info + warn kept, debug dropped: {kept:?}");
+        assert_eq!(kept[0], ("info".to_string(), "clash started".to_string()));
+        assert_eq!(kept[1].0, "warn");
+        assert!(
+            kept[1].1.starts_with("reload failed peer="),
+            "{:?}",
+            kept[1].1
+        );
+        assert!(
+            !kept[1].1.contains('\x07'),
+            "named fields are still sanitized"
+        );
     }
 }

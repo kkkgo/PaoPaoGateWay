@@ -308,7 +308,7 @@ pub struct Score {
 
 pub fn score(s: &Sample) -> Option<Score> {
     let protocol = s.protocol?;
-    if !s.ready || s.ttfb.is_empty() || s.rate.is_empty() {
+    if !s.ready || s.void || s.ttfb.is_empty() || s.rate.is_empty() {
         return None;
     }
     let attempts = (s.ttfb.len() + s.rate.len() + s.failures as usize) as f64;
@@ -501,6 +501,10 @@ fn describe(s: &Option<Score>, sample: &Sample) -> String {
                 "registered, but the new hostname never resolved on this egress".to_string()
             }
             Stage::Resolved => format!("registered and resolved, but never answered 200{}", why()),
+            Stage::Warm if sample.void => format!(
+                "reachable, but the edge answered on its own, so the round says nothing about the transport{}",
+                why()
+            ),
             Stage::Warm => format!(
                 "reachable, but no usable sample ({} failed){}",
                 sample.failures,
@@ -912,6 +916,31 @@ mod tests {
     }
 
     #[test]
+    fn an_arm_the_edge_answered_for_is_void_not_unstable() {
+        let ok = |void| Sample {
+            protocol: Some(Protocol::Http2),
+            ready: true,
+            stage: crate::cf_probe::Stage::Warm,
+            ttfb: vec![Duration::from_millis(90); 3],
+            rate: vec![8e6; 3],
+            failures: 0,
+            void,
+            ..Default::default()
+        };
+        assert!(score(&ok(false)).is_some());
+        assert!(
+            score(&ok(true)).is_none(),
+            "samples taken before the edge started answering must not score"
+        );
+        let other = ok(false);
+        assert_eq!(
+            rank((&score(&ok(true)), &ok(true)), (&score(&other), &other)),
+            None,
+            "a void arm is no information, never a default win for the other arm"
+        );
+    }
+
+    #[test]
     fn describe_tells_every_stage_apart() {
         use crate::cf_probe::Stage;
         let at = |stage, failures, detail: Option<&str>| Sample {
@@ -930,11 +959,23 @@ mod tests {
                 &at(Stage::Resolved, 0, Some("edge answered \"HTTP/1.1 530\"")),
             ),
             describe(&None, &at(Stage::Warm, 8, Some("timed out"))),
+            describe(
+                &None,
+                &Sample {
+                    void: true,
+                    ..at(
+                        Stage::Warm,
+                        0,
+                        Some("edge answered \"HTTP/1.1 301 Moved Permanently\""),
+                    )
+                },
+            ),
         ];
         assert!(said[0].contains("did not register"));
         assert!(said[1].contains("never resolved"));
         assert!(said[2].contains("never answered 200") && said[2].contains("530"));
         assert!(said[3].contains("no usable sample") && said[3].contains("timed out"));
+        assert!(said[4].contains("edge answered on its own") && said[4].contains("301"));
 
         for i in 0..said.len() {
             for j in (i + 1)..said.len() {

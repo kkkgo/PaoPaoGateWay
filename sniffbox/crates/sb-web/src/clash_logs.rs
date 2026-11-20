@@ -1,11 +1,10 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-use crate::events::{LogEvent, LogSource, LogTx};
+use crate::events::{LogSource, LogTx};
 use crate::http;
 use crate::idle_gate::IdleGate;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -135,8 +134,7 @@ fn emit_line(line: &[u8], log_tx: &LogTx) {
         .and_then(|p| p.as_str())
         .unwrap_or(line)
         .to_string();
-
-    let _ = log_tx.send(Arc::new(LogEvent::new(LogSource::Clash, level, msg)));
+    log_tx.emit(LogSource::Clash, level, msg);
 }
 
 pub(crate) struct ChunkDecoder {
@@ -229,7 +227,8 @@ mod tests {
 
     #[test]
     fn emit_parses_clash_json() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let tx = crate::events::LogHub::new(8, 8, 1 << 12);
+        let mut rx = tx.subscribe();
         emit_line(br#"{"type":"warning","payload":"rule not found"}"#, &tx);
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.source, LogSource::Clash);
@@ -239,7 +238,8 @@ mod tests {
 
     #[test]
     fn emit_ignores_non_json() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let tx = crate::events::LogHub::new(8, 8, 1 << 12);
+        let mut rx = tx.subscribe();
         emit_line(b"not json at all", &tx);
         emit_line(b"", &tx);
         assert!(rx.try_recv().is_err());

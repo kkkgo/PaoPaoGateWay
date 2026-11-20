@@ -40,17 +40,9 @@ fn flush_once(shared: &SharedState, clean_state: &mut CleanState) {
     let net_cleanday = shared.net_cleanday();
     drain_local(shared);
 
-    let _ = shared
-        .conn_table
-        .sweep_recency(0, Duration::from_secs(86_400));
+    let _ = shared.conn_table.sweep_recency(0);
 
-    maybe_clean(net_cleanday, clean_state, || {
-        shared.conn_table.clear();
-        shared.traffic.clear();
-        shared.agg.clear();
-        shared.node_dist.clear();
-        shared.cf_traffic.clear();
-    });
+    maybe_clean(net_cleanday, clean_state, || daily_clean(shared));
 
     shared.sniff_neg.gc();
 
@@ -68,6 +60,12 @@ fn flush_once(shared: &SharedState, clean_state: &mut CleanState) {
     } else {
         shared.agg.prune(max_rec);
     }
+}
+
+fn daily_clean(shared: &SharedState) {
+    shared.clear_traffic_stats();
+    shared.node_dist.clear();
+    shared.cf_traffic.clear();
 }
 
 fn drain_local(shared: &SharedState) {
@@ -238,5 +236,91 @@ mod tests {
 
         drain_local(&shared);
         assert_eq!(shared.traffic.totals(), (1_073_741_824, 900));
+    }
+
+    fn active_ids(shared: &Arc<SharedState>) -> Vec<String> {
+        use sb_web::ConnectionsSource;
+        let body = crate::runtime::WebConnections {
+            shared: Arc::clone(shared),
+        }
+        .connections_json();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn agg_rows(shared: &Arc<SharedState>) -> Vec<serde_json::Value> {
+        shared.agg.rebuild(shared.max_rec());
+        serde_json::from_str(&shared.agg.snapshot_json()).unwrap()
+    }
+
+    #[test]
+    fn traffic_clear_keeps_live_connections_and_counts_only_new_bytes() {
+        use sb_web::TrafficSource;
+        let shared = shared_net_rec_on();
+        let mut clean = CleanState::default();
+        let live = rec_with_bytes(1, 100, 200);
+        shared.conn_table.insert(Arc::clone(&live));
+        let done = rec_with_bytes(2, 1, 1);
+        shared.conn_table.insert(Arc::clone(&done));
+        flush_once(&shared, &mut clean);
+        shared.conn_table.close(done.id);
+        assert_eq!(shared.traffic.totals(), (201, 101));
+
+        crate::runtime::WebTraffic {
+            shared: Arc::clone(&shared),
+        }
+        .clear();
+        assert_eq!(shared.traffic.totals(), (0, 0));
+        assert_eq!(active_ids(&shared), vec![live.id.0.to_string()]);
+        assert!(shared.conn_table.get(done.id).is_none());
+
+        live.add_up(5);
+        live.add_down(7);
+        flush_once(&shared, &mut clean);
+        assert_eq!(
+            shared.traffic.totals(),
+            (7, 5),
+            "only post-clear bytes are counted"
+        );
+        let rows = agg_rows(&shared);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["up"], 5);
+        assert_eq!(rows[0]["down"], 7);
+        assert_eq!(
+            rows[0]["conns"], 1,
+            "live conn counts once in the fresh window"
+        );
+    }
+
+    #[test]
+    fn daily_clean_keeps_live_connections() {
+        let shared = shared_net_rec_off();
+        let mut clean = CleanState::default();
+        let live = rec_with_bytes(1, 10, 20);
+        shared.conn_table.insert(Arc::clone(&live));
+        flush_once(&shared, &mut clean);
+        daily_clean(&shared);
+        assert_eq!(shared.traffic.totals(), (0, 0));
+        assert_eq!(active_ids(&shared), vec![live.id.0.to_string()]);
+        live.add_down(3);
+        flush_once(&shared, &mut clean);
+        assert_eq!(shared.traffic.totals(), (3, 0));
+    }
+
+    #[test]
+    fn housekeeping_reaps_orphans_after_accounting_and_keeps_owned() {
+        let shared = shared_net_rec_off();
+        let mut clean = CleanState::default();
+        let owned = rec_with_bytes(1, 0, 0);
+        shared.conn_table.insert(Arc::clone(&owned));
+        shared.conn_table.insert(rec_with_bytes(2, 30, 40));
+        flush_once(&shared, &mut clean);
+        assert_eq!(shared.traffic.totals(), (40, 30));
+        assert_eq!(active_ids(&shared), vec![owned.id.0.to_string()]);
     }
 }

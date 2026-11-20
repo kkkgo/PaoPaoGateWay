@@ -247,6 +247,12 @@ impl ConnRecord {
             drain_one(&self.download, &self.last_folded_down),
         )
     }
+
+    pub fn rebase_cursors(&self) {
+        let _ = self.drain_delta();
+        let _ = self.fold_delta();
+        self.agg_counted.store(false, Ordering::Relaxed);
+    }
 }
 
 fn drain_one(cur: &AtomicU64, last: &AtomicU64) -> u64 {

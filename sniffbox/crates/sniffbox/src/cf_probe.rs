@@ -44,6 +44,8 @@ pub struct Sample {
     pub stage: Stage,
 
     pub detail: Option<String>,
+
+    pub void: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -346,7 +348,7 @@ async fn resolve(egress: Egress, host: &str) -> Option<SocketAddr> {
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
     loop {
         if let Some(ip) = crate::cf_edge::resolve_a(egress, host).await {
-            return Some(SocketAddr::new(ip, 80));
+            return Some(SocketAddr::new(ip, 443));
         }
         if Instant::now() >= deadline {
             return None;
@@ -477,30 +479,35 @@ impl Arm {
     }
 
     async fn sample_tiny(arm: &mut Option<Arm>, s: &mut Sample) {
-        let Some(arm) = arm else { return };
-        match get(arm.addr, &arm.host, "/", 0).await {
+        let Some(a) = arm.as_ref() else { return };
+        match get(a.addr, &a.host, "/", 0).await {
             Ok((ttfb, _)) => s.ttfb.push(ttfb),
-            Err(e) => {
-                s.failures += 1;
-                s.detail.get_or_insert_with(|| e.as_text());
-            }
+            Err(e) => Arm::failed(arm, s, e),
         }
     }
 
     async fn sample_sized(arm: &mut Option<Arm>, s: &mut Sample) {
-        let Some(arm) = arm else { return };
+        let Some(a) = arm.as_ref() else { return };
         let path = format!("/b/{PROBE_BYTES}");
-        match get(arm.addr, &arm.host, &path, PROBE_BYTES).await {
+        match get(a.addr, &a.host, &path, PROBE_BYTES).await {
             Ok((_, body)) if !body.is_zero() => {
                 s.rate.push(PROBE_BYTES as f64 / body.as_secs_f64())
             }
 
             Ok(_) => s.failures += 1,
-            Err(e) => {
-                s.failures += 1;
-                s.detail.get_or_insert_with(|| e.as_text());
-            }
+            Err(e) => Arm::failed(arm, s, e),
         }
+    }
+
+    fn failed(arm: &mut Option<Arm>, s: &mut Sample, e: ProbeErr) {
+        if e.edge_answered() {
+            s.void = true;
+            s.detail = Some(e.as_text());
+            *arm = None;
+            return;
+        }
+        s.failures += 1;
+        s.detail.get_or_insert_with(|| e.as_text());
     }
 }
 
@@ -526,6 +533,8 @@ pub enum ProbeErr {
 
     Connect,
 
+    Tls,
+
     Io,
 
     Status(String),
@@ -539,11 +548,22 @@ impl ProbeErr {
     pub fn as_text(&self) -> String {
         match self {
             Self::Connect => "cannot connect (proxy refused, or edge unreachable)".into(),
+            Self::Tls => "TLS handshake with the edge failed".into(),
             Self::Io => "connection broke before a response".into(),
             Self::Status(line) => format!("edge answered {line:?}"),
             Self::Short { got, want } => format!("truncated body ({got}/{want} bytes)"),
             Self::Timeout => "timed out".into(),
         }
+    }
+
+    pub fn edge_answered(&self) -> bool {
+        let Self::Status(line) = self else {
+            return false;
+        };
+        line.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .is_some_and(|c| (300..500).contains(&c))
     }
 }
 
@@ -553,44 +573,61 @@ async fn get(
     path: &str,
     expect: usize,
 ) -> Result<(Duration, Duration), ProbeErr> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let work = async {
-        let mut s = connect(addr).await.ok_or(ProbeErr::Connect)?;
-        let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        let started = Instant::now();
-        s.write_all(req.as_bytes())
-            .await
-            .map_err(|_| ProbeErr::Io)?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let n = s.read(&mut buf).await.map_err(|_| ProbeErr::Io)?;
-        if n == 0 {
-            return Err(ProbeErr::Io);
-        }
-        let ttfb = started.elapsed();
-
-        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
-        if !head.starts_with("HTTP/1.1 200") {
-            return Err(ProbeErr::Status(status_line(&head)));
-        }
-        let body_start = head.find("\r\n\r\n").map(|i| n - (i + 4)).unwrap_or(0);
-        let stream_started = Instant::now();
-        let mut got = body_start;
-        loop {
-            let r = s.read(&mut buf).await.map_err(|_| ProbeErr::Io)?;
-            if r == 0 {
-                break;
-            }
-            got += r;
-        }
-        if got < expect {
-            return Err(ProbeErr::Short { got, want: expect });
-        }
-        Ok((ttfb, stream_started.elapsed()))
+        let s = connect(addr, host).await?;
+        exchange(s, host, path, expect).await
     };
     match tokio::time::timeout(SAMPLE_TIMEOUT, work).await {
         Ok(r) => r,
         Err(_) => Err(ProbeErr::Timeout),
     }
+}
+
+async fn exchange<S>(
+    mut s: S,
+    host: &str,
+    path: &str,
+    expect: usize,
+) -> Result<(Duration, Duration), ProbeErr>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let started = Instant::now();
+    s.write_all(req.as_bytes())
+        .await
+        .map_err(|_| ProbeErr::Io)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = s.read(&mut buf).await.map_err(|_| ProbeErr::Io)?;
+    if n == 0 {
+        return Err(ProbeErr::Io);
+    }
+    let ttfb = started.elapsed();
+
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    if !head.starts_with("HTTP/1.1 200") {
+        return Err(ProbeErr::Status(status_line(&head)));
+    }
+    let body_start = head.find("\r\n\r\n").map(|i| n - (i + 4)).unwrap_or(0);
+    let stream_started = Instant::now();
+    let mut got = body_start;
+    loop {
+        let r = match s.read(&mut buf).await {
+            Ok(r) => r,
+
+            Err(_) if got >= expect => 0,
+            Err(_) => return Err(ProbeErr::Io),
+        };
+        if r == 0 {
+            break;
+        }
+        got += r;
+    }
+    if got < expect {
+        return Err(ProbeErr::Short { got, want: expect });
+    }
+    Ok((ttfb, stream_started.elapsed()))
 }
 
 fn status_line(head: &str) -> String {
@@ -603,11 +640,19 @@ fn status_line(head: &str) -> String {
         .collect()
 }
 
-async fn connect(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
-    if let Some(s) = connect_via_health_socks5(addr).await {
-        return Some(s);
-    }
-    tokio::net::TcpStream::connect(addr).await.ok()
+async fn connect(
+    addr: SocketAddr,
+    host: &str,
+) -> Result<sb_ppgw::tls::TlsStream<tokio::net::TcpStream>, ProbeErr> {
+    let tcp = match connect_via_health_socks5(addr).await {
+        Some(s) => s,
+        None => tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|_| ProbeErr::Connect)?,
+    };
+    sb_ppgw::tls::connect(tcp, host, SAMPLE_TIMEOUT)
+        .await
+        .ok_or(ProbeErr::Tls)
 }
 
 async fn connect_via_health_socks5(addr: SocketAddr) -> Option<tokio::net::TcpStream> {
@@ -853,6 +898,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live quick tunnel named in CF_PROBE_HOST + internet"]
+    async fn probe_client_leg() {
+        let host = std::env::var("CF_PROBE_HOST").expect("CF_PROBE_HOST");
+        let addr = tokio::net::lookup_host((host.as_str(), 443))
+            .await
+            .unwrap()
+            .next()
+            .expect("hostname resolves");
+        let r = get(addr, &host, "/", 0).await;
+        println!("addr: {addr}\nget : {r:?}");
+        if let Err(e) = &r {
+            println!("edge answered on its own: {}", e.edge_answered());
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "spawns two real quick tunnels (~8 MB); needs root + cloudflared + internet"]
     async fn real_scoring_round() {
         let (quic, http2) = measure_pair(Egress::Direct, crate::cf_quality::ROUNDS).await;
@@ -877,6 +938,126 @@ mod tests {
 
         assert_eq!(log_tail(&dir.join("gone.log"), 3), "<no log>");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct Scripted {
+        data: Vec<u8>,
+        pos: usize,
+        then_err: bool,
+    }
+
+    impl tokio::io::AsyncRead for Scripted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return std::task::Poll::Ready(if self.then_err {
+                    Err(std::io::Error::other("unexpected eof"))
+                } else {
+                    Ok(())
+                });
+            }
+            let take = buf.remaining().min(self.data.len() - self.pos).min(1000);
+            let start = self.pos;
+            buf.put_slice(&self.data[start..start + take]);
+            self.pos += take;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Scripted {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn reply(head: &str, body: usize, then_err: bool) -> Scripted {
+        let mut data = head.as_bytes().to_vec();
+        data.extend(std::iter::repeat_n(0u8, body));
+        Scripted {
+            data,
+            pos: 0,
+            then_err,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edge_redirect_is_reported_as_the_edge_answering() {
+        let head = "HTTP/1.1 301 Moved Permanently\r\nLocation: https://x/\r\n\r\n";
+        let err = exchange(reply(head, 0, false), "x", "/", 0)
+            .await
+            .unwrap_err();
+        assert!(err.edge_answered(), "{err:?}");
+        assert!(err.as_text().contains("301"));
+    }
+
+    #[test]
+    fn only_3xx_and_4xx_count_as_the_edge_answering() {
+        let st = |l: &str| ProbeErr::Status(l.to_string());
+        for edge in [
+            "HTTP/1.1 301 Moved Permanently",
+            "HTTP/1.1 308 Permanent Redirect",
+            "HTTP/1.1 403 Forbidden",
+            "HTTP/1.1 429 Too Many Requests",
+        ] {
+            assert!(st(edge).edge_answered(), "{edge}");
+        }
+        for tunnel in [
+            "HTTP/1.1 502 Bad Gateway",
+            "HTTP/1.1 530 <none>",
+            "garbage",
+            "",
+        ] {
+            assert!(!st(tunnel).edge_answered(), "{tunnel}");
+        }
+        for other in [
+            ProbeErr::Connect,
+            ProbeErr::Tls,
+            ProbeErr::Io,
+            ProbeErr::Timeout,
+            ProbeErr::Short { got: 1, want: 2 },
+        ] {
+            assert!(!other.edge_answered(), "{other:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_abrupt_close_after_a_full_body_is_not_a_break() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n";
+        assert!(
+            exchange(reply(head, 5000, true), "x", "/b/5000", 5000)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            exchange(reply(head, 3000, true), "x", "/b/5000", 5000).await,
+            Err(ProbeErr::Io)
+        ));
+        assert!(matches!(
+            exchange(reply(head, 3000, false), "x", "/b/5000", 5000).await,
+            Err(ProbeErr::Short {
+                got: 3000,
+                want: 5000
+            })
+        ));
     }
 
     #[test]
